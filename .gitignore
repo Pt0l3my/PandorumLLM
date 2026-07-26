@@ -1,0 +1,26 @@
+# --- runtime state: created when the panel runs, never committed -------------
+fleet-config.json
+panel-port.txt
+profiles/
+logs/
+models/
+providerYAML/
+generated-launchers/
+ps1-launchers/*.ps1
+
+# --- build output -----------------------------------------------------------
+PandorumLLM.exe
+*.o
+*.obj
+__pycache__/
+*.pyc
+
+# --- release archives: these are attached to a Release, not committed --------
+PandorumLLM-v*.zip
+PandorumLLM-v*.zip.sha256.txt
+
+# --- editors / OS -----------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,155 @@
+{
+  "launcherDirs": [],
+  "gpus": [],
+  "slots": [
+    {
+      "id": "slot1",
+      "label": "server 1",
+      "port": 1236,
+      "gpu": "",
+      "gpuId": "",
+      "autoName": true,
+      "script": "",
+      "providers": []
+    },
+    {
+      "id": "slot2",
+      "label": "server 2",
+      "port": 1237,
+      "gpu": "",
+      "gpuId": "",
+      "autoName": true,
+      "script": "",
+      "providers": []
+    },
+    {
+      "id": "slot3",
+      "label": "server 3",
+      "port": 1238,
+      "gpu": "",
+      "gpuId": "",
+      "autoName": true,
+      "script": "",
+      "providers": []
+    }
+  ],
+  "unallocatedProviders": [
+    {
+      "id": "prov1",
+      "title": "Dialogue",
+      "port": 1251,
+      "thinking": false,
+      "priority": 0,
+      "emoji": "💬",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov2",
+      "title": "GM",
+      "port": 1252,
+      "thinking": false,
+      "priority": 0,
+      "emoji": "🎲",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov3",
+      "title": "Combat",
+      "port": 1253,
+      "thinking": false,
+      "priority": 0,
+      "emoji": "⚔️",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov4",
+      "title": "Meta",
+      "port": 1254,
+      "thinking": false,
+      "priority": 2,
+      "emoji": "🧪",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov5",
+      "title": "UT",
+      "port": 1255,
+      "thinking": false,
+      "priority": 2,
+      "emoji": "🌐",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov6",
+      "title": "AI-Assistant",
+      "port": 1256,
+      "thinking": false,
+      "priority": 0,
+      "emoji": "🤖",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov7",
+      "title": "ActionEval",
+      "port": 1257,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🏃",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov8",
+      "title": "Charbio",
+      "port": 1258,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🎭",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov9",
+      "title": "Diary",
+      "port": 1259,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "✍️",
+      "diaryGrammar": true
+    },
+    {
+      "id": "prov10",
+      "title": "Memory",
+      "port": 1260,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🧠",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov11",
+      "title": "Vision",
+      "port": 1261,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "👁️",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov12",
+      "title": "IntelEngine",
+      "port": 1262,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🛰️",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov13",
+      "title": "SeverActions",
+      "port": 1263,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🔧",
+      "diaryGrammar": false
+    }
+  ]
+}
