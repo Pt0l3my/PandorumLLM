@@ -26,7 +26,7 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 APP_NAME    = "PandorumLLM"
-APP_VERSION = "v3.65 Beta"
+APP_VERSION = "v3.67 Beta"
 PORT_CANDIDATES = [50607, 50617, 50627, 50637, 50647]   # edit these if they clash (valid ports: 1-65535)
 PORT = PORT_CANDIDATES[0]                          # runtime value; set by choose_port()
 MAX_SLOTS   = 20
@@ -1334,8 +1334,10 @@ CLIENTS = {}
 LIFE = {"ever": False, "empty_since": None, "exiting": False}
 import queue as _queue
 SSE_CLIENTS = set()
+SSE_SEQ = {"n": 0}   # bumps on every notify; the heartbeat echoes it so the page can spot a dead stream
 def sse_notify(kind, extra=None):
-    msg = json.dumps({"t": kind, **(extra or {})})
+    SSE_SEQ["n"] += 1
+    msg = json.dumps({"t": kind, "seq": SSE_SEQ["n"], **(extra or {})})
     for q in list(SSE_CLIENTS):
         try: q.put_nowait(msg)
         except Exception: pass
@@ -2958,7 +2960,7 @@ class ProxyManager:
             inp if inp is not None else "?", out if out is not None else "?",
             ("(~%d)" % tn) if tn else "", ("%.0f" % float(pf)) if pf else "?",
             ("%.0f" % float(dc)) if dc else "?", ms / 1000.0,
-            ("held %dms" % wait_ms) if wait_ms > 0 else ""))
+            ("+%d ms" % wait_ms) if wait_ms > 0 else ""))
         ld = log_dir()
         try:
             with open(os.path.join(ld, "%s_dashboard.log" % self.session), "a", encoding="utf-8") as f:
@@ -3785,7 +3787,7 @@ class Handler(BaseHTTPRequestHandler):
             if uid:
                 if self.path == "/api/bye": CLIENTS.pop(uid, None)
                 else: CLIENTS[uid] = time.time(); LIFE["ever"] = True
-            self._send(200, "application/json", '{"ok":true}')
+            self._send(200, "application/json", json.dumps({"ok": True, "seq": SSE_SEQ["n"]}))
             return
         try:
             body = json.loads(raw or b"{}")
@@ -4439,14 +4441,12 @@ PAGE = """<!doctype html>
   pre.tail.blackbg { background:#000 !important; }
   pre.tail { background:#0d0f13; border:none; box-shadow:0 0 14px -2px rgba(0,0,0,.8); border-radius:10px; padding:28px 12px 12px;
              font-family:Consolas,monospace; font-size:13px; line-height:1.5; white-space:pre-wrap; color:var(--txt);
-             height:calc(100vh - 210px); overflow:auto; margin:0; }
+             height:calc(100vh - 162px); overflow:auto; margin:0; }
   /* log-source line: overlays the top of the terminal so it never shifts the terminal box
      (split panes stay aligned whether or not a source line is present) */
   .tailbox { position:relative; }
-  .tail-src { position:absolute; top:1px; left:1px; right:1px; z-index:3; margin:0;
-              padding:5px 12px; line-height:17px; white-space:nowrap; overflow:hidden;
-              text-overflow:ellipsis; background:#0d0f13; border-radius:10px 10px 0 0; pointer-events:none; }
-  pre.tail.blackbg ~ .tail-src { background:#000; }
+  .tail-src { margin:0 0 6px; padding:4px 12px; line-height:17px; white-space:nowrap;
+              overflow:hidden; text-overflow:ellipsis; background:#0d0f13; border-radius:8px; }
   .tail-src:empty { display:none; }
   body.remoteview .tail-src { display:none !important; }
   .ed { display:flex; background:#0d0f13; box-shadow:0 0 14px -2px rgba(0,0,0,.8); border:none; border-radius:10px; overflow:hidden; height:280px; resize:vertical; min-height:160px; }
@@ -4493,7 +4493,30 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
   .tail, .log { font: 500 13.5px/1.6 "Cascadia Code", Consolas, monospace; color: #e8ecf2; }
   .hint { font-size: 13px; color: var(--dim); }
   .setup-lab { color: var(--txt); font-size: 14px; font-weight: 600; }
-.tmax { position: fixed; inset: 8px; z-index: 60; display: flex; flex-direction: column; background: var(--bg); padding: 8px; box-shadow:0 0 12px -2px rgba(0,0,0,.85); border-radius: 10px; }
+.tmax { position: fixed; inset: 0; z-index: 60; display: flex; flex-direction: column; background: var(--bg); padding: 0; }
+/* Terminal chrome, both views: a slim always-there bar (source + Adjust + Full window)
+   and a floating settings panel the Adjust button toggles OVER the terminal - never
+   pushing it. Full Window adds edge-to-edge and the idle hide on top of the same parts. */
+.tbar { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.tbar .tail-src { margin: 0; flex: 1 1 auto; min-width: 0; }
+.tchrome { position: relative; }
+.tpanel { display: none; position: absolute; top: 100%; left: auto; right: 0; z-index: 9;
+          width: max-content; max-width: 100%; margin-top: 4px;
+          background: rgba(13,16,22,.72); backdrop-filter: blur(2px);
+          box-shadow: 0 0 14px -2px rgba(0,0,0,.85); border-radius: 10px; padding: 10px 12px 4px; }
+.tchrome.adjopen .tpanel { display: block; }
+.tmax .tchrome { position: absolute; top: 0; left: 0; right: 0; z-index: 9; padding: 6px 8px; pointer-events: none; }
+.tmax .tchrome .tbar { margin-bottom: 0; }
+.tmax .tbar > * , .tmax .tpanel { pointer-events: auto; }
+.tmax .tchrome:not(.adjopen) .tbar .tail-src { visibility: hidden; }
+.tmax .splitgrid > div { position: relative; }
+.tmax .splitgrid .tchrome { z-index: 8; }
+.tmaxonly { display: none; }
+.tmax .tmaxonly { display: inline-block; }
+.tmax #adjbtn-splitt { display: none; }
+.tmax.hidechrome .tchrome { display: none; }
+body.tmaxidle #navfly { display: none; }
+.tmax .tail { border-radius: 0; }
 .tmax .tailbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 .tmax .tail { flex: 1; height: auto; max-height: none; line-height: 1.6; }
   .tscale-btn { display: none; }
@@ -4537,7 +4560,7 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 #twrap-split.tmax .splitgrid { flex: 1; min-height: 0; }
 #twrap-split.tmax .splitgrid > div { min-height: 0; }
 #twrap-split.tmax .tail { max-height: none; height: auto; }
-  .tail-cap { max-height: 72vh; }
+  .tail-cap { max-height: calc(100vh - 205px); }
   .tmax .tail-cap { max-height: none; }
 .chip.clickable { cursor: pointer; }
 #tail-thinking { color: #fff; }
@@ -4720,17 +4743,17 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
         <span class="bgwrap" id="bgwrap"><button class="stop" data-act="bgToggle" title="choose the terminal background">Terminal background color</button><span class="bgpop"><button class="stop bgopt" data-act="bgPick" data-v="0">Midnight</button><button class="stop bgopt" data-act="bgPick" data-v="1">Black</button></span></span>
       </div>
       <div id="tpane-proxy">
-      <div id="twrap-dashboard"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="auto" id="termscale-auto-dashboard">Auto</button><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="manual" id="termscale-manual-dashboard">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="dashboard" id="tscalebtn-dashboard">Default text size</button><span style="margin-left:auto"></span><button class="stop" data-act="tailMax" data-kind="dashboard" id="tmaxbtn-dashboard">⛶ Full window</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-dashboard" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-dashboard" data-fskind="dashboard" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-dashboard" data-fontkind="dashboard" class="tsel tfont"></select><span class="hint" id="termscale-msg-dashboard" style="margin-left:4px"></span></div><div class="tailbox"><pre class="tail" id="tail-dashboard"></pre><div class="hint tail-src" id="dash-src"></div></div></div>
+      <div id="twrap-dashboard"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="dash-src"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="dashboard" id="tmaxbtn-dashboard">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="auto" id="termscale-auto-dashboard">Auto</button><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="manual" id="termscale-manual-dashboard">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="dashboard" id="tscalebtn-dashboard">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-dashboard" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-dashboard" data-fskind="dashboard" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-dashboard" data-fontkind="dashboard" class="tsel tfont"></select><span class="hint" id="termscale-msg-dashboard" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-dashboard"></pre></div></div>
       </div>
       <div id="tpane-think" style="display:none">
-    <div id="twrap-thinking"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="auto" id="termscale-auto-thinking">Auto</button><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="manual" id="termscale-manual-thinking">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="thinking" id="tscalebtn-thinking">Default text size</button><span style="margin-left:auto"></span><button class="stop" data-act="tailMax" data-kind="thinking" id="tmaxbtn-thinking">⛶ Full window</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-thinking" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-thinking" data-fskind="thinking" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-thinking" data-fontkind="thinking" class="tsel tfont"></select><span class="hint" id="termscale-msg-thinking" style="margin-left:4px"></span></div><div class="tailbox"><pre class="tail" id="tail-thinking"></pre><div class="hint tail-src" id="think-src"></div></div></div>
+    <div id="twrap-thinking"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="think-src"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="thinking" id="tmaxbtn-thinking">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="auto" id="termscale-auto-thinking">Auto</button><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="manual" id="termscale-manual-thinking">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="thinking" id="tscalebtn-thinking">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-thinking" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-thinking" data-fskind="thinking" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-thinking" data-fontkind="thinking" class="tsel tfont"></select><span class="hint" id="termscale-msg-thinking" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-thinking"></pre></div></div>
       </div>
       <div id="tpane-split" style="display:none">
     <div id="twrap-split">
-      <div class="row" style="justify-content:flex-end;margin-bottom:6px"><button class="stop" data-act="tailMax" data-kind="split" id="tmaxbtn-split">⛶ Full window</button></div>
+      <div class="tchrome"><div class="tbar" style="justify-content:flex-end"><button class="stop adjbtn tmaxonly" data-act="tmaxAdjust" data-tc="tchrome-splitt" title="font and size controls for the right terminal">Adjust</button><button class="stop" data-act="tailMax" data-kind="split" id="tmaxbtn-split">⛶ Full window</button></div></div>
       <div class="splitgrid" style="display:flex;gap:10px;align-items:stretch">
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="auto" id="termscale-auto-splitd">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="manual" id="termscale-manual-splitd">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitd" id="tscalebtn-splitd">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitd" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitd" data-fskind="splitd" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitd" data-fontkind="splitd" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitd" style="margin-left:4px"></span></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitd"></pre><div class="hint tail-src" id="split-src-d"></div></div></div>
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="auto" id="termscale-auto-splitt">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="manual" id="termscale-manual-splitt">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitt" id="tscalebtn-splitt">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitt" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitt" data-fskind="splitt" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitt" data-fontkind="splitt" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitt" style="margin-left:4px"></span></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitt"></pre><div class="hint tail-src" id="split-src-t"></div></div></div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="split-src-d"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="auto" id="termscale-auto-splitd">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="manual" id="termscale-manual-splitd">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitd" id="tscalebtn-splitd">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitd" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitd" data-fskind="splitd" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitd" data-fontkind="splitd" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitd" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitd"></pre></div></div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome" id="tchrome-splitt"><div class="tbar"><div class="hint tail-src" id="split-src-t"></div><span style="margin-left:auto"></span><button class="stop adjbtn" id="adjbtn-splitt" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="auto" id="termscale-auto-splitt">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="manual" id="termscale-manual-splitt">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitt" id="tscalebtn-splitt">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitt" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitt" data-fskind="splitt" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitt" data-fontkind="splitt" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitt" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitt"></pre></div></div>
       </div>
     </div>
       </div>
@@ -5260,13 +5283,18 @@ function queueStats() {
   clearTimeout(statsTimer); statsTimer = setTimeout(renderStats, 400);
 }
 
-function renderSlots(force) {
+// header chrome (version, stack line, elevation banner, profiles) is global page state -
+// it repaints on every load() regardless of tab, in exactly one place
+function paintChrome() {
   if (!state) return;
   $("ver").textContent = state.version;
   $("sub").textContent = state.stack + "   |   slots: " + state.slots.length + "/20";
   $("banner").style.display = state.elevated ? "none" : "block";
   const hp = $("hdr-prof");
   if (hp && !window.__profOpen) { const nh = profRow(); if (hp.innerHTML !== nh) hp.innerHTML = nh; }
+}
+function renderSlots(force) {
+  if (!state) return;
   const ae = document.activeElement;
   if (!force && (curTab !== "servers" || curSsub !== "slots" || paramBusy()
       || (ae && ["SELECT","INPUT","TEXTAREA"].includes(ae.tagName)))) {
@@ -5621,7 +5649,14 @@ async function viewLog(name) {
   v.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 const DASH_PAL = ["#ff5dc8", "#f0883e", "#3fdd78", "#4da3ff", "#e0c23c", "#e05fd0", "#5ad0c0", "#d97b6c", "#8fb4ff", "#c9a227", "#7ee081", "#ff8ac2"];
+// fixed colors matched to the chips SkyrimNet itself shows for these roles, so both UIs
+// speak the same color language; every other title falls through to the vivid hash palette
+const PROV_COL = { "Dialogue":"#10b981", "GM":"#f59e0b", "Combat":"#dc2626", "Meta":"#64748b",
+  "Vision":"#06b6d4", "Memory":"#d946ef", "Diary":"#f97316", "Charbio":"#14b8a6", "Bio":"#14b8a6",
+  "ActionEval":"#7c3aed", "Action":"#7c3aed", "AI-Assistant":"#9333ea", "Agent":"#9333ea",
+  "Vanilla":"#a8a29e" };
 function dashColor(name) {
+  if (PROV_COL[name]) return PROV_COL[name];
   let h = 0; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
   return DASH_PAL[h % DASH_PAL.length];
 }
@@ -5859,6 +5894,7 @@ function paintTail(which, text, elOv) {
   const NL = String.fromCharCode(10);
   const numRx = new RegExp("^[0-9][0-9.,]*(ms)?$");
   const thinkRx = new RegExp("^[(]~[0-9]+[)]$");
+  const holdRx = new RegExp("^[+][0-9]+(ms)?$");   // priority-queue wait, e.g. +2922 (ms follows as its own token)
   const portRx = new RegExp("^[[][0-9]{4}[]]$");
   const errRx = new RegExp("error|fail|timeout|refused", "i");
   const names = new Set((state && state.routing || []).flatMap(s => (s.providers || []).map(p => p.title)).filter(Boolean));
@@ -5871,6 +5907,11 @@ function paintTail(which, text, elOv) {
       if (tk[0] === "[" && tk.indexOf(":") > 0) return '<span style="color:#7fd4ff">' + esc(tk) + '</span>';
       if (portRx.test(tk)) return '<span style="color:#8b93a3">' + esc(tk) + '</span>';
       if (thinkRx.test(tk)) return '<span style="color:#ff5dc8">' + esc(tk) + '</span>';
+      if (holdRx.test(tk)) {
+        let body = tk.slice(1), tailMs = "";
+        if (body.slice(-2) === "ms") { body = body.slice(0, -2); tailMs = ' <span style="color:#e8ecf2">ms</span>'; }
+        return '<span style="color:#e8ecf2">+</span><span style="color:var(--ok)">' + esc(body) + '</span>' + tailMs;
+      }
       if (numRx.test(tk)) {
         if (tk.slice(-2) === "ms") return '<span style="color:var(--ok)">' + esc(tk.slice(0, -2)) + '</span> <span style="color:#e8ecf2">ms</span>';
         return '<span style="color:var(--ok)">' + esc(tk) + '</span>';
@@ -6455,13 +6496,7 @@ function setAutoRef(v) {
     const busy = uiBusy();
     if (busy) { trace("refresh", "tick skipped", busy); return; }
     trace("refresh", "tick");
-    load();
-    if (curTab === "dashboard" && curDsub === "term" && curTsub === "proxy") refreshTail("dashboard");
-    if (curTab === "dashboard" && curDsub === "setup") renderRouting();
-    if (curTab === "dashboard" && curDsub === "yaml" && !(document.activeElement && document.activeElement.closest && document.activeElement.closest("#dpane-yaml"))) renderYaml();
-    if (curTab === "dashboard" && curDsub === "term" && curTsub === "think") refreshTail("thinking");
-    if (curTab === "dashboard" && curDsub === "term" && curTsub === "split") refreshSplit();
-    if (curTab === "helper") renderHelper();
+    liveRefresh("tick");
   }, s * 1000);
 }
 function paintProfiles() {
@@ -6558,6 +6593,8 @@ document.addEventListener("pointerdown", function(e) {
   }
   const inMenu = e.target.closest && e.target.closest(".bgwrap, .gpuwrap, .refwrap, .profwrap");
   if (!inMenu) closeMenus("");
+  if (!(e.target.closest && e.target.closest(".tpanel, .adjbtn")))
+    document.querySelectorAll(".adjopen").forEach(w => w.classList.remove("adjopen"));
 }, true);
 async function profSel(sel) {
   window.__profPick = sel.value;
@@ -6567,7 +6604,7 @@ async function profSel(sel) {
   if (!await uiConfirm("Load profile " + Q + n + Q + "? This overwrites the current Proxy Setup.")) { sel.value = ""; return; }
   const r = await post("/api/profile-load", { name: n });
   recoMsg = r.error ? ("⚠ " + r.error) : ("✅ profile loaded: " + n);
-  await load(); renderCurrent();
+  await load(); renderCurrent(true);
 }
 async function refreshTail(which) {
   const r = await post("/api/tail", { kind: which });
@@ -6624,7 +6661,7 @@ function provCard(p, s) {
   const prio = [0,1,2].map(n => '<option value="'+n+'"'+(n===pv?" selected":"")+'>'+n+" - "+["High","Normal","Low"][n]+'</option>').join("");
   const st = p.stats ? ' <span class="chip">reqs '+p.stats.n+' &middot; '+esc(p.stats.last)+'</span>' : "";
   const src = (p.samplerSource || "server");
-  return '<div class="prov" data-pid="'+p.id+'" id="prov-'+p.id+'">'
+  return '<div class="prov" data-pid="'+p.id+'" id="prov-'+p.id+'" style="border-left:3px solid '+dashColor(p.title||p.id)+';padding-left:9px;border-radius:6px">'
     + '<select class="edit" style="width:62px;min-width:62px;padding:7px 22px 7px 8px;background-position:right 6px center" title="emoji (shown in dashboard + thinking logs)" data-act="provField" data-field="emoji" data-id="'+p.id+'">'+eopts+'</select>'
     + '<input class="edit" style="max-width:150px" value="'+esc(p.title).replace(/"/g,"&quot;")+'" data-act="provField" data-field="title" data-id="'+p.id+'">'
     + '<input class="edit" style="max-width:68px" value="'+esc(p.port)+'" title="SN provider port (4 digits)" data-act="provField" data-field="port" data-id="'+p.id+'">'
@@ -6691,9 +6728,9 @@ function sampEdit(el) {
   const commit = async () => {
     if (done) return; done = true;
     const r = await post("/api/sampler-edit", { slot: slot, key: key, value: inp.value.trim() });
-    if (r.error) { uiAlert(r.error); await load(); renderCurrent(); return; }
+    if (r.error) { uiAlert(r.error); await load(); renderCurrent(true); return; }
     await load();
-    renderCurrent();                              // the chip returns with the new value on it
+    renderCurrent(true);                              // the chip returns with the new value on it
   };
   inp.addEventListener("keydown", e => {
     if (e.key === "Enter") commit();
@@ -6712,13 +6749,13 @@ function provSampEdit(el) {
   const commit = async () => {
     if (done) return; done = true;
     const r = await post("/api/provider-sampler", { id: id, key: key, value: inp.value.trim() });
-    if (r.error) { netLog("could not set " + key + ": " + r.error); await load(); renderCurrent(); return; }
+    if (r.error) { netLog("could not set " + key + ": " + r.error); await load(); renderCurrent(true); return; }
     await load();
-    renderCurrent();                              // always restores the chip row
+    renderCurrent(true);                              // always restores the chip row
   };
   inp.addEventListener("keydown", e => {
     if (e.key === "Enter") commit();
-    if (e.key === "Escape") { done = true; renderCurrent(); }
+    if (e.key === "Escape") { done = true; renderCurrent(true); }
   });
   inp.addEventListener("blur", commit);
 }
@@ -6994,7 +7031,7 @@ function netCard() {
 function netBox(kind, id, title, sub, right, col) {
   return '<div class="netbox ' + kind + '" data-nb="' + kind + ':' + id + '" data-kind="' + kind + '" data-id="' + esc(id) + '"'
     + ' draggable="' + (kind === "gpu" ? "false" : "true") + '"'
-    + (col ? ' style="--nbc:' + col + ';box-shadow:0 0 0 1px ' + col + '3d, 0 0 9px -3px ' + col + '"' : '')
+    + (col ? ' style="--nbc:' + col + ';box-shadow:0 0 0 1px ' + col + '3d, 0 0 14px -3px ' + col + '"' : '')
     + '><div class="nb-t">' + title + '</div>'
     + (sub ? '<div class="nb-s">' + sub + '</div>' : '')
     + (right ? '<div class="nb-r">' + right + '</div>' : '')
@@ -7343,11 +7380,53 @@ function provPrio(id) {
 }
 const UI_VERSION = "__UIV__";
 let tailMaxState = { dashboard: false, thinking: false, split: false };
+// Full-window chrome reveal - the ONE mechanism for all three terminal views.
+// Controls start hidden; any mouse move (or key) shows them; 2.5s of stillness hides
+// them again, unless a control inside the full-window pane holds focus.
+let tmaxT = null;
+function tmaxHide() {
+  document.querySelectorAll(".tmax").forEach(w => {
+    if (w.querySelector && w.querySelector(".adjopen")) return;   // an open Adjust menu persists until closed
+    const ae = document.activeElement;
+    if (ae && w.contains(ae) && ["INPUT","SELECT","TEXTAREA"].includes(ae.tagName)) return;
+    w.classList.add("hidechrome");
+  });
+  const panes = document.querySelectorAll(".tmax");
+  if (panes.length && [...panes].every(w => w.classList.contains("hidechrome")))
+    document.body.classList.add("tmaxidle");   // the floating nav arrows follow the chrome
+}
+function tmaxWake() {
+  document.body.classList.remove("tmaxidle");
+  document.querySelectorAll(".tmax.hidechrome").forEach(w => w.classList.remove("hidechrome"));
+  clearTimeout(tmaxT); tmaxT = setTimeout(tmaxHide, 2500);
+}
+function tmaxChrome(on) {
+  clearTimeout(tmaxT); tmaxT = null;
+  if (on) {
+    if (!window.__tmaxWake) {
+      window.__tmaxWake = tmaxWake;
+      window.addEventListener("mousemove", window.__tmaxWake);
+      window.addEventListener("keydown", window.__tmaxWake);
+    }
+    tmaxHide();
+  } else if (window.__tmaxWake) {
+    window.removeEventListener("mousemove", window.__tmaxWake);
+    window.removeEventListener("keydown", window.__tmaxWake);
+    window.__tmaxWake = null;
+    document.body.classList.remove("tmaxidle");
+    document.querySelectorAll(".hidechrome").forEach(w => w.classList.remove("hidechrome"));
+  }
+}
+window.addEventListener("keydown", e => {
+  if (e.key !== "Escape") return;
+  const kind = Object.keys(tailMaxState).find(k => tailMaxState[k]);
+  if (kind) { const b = $("tmaxbtn-" + kind); if (b) b.click(); }
+});
 let ipMsg = {};
 let pcModeMsg = null;
 function ipNote(m, err) {
   pcModeMsg = { msg: m, err: !!err };
-  if (typeof renderRouting === "function") renderRouting(); else uiAlert(m);
+  if (typeof renderRouting === "function") renderRouting(true); else uiAlert(m);
 }
 function ipStatusFor(key, cur) {
   // Reactive status for an IP row: derived from the field value vs the saved setting, so it
@@ -7388,7 +7467,7 @@ async function setIp(key, inputId, el) {
     msg += "  \u26A0 regenerate providers.yaml (it was built on " + st.yamlGeneratedIp + ")";
   ipMsg[key] = msg;
   applyPcMode(wasOne);              // an IP action must never change 1-PC / 2-PC mode
-  await load(); renderCurrent();
+  await load(); renderCurrent(true);
 }
 // ITEM 5: Launch mirrors the fleet button's states, and Stop only exists once running
 function srvButtons(s, off, running) {
@@ -7578,10 +7657,15 @@ function renderNetwork() {
   requestAnimationFrame(function() { netEqualize(); drawNetLines(); });
 }
 // ITEM 4: every provider in one flat stack, each showing the server it is allocated to
-function renderProviders() {
+function renderProviders(force) {
   if (!state) return;
   const pane = $("pmpane-providers");
   if (!pane) return;
+  if (!force) {
+    if (curTab !== "provmgmt" || curPmSub !== "providers") return;
+    const ae = document.activeElement;
+    if (ae && pane.contains(ae) && ["INPUT","SELECT","TEXTAREA"].includes(ae.tagName)) return;
+  }
   const servers = state.routing || [];
   const rows = [];
   servers.forEach(function(s) { (s.providers || []).forEach(function(p) { rows.push({ p: p, s: s }); }); });
@@ -7898,19 +7982,24 @@ document.addEventListener("pointerout", function(e) {
   if (!b || (e.relatedTarget && b.contains(e.relatedTarget))) return;
   clearInterval(arcTimer); arcTimer = null;
 });
-function renderCurrent() {
+function renderCurrent(force) {
   if (curTab === "network") { renderNetwork(); return; }
-  if (curTab === "provmgmt") { if (curPmSub === "stats") renderStats(); else renderProviders(); return; }
+  if (curTab === "provmgmt") { if (curPmSub === "stats") renderStats(); else renderProviders(force); return; }
   if (curTab === "servers") {
     if (curSsub === "stats") renderStats();
-    else if (curSsub === "inspect") renderSrvInspector();
-    else renderSlots();
+    else if (curSsub === "inspect") { if (force) renderSrvInspector(); }   // never redraw the editor under a live event
+    else renderSlots(force);
     return;
   }
-  renderRouting();
+  renderRouting(force);
 }
-function renderRouting() {
+function renderRouting(force) {
   if (!state) return;
+  if (!force) {
+    if (curTab !== "dashboard" || curDsub !== "setup") return;
+    const ae = document.activeElement, pane = $("dpane-setup");
+    if (ae && pane && pane.contains(ae) && ["INPUT","SELECT","TEXTAREA"].includes(ae.tagName)) return;
+  }
   reconcilePcMode();
   const keepP = $("ip-panel") ? $("ip-panel").value : null;
   const keepR = $("ip-remote") ? $("ip-remote").value : null;
@@ -7934,7 +8023,7 @@ async function detectGpus(el) {
   const r = await post("/api/detect-gpus", {});
   el.disabled = false;
   if (r.error) { netLog("GPU detection failed: " + r.error); return; }
-  await load(); renderCurrent();
+  await load(); renderCurrent(true);
   const gs = state.gpus || [];
   netLog("detected " + gs.length + " GPU" + (gs.length === 1 ? "" : "s"));
   gs.forEach(function(g) {
@@ -8327,7 +8416,7 @@ document.addEventListener("click", ev => {
         const r = await post("/api/provider-sampler", { id: p.id, clearAll: true });
         if (r && r.error) { uiAlert(r.error); break; }
       }
-      await load(); renderCurrent();
+      await load(); renderCurrent(true);
     })();
     return;
   }
@@ -8335,7 +8424,7 @@ document.addEventListener("click", ev => {
     (async () => {
       const r = await post("/api/provider-sampler", { id: d.id, clearAll: true });
       if (r && r.error) { uiAlert(r.error); }
-      await load(); renderCurrent();
+      await load(); renderCurrent(true);
     })();
     return;
   }
@@ -8385,7 +8474,7 @@ document.addEventListener("click", ev => {
     post("/api/profile-save", { name: n }).then(async r => {
       recoMsg = r.error ? ("⚠ " + r.error) : ("✅ profile saved: " + n);
       window.__profOpen = false;
-      await load(); renderCurrent(); paintProfiles();
+      await load(); renderCurrent(true); paintProfiles();
     });
     return;
   }
@@ -8395,7 +8484,7 @@ document.addEventListener("click", ev => {
       post("/api/profile-save", { name: n.trim() }).then(async r => {
         recoMsg = r.error ? ("⚠ " + r.error) : ("✅ profile saved: " + n.trim());
         if (!r.error) { window.__profPick = n.trim(); window.__profOpen = false; }
-        await load(); renderCurrent(); paintProfiles();
+        await load(); renderCurrent(true); paintProfiles();
       });
     });
     return;
@@ -8408,7 +8497,7 @@ document.addEventListener("click", ev => {
       post("/api/profile-delete", { name: n }).then(async r => {
         recoMsg = r.error ? ("⚠ " + r.error) : ("✅ profile deleted: " + n);
         window.__profPick = ""; window.__profOpen = false;
-        await load(); renderCurrent(); paintProfiles();
+        await load(); renderCurrent(true); paintProfiles();
       });
     });
     return;
@@ -8534,7 +8623,7 @@ document.addEventListener("click", ev => {
       if (!ok) return;
       post("/api/restore-servers", {}).then(async function(r) {
         if (r.error) { uiAlert(r.error); return; }
-        await load(); renderCurrent();
+        await load(); renderCurrent(true);
       });
     });
     return;
@@ -8544,7 +8633,7 @@ document.addEventListener("click", ev => {
       if (!ok) return;
       post("/api/provider-restore-defaults", {}).then(async r => {
         if (r && r.error) { uiAlert(r.error); return; }
-        await load(); renderCurrent();
+        await load(); renderCurrent(true);
       });
     });
     return;
@@ -8560,6 +8649,13 @@ document.addEventListener("click", ev => {
     post("/api/helper-reset", {}).then(async () => { window.__helperLines = []; window.__helperPrev = {}; await load(); renderHelper(); });
     return;
   }
+  if (d.act === "tmaxAdjust") {
+    const c = d.tc ? $(d.tc) : el.closest(".tchrome");   // each terminal owns its menu; data-tc lets a stand-in button reach it
+    if (c) c.classList.toggle("adjopen");
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    if (Object.values(tailMaxState).some(x=>x)) tmaxWake();
+    return;
+  }
   if (d.act === "tailMax") {
     const w = $("twrap-" + d.kind), b = $("tmaxbtn-" + d.kind);
     if (w) {
@@ -8567,7 +8663,7 @@ document.addEventListener("click", ev => {
         const te = d.kind === "split" ? $("tail-splitd") : $("tail-" + d.kind);
         tailNormalW[d.kind] = te ? te.clientWidth : 0;
       }
-      const on = w.classList.toggle("tmax"); tailMaxState[d.kind] = on; applyTermScale(); if (b) b.textContent = on ? "🗗 Normal Size" : "⛶ Full Window";
+      const on = w.classList.toggle("tmax"); tailMaxState[d.kind] = on; if (!on) w.querySelectorAll(".adjopen").forEach(c => c.classList.remove("adjopen")); if (on && document.activeElement && document.activeElement.blur) document.activeElement.blur(); tmaxChrome(Object.values(tailMaxState).some(x=>x)); applyTermScale(); if (b) b.textContent = on ? "🗗 Normal Size" : "⛶ Full Window";
     }
     return;
   }
@@ -8580,11 +8676,11 @@ document.addEventListener("click", ev => {
       recoMsg = r.error ? ("⚠ " + r.error) : ("✅ " + (r.summary || "done"));
       await load();
       done();
-      renderCurrent();
+      renderCurrent(true);
     }).catch(e => {
       done();
       recoMsg = "request failed: " + e;
-      renderCurrent();
+      renderCurrent(true);
     });
     return;
   }
@@ -8603,7 +8699,7 @@ document.addEventListener("click", ev => {
       applyPcMode(true);
       const r = await post("/api/settings", { panelIp: ip, remoteIp: ip, onePC: true });
       if (r && r.error) { uiAlert(r.error); return; }
-      await load(); renderCurrent();
+      await load(); renderCurrent(true);
       ipNote("1 PC setup: SkyrimNet and PandorumLLM share this machine (" + ip + ")");
     })();
   }
@@ -8614,7 +8710,7 @@ document.addEventListener("click", ev => {
       applyPcMode(false);
       const r = await post("/api/settings", { onePC: false });
       if (r && r.error) { uiAlert(r.error); return; }
-      await load(); renderCurrent();
+      await load(); renderCurrent(true);
       const inp = $("ip-remote");
       if (inp) flashTargets("#ip-remote");
     })();
@@ -8651,19 +8747,19 @@ function startEditR(sid, field) {
     if (save && String(inp.value).trim() !== "") {
       const b = { slot: sid }; b[field] = inp.value;
       post("/api/edit", b).then(r => { if (r.error) uiAlert(r.error); load().then(renderCurrent); });
-    } else renderCurrent();
+    } else renderCurrent(true);
   };
   inp.addEventListener("keydown", e => { if (e.key === "Enter") fin(true); if (e.key === "Escape") fin(false); });
   inp.addEventListener("blur", () => fin(true));
 }
-async function provAdd(sid) { const r = await post("/api/provider-add", { slot: sid }); if (r.error) uiAlert(r.error); await load(); renderCurrent(); }
+async function provAdd(sid) { const r = await post("/api/provider-add", { slot: sid }); if (r.error) uiAlert(r.error); await load(); renderCurrent(true); }
 async function provRemove(id) {
   if (!await uiConfirm("Remove this added provider?")) return;
-  const r = await post("/api/provider-remove", { id }); if (r.error) uiAlert(r.error); await load(); renderCurrent();
+  const r = await post("/api/provider-remove", { id }); if (r.error) uiAlert(r.error); await load(); renderCurrent(true);
 }
 async function provEdit(id, patch) {
   const r = await post("/api/provider-edit", { id, ...patch }); if (r.error) uiAlert(r.error);
-  await load(); renderCurrent();
+  await load(); renderCurrent(true);
 }
 
 /* ---------- setup path buttons ---------- */
@@ -9648,7 +9744,8 @@ async function load() {
   try {
     state = await (await fetch("/api/state")).json();
     reconcilePcMode();
-    renderSlots();
+    paintChrome();
+    renderCurrent();
     applyScopeUI();
     fleetWatch();
     if (!window.__themed) {
@@ -9739,7 +9836,20 @@ async function act(sid, kind, btn) {
 }
 let exitArmed = false;
 const HB_UID = Math.random().toString(36).slice(2) + Date.now().toString(36);
-setInterval(() => { if (!exitArmed) fetch("/api/heartbeat", { method:"POST", body: JSON.stringify({uid: HB_UID}) }).catch(()=>{}); }, 5000);
+setInterval(async () => {
+  if (exitArmed) return;
+  try {
+    const hb = await (await fetch("/api/heartbeat", { method:"POST", body: JSON.stringify({uid: HB_UID}) })).json();
+    // the server bumps seq on every notify; if it moved and this page saw nothing, the
+    // stream is dead - catch up once and rebuild the EventSource
+    if (hb && hb.seq && hb.seq > (window.__sseSeq || 0)) {
+      trace("refresh", "SSE gap - heartbeat fallback", (window.__sseSeq || 0) + " -> " + hb.seq);
+      window.__sseSeq = hb.seq;
+      liveRefresh("tail");
+      connectES();
+    }
+  } catch (e) {}
+}, 5000);
 fetch("/api/heartbeat", { method:"POST", body: JSON.stringify({uid: HB_UID}) }).catch(()=>{});
 window.addEventListener("pagehide", () => { if (!exitArmed) navigator.sendBeacon("/api/bye", HB_UID); });
 window.addEventListener("beforeunload", e => {
@@ -9795,27 +9905,32 @@ function queueLoad() {
 }
 function queueRouting() {
   clearTimeout(routeTimer);
-  routeTimer = setTimeout(() => {
-    const ae = document.activeElement, pane = $("dpane-setup");
-    if (curTab === "dashboard" && curDsub === "setup"
-        && !(ae && pane && pane.contains(ae) && ["INPUT","SELECT","TEXTAREA"].includes(ae.tagName)))
-      renderRouting();
-  }, 250);
+  routeTimer = setTimeout(() => renderRouting(), 250);   // the tab/focus guard lives inside renderRouting
 }
-const es = new EventSource("/api/events");
-es.onmessage = e => {
-  let ev = {}; try { ev = JSON.parse(e.data); } catch (x) { return; }
-  if (ev.t === "state") { queueLoad(); queueRouting(); queueStats(); queueErrors(); }
-  if (ev.t === "tail") {
-    if (curTab === "dashboard" && curDsub === "term" && curTsub === "proxy") refreshTail("dashboard");
-    if (curTab === "helper") renderHelper();
-    if (curTab === "dashboard" && curDsub === "term" && curTsub === "think") refreshTail("thinking");
-    if (curTab === "dashboard" && curDsub === "term" && curTsub === "split") refreshSplit();
-    queueStats();
-    queueErrors();
-    queueLoad(); queueRouting();
+// The ONE per-tab live-refresh rule. SSE events, the auto-refresh tick and the
+// heartbeat fallback all come through here - nothing else may spell this out again.
+function liveRefresh(src) {
+  if (curTab === "dashboard" && curDsub === "term" && src !== "state") {
+    if (curTsub === "proxy") refreshTail("dashboard");
+    if (curTsub === "think") refreshTail("thinking");
+    if (curTsub === "split") refreshSplit();
   }
-};
+  if (curTab === "dashboard" && curDsub === "yaml" && !(document.activeElement && document.activeElement.closest && document.activeElement.closest("#dpane-yaml"))) renderYaml();
+  if (curTab === "helper") renderHelper();
+  queueStats(); queueErrors(); queueLoad(); queueRouting();
+}
+function connectES() {
+  if (window.__es) { try { window.__es.close(); } catch (e) {} }
+  const es = new EventSource("/api/events");
+  es.onmessage = e => {
+    let ev = {}; try { ev = JSON.parse(e.data); } catch (x) { return; }
+    if (ev.seq) window.__sseSeq = ev.seq;
+    if (ev.t === "state") liveRefresh("state");
+    if (ev.t === "tail") liveRefresh("tail");
+  };
+  window.__es = es;
+}
+connectES();
 
 function showModal(html, resizable) {
   let ov = document.getElementById("pl-modal");

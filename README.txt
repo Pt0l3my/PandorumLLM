@@ -1,4 +1,4 @@
-PandorumLLM v3.65 Beta - local LLM stack for SkyrimNet, all in one folder
+PandorumLLM v3.67 Beta - local LLM stack for SkyrimNet, all in one folder
 ============================================================
 
 
@@ -3101,3 +3101,77 @@ v3.65: model filenames no longer reach a remote viewer.
   build time, and this one slipped through because nothing tested the parameters.
   The build now feeds a fully populated server through the masking and fails if a
   filename, a path or a card serial survives anywhere in what a viewer receives.
+
+v3.66: live updates repaired - one refresh rule, a self-healing stream, SkyrimNet colors.
+- Fix: the page's only live driver was the event stream, and the per-tab refresh rule
+  was written twice (event handler and auto-refresh tick) with drifted copies. One
+  liveRefresh() now; the build counts the copies so a second cannot reappear.
+- Fix: a state event repainted only the server slots, so Provider cards never updated
+  live. Every event now repaints whichever page is open; the do-not-redraw-while-typing
+  guards moved inside the renderers themselves, one home each.
+- Add: every event carries a sequence number and the 5-second heartbeat echoes it. A
+  silently dead stream is noticed within about five seconds; the page catches up and
+  rebuilds the connection, and notes the gap in Log > Observer.
+- Change: the source-file line sits above each terminal instead of inside it, on all
+  three terminal views.
+- Change: provider colors now match the chips SkyrimNet itself shows for the same
+  roles, everywhere at once - terminal lines, statistics bars, provider rows (new
+  colored accent) and the Live Network glow. Titles SkyrimNet does not know get vivid
+  colors from the hash palette; grey no longer appears.
+- Note: the Server Inspector repaints only on your own actions, never under a live
+  event, so the editor cannot be redrawn while in use.
+
+v3.67: full-window terminals go edge to edge, controls appear only when the mouse moves.
+- Change: Full Window now covers the whole page, terminal text up to the top edge.
+- Add: in Full Window every button, dropdown and the source line is hidden (not
+  removed) until the mouse moves or a key is pressed; 2.5 seconds of stillness hides
+  them again. A control that holds focus - an open font picker, a field being used -
+  keeps the row visible. One mechanism serves all three terminal views.
+- Add: Escape leaves Full Window, since the exit button is hidden most of the time.
+
+v3.67 hotfix1: the terminal's priority-wait marker now reads +8013ms instead of
+held 8013ms. No other change; page reload not required.
+
+v3.67 hotfix2: Full Window's hidden controls actually hide. Clicking the Full Window
+button left it focused, and a focused button counted as "in use", so the hide never
+engaged. Buttons no longer hold the controls visible (only open dropdowns and fields
+do), the toggle drops its own focus, and the frame padding is gone - terminal text
+reaches the true top edge. Covered by a runtime test that enters Full Window with the
+button still focused.
+
+v3.67 hotfix3: the priority-queue wait in the terminal reads +2922 ms with the number
+in green, matching the other timing figures. Lines written by earlier builds (+2922ms,
+one token) are recolored the same way.
+
+v3.67 hotfix4: Full Window controls float over the terminal instead of pushing it
+down. Waking the mouse now shows only two buttons - Adjust and Normal Size; Adjust
+reveals the font, size and source controls, and stays as set until Full Window is
+left. The priority-wait marker is recolored: + and ms in plain text, only the number
+in green.
+
+v3.67 hotfix5: the terminal chrome is the same in both views - a slim bar with the
+source line, Adjust and Full window, and a settings panel that Adjust floats OVER the
+terminal instead of pushing it. Terminals take the freed height in normal view too.
+Fixes Full Window's unclickable, washed-out buttons: the stacked overlay strips were
+painting over and swallowing clicks meant for the bar; overlays no longer catch the
+pointer except on their own controls, and the grey gradient strip is gone.
+
+v3.67 hotfix6: an open Adjust menu now stays put - the Full Window idle hide leaves it
+alone until it is closed with the button or by clicking anywhere outside it, in both
+views, through the same outside-click gate every other drop-out panel uses. The menu
+background is translucent with a 2px blur of the terminal beneath.
+
+v3.67 hotfix7: the Adjust menu is a compact card only as wide as its controls, hanging
+directly under the Adjust button and aligned to the terminal's right edge, instead of
+a strip across the whole width. In Split view each terminal has its own Adjust button
+opening its own menu. Everything else about the menu (persistence, outside-click
+close, translucency) is unchanged.
+
+v3.67 hotfix8: in Split view's Full Window, the right terminal's Adjust no longer
+lands on top of Normal Size. A stand-in Adjust sits beside Normal Size and opens the
+right terminal's menu in its usual place at that terminal's right edge; the column's
+own button steps aside in Full Window and returns in normal view.
+
+v3.67 hotfix9: the floating page-navigation arrows (bottom-left) now follow the Full
+Window idle hide - gone with the rest of the chrome after 2.5 s of stillness, back on
+any mouse move or key, and always back on leaving Full Window.
