@@ -1,3 +1,5 @@
+![PandorumLLM](https://github.com/user-attachments/assets/039c932c-d545-4a42-adb9-fe66f59756b5)
+
 # PandorumLLM
 
 **A browser control panel for a local llama.cpp fleet, built for SkyrimNet.**
