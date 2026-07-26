@@ -114,7 +114,6 @@ permission to repost it.
 
 ## Also here
 
-- **[CHANGELOG.md](CHANGELOG.md)** — every released version, back to v0.8
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** — architecture, traps, and how a release is cut
 - **README.txt** — the user-facing readme that ships in the zip
 
