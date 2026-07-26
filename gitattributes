@@ -1,0 +1,27 @@
+# PandorumLLM keeps strict per-file line endings and the build gate enforces them.
+# Without this, Git rewrites them on checkout and a fresh clone fails its own build.
+
+# Do not touch anything unless told to below.
+*                   -text
+
+# Must stay LF only - windres and the manifest parser expect it.
+*.rc                text eol=lf
+*.manifest          text eol=lf
+*.cpp               text eol=lf
+
+# Must stay CRLF - Windows scripts and the panel itself.
+*.py                text eol=crlf
+*.bat               text eol=crlf
+*.txt               text eol=crlf
+
+# PowerShell is CRLF, except the fleet script which is LF by long-standing convention.
+*.ps1               text eol=crlf
+launch-llm-fleet.ps1 text eol=lf
+
+# Documents: leave to the platform, nothing reads them mechanically.
+*.md                text
+
+# Binary - never convert.
+*.ico               binary
+*.exe               binary
+*.zip               binary
