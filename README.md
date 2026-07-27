@@ -1,89 +1,47 @@
-![PandorumLLM](https://github.com/user-attachments/assets/039c932c-d545-4a42-adb9-fe66f59756b5)
-
 # PandorumLLM
 
-**Control panel + proxy built for SkyrimNet — a reliable, local llama.cpp solution.**
-Any models, any GPU setup, one or two PCs: link each GPU to its own server, then
-allocate every Provider (job) to whichever server you want with simple drag & drop —
-any configuration you can think of, launched with one click.
-Setting up llama.cpp servers means no files, Python, API or C++ to mess with — every
-option is a curated field to enter or a setting to toggle and choose.
-No install — unzip the folder anywhere, double-click the exe, and the panel opens in
-your browser. One Python file, no dependencies, no cloud, no accounts.
+**A browser control panel for a local llama.cpp fleet, built for SkyrimNet.**
+
+One Python file, no dependencies, no cloud. It starts your servers, routes SkyrimNet's
+providers to them, and shows you what the models are actually doing while you play.
 
 ---
 
-## 🔀 The proxy — one port per Provider
+## What it does
 
-- **Per-Provider samplers, edited on the fly.** Force temperature, top-p, top-k,
-  min-p or DRY for a single job mid-session — click a chip, set a value, done. Injected
-  100% llama.cpp-compliant, cleared again just as fast.
-- **Live values.** Chips show each Provider's settings actually in effect — from the
-  request, from the server, or unknown.
-- **Thinking on/off, on the fly.** Per Provider, mid-session, no API editing — and
-  the thinking process streams live in its own terminal, colour-coded per job.
-- **Job-specific rails**, like the Diary grammar guard, applied automatically.
-- SkyrimNet simply points each provider at its port — the panel writes
-  `Providers.yaml` for you, exactly where SkyrimNet expects it.
+SkyrimNet needs a dozen or so providers — dialogue, combat, memory, vision and the rest —
+and each one has to reach a running llama.cpp server. Doing that by hand means juggling
+PowerShell launchers, ports, GPU assignments and a `Providers.yaml` you have to keep in
+sync. PandorumLLM does the juggling.
 
-## 🚀 Servers & launchers
+- **Run several servers across several GPUs.** Cards are pinned by UUID, so a driver update
+  or a reboot can't quietly swap which model lands on which card.
+- **Build launchers without writing PowerShell.** Pick a model, set context and batch sizes,
+  and the launcher is generated for you — or bring your own `.ps1` and the panel reads it,
+  including model paths held in variables.
+- **Route providers by dragging them.** A live network graph shows GPU → server → provider,
+  and drops take effect immediately.
+- **Watch it work.** Three live terminals: the proxy feed, the models' reasoning as it's
+  generated, and a split view. Colour-coded per provider, scalable, in whichever font you like.
+- **See where the time goes.** Per-provider generation, prefill and decode timings with
+  tokens/second, input and output token counts, cache hits, queue time, and MTP acceptance
+  rates if you're running speculative decoding.
+- **Tune samplers per provider.** Read what SkyrimNet is actually sending, override any
+  parameter for one provider, and clear it again in a click.
+- **Generate `Providers.yaml`.** Built from your live setup and written where SkyrimNet
+  wants it.
+- **Follow the guide if you'd rather not think about it.** An eight-step setup flow that
+  checks its own work and tells you what's left.
 
-- **One-click launch** of every server, with a live tally (`Running… 3/3`).
-- **Any GPU setup.** Multiple GPUs and servers, cards pinned by UUID so nothing
-  silently swaps; one PC or two over your LAN.
-- **No argument files to edit.** Launcher options — context, batch sizes, flash
-  attention, caching and the rest — are toggles and fields in the UI, handled behind
-  the scenes.
-- **Launcher Creator.** Build and inspect llama.cpp launchers from a template — no
-  PowerShell writing needed.
-- **Server Editor.** Edit a server's launcher settings directly from the panel.
-- **Bring your own `.ps1`.** Load existing launcher files onto servers — every
-  parameter and model path is auto-detected and read (even paths held in variables),
-  and models and settings are allocated automatically.
-- **Recommended Setup** assigns every Provider to the best server for it, based on
-  your models and GPUs.
-- **Live network graph** — GPU → server → Provider drawn as lines; drag a job to
-  re-route it, effective immediately.
-- **Profiles** save and restore whole configurations.
+---
 
-## 📊 Monitoring
+## Requirements
 
-- **Per-server graphs**, one bar per model: prefill and decode speed (t/s), response
-  time, token usage, thinking tokens, queue time, cache hits and time saved,
-  speculative-decoding acceptance and draft size, generations, loads and errors.
-- **Per-Provider graphs**: generation time, input / output / thinking tokens and
-  errors — click a Provider's emoji for its generation, prefill and decode breakdown
-  with tok/s.
-- Three live terminal views — server output, proxy traffic and model thinking —
-  colour-coded per Provider, with adjustable font and size.
-
-## 🔒 Remote & safety
-
-- **Remote view** from any other PC on your LAN — read-only, enforced server-side,
-  with paths, addresses and hardware details redacted. Off-LAN access is rejected.
-- **Launcher sweep** flags constructs that don't belong in a llama-server launcher —
-  a mistake-catcher, not a guarantee.
-- Open source, one readable file, zero cloud; every release ships with a SHA-256
-  checksum.
-
-## 📖 Guides
-
-- **Main Guide** — step-by-step setup that checks its own progress and tells you
-  what's left.
-- **Sampler reference** tailored for SkyrimNet use — what each parameter does and
-  where it matters.
-
-## 🧾 Requirements
-
-- **Windows** with [PowerShell 7](https://github.com/PowerShell/PowerShell) (`pwsh`)
-- **[Python 3.9+](https://www.python.org/downloads/)** — standard library only,
-  nothing to pip-install
-- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** — a CUDA build if you run
-  NVIDIA cards
-- **NVIDIA GPU(s)** with `nvidia-smi` on PATH — it ships with the
-  [driver](https://www.nvidia.com/en-us/drivers/)
-- **[SkyrimNet](https://github.com/MinLL/SkyrimNet-GamePlugin)** — the reason this
-  exists
+- **Windows** with PowerShell 7 (`pwsh`)
+- **Python 3.9+** — stdlib only, nothing to install
+- **llama.cpp** (a CUDA build, if you have NVIDIA cards)
+- **NVIDIA GPU(s)** with `nvidia-smi` on PATH for detection
+- **SkyrimNet**, if you want the reason this exists
 
 ---
 
@@ -102,7 +60,7 @@ your browser. One Python file, no dependencies, no cloud, no accounts.
 Every release ships a SHA-256. Check it before you run anything:
 
 ```
-certutil -hashfile PandorumLLM-v3.65-Beta.zip SHA256
+certutil -hashfile PandorumLLM-v3.72-Beta.zip SHA256
 ```
 
 Compare it against the `.sha256.txt` attached to the same release. If they don't match,
@@ -120,10 +78,10 @@ appear for any unsigned tool from an individual.
 
 What the app does and doesn't do:
 
-- **No automatic outbound connections.** It never phones home or sends telemetry. The one
-  outbound request in the source is the **Check for update** button in Folder Settings,
-  which asks github.com for the newest llama.cpp release tag — only when you press it, and
-  nothing about your setup is sent.
+- **No telemetry, and nothing about your setup ever leaves the machine.** Two outbound requests exist, both
+  host-only and both plain reads of public pages with nothing about your setup sent: the
+  llama.cpp update check, only when you press it, and the app version check on the header,
+  once per session and cached for six hours. Everything else is local.
 - **It runs PowerShell** — that's the whole job. It launches the `.ps1` files in your
   launcher folder. **A launcher is a script, and running one runs whatever is in it.** There's
   a **Sweep launcher folder** button in Folder Settings that reads every `.ps1` there and

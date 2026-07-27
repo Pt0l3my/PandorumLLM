@@ -1,4 +1,4 @@
-PandorumLLM v3.67 Beta - local LLM stack for SkyrimNet, all in one folder
+PandorumLLM v3.72 Beta - local LLM stack for SkyrimNet, all in one folder
 ============================================================
 
 
@@ -3175,3 +3175,405 @@ own button steps aside in Full Window and returns in normal view.
 v3.67 hotfix9: the floating page-navigation arrows (bottom-left) now follow the Full
 Window idle hide - gone with the rest of the chrome after 2.5 s of stillness, back on
 any mouse move or key, and always back on leaving Full Window.
+
+v3.67 hotfix10: the panel no longer resolves its own hostname on every api call. The
+origin check did a fresh name lookup per request, and on Windows machines without a
+default gateway that lookup can stall for seconds - which is why panels with a busy
+proxy took half a minute to first draw the server cards, and the debug report took
+four. Literal localhost or LAN addresses now skip resolution entirely and the address
+list is cached for a minute. Verified by a gate that counts resolutions across twenty
+api calls: zero.
+
+v3.67 hotfix11: the version everywhere - header, logs, debug report, page-cache check -
+now carries the hotfix number (v3.67-hf11 Beta), so a report always says exactly which
+build produced it. The Server Editor's launcher picker mirrors the launcher actually
+saved on the server instead of a session variable, so it survives restarts; a saved
+hand-edit outside the launcher folder shows as a "(current, hand-edited)" entry. And
+the panel now times itself: an /api/state call over half a second writes a line to the
+error log naming the slow phase, and the debug report ends with a timing breakdown of
+its own build - so the next slow-startup report will name the culprit instead of us
+guessing at it.
+
+v3.67 hotfix12: the panel now says which file it is running. The startup banner, the
+debug report and the tooltip on the version in the header all carry the full path of
+fleet-panel.py, a short hash of its contents, its size and when it was last modified.
+Replacing a file is not the same as running it: an older instance still holding the
+port serves the old code to the browser, and there was no way to tell. If startup
+displaces a running instance of a different version, it now says so.
+
+v3.67 hotfix13: server cards are quick again. Checking whether a server is up used
+socket.create_connection and urlopen, and both run the name resolver even for
+127.0.0.1 - about a second each on a machine with no default gateway, so three
+servers cost three seconds on every state read and the debug report took over four.
+The probe now uses a plain socket and speaks /health over the same connection, with a
+short cache so a burst of refreshes probes once. The same report is now built in about
+a millisecond.
+Also remembered across restarts: the launcher you loaded into a server (the picked
+file is copied into generated-launchers, so its origin is now stored alongside and the
+picker shows it), whether the Server Editor was left Locked or Open, and which profile
+is loaded - its name is shown beside Profiles in the header.
+
+v3.67 hotfix14: the whole state build is now traced, and the probes stop dominating
+it. Every step that reads the disk or the network is timed - launcher folder scan,
+model folder scan, template scan, launcher parsing, log parsing, config reads, address
+lookups and the port probes - and whatever time is left over is reported as
+everything-else, so a slow call is never unexplained. The breakdown appears in the
+debug report and in the error log for any state read over half a second.
+On this machine a closed server port is dropped rather than refused, so each probe sat
+out its full timeout. Probes now run for all servers at once with a 0.35s loopback
+limit, so three unreachable servers cost 0.35s instead of three seconds.
+Also: the Observer is remembered - if it was recording when you left, it starts
+recording again on the next run.
+
+v3.67 hotfix15: the wait before servers show as ready was the model list. Identifying
+a .gguf means opening it and reading its header, that was done for every model on
+every scan, and the result was only held for thirty seconds - so a folder of large
+models cost that read again and again, and the server cards sat on "Model could not be
+loaded" until it finished. Each file's kind is now remembered in model-kinds.json,
+keyed to the file's size and date so a changed or new model is still re-read, the scan
+is held for five minutes, and the first scan runs in the background at startup instead
+of under the first page load. A scan over a second says so in the error log.
+Also: report internals now cover folder checks and model header reads, and the logs
+and providers.yaml folders no longer report "nothing expected found in it" - they are
+written to, not read from, so existing is all they need to be.
+
+v3.67 hotfix16: Live Network is now the start page in fact as well as in the sidebar -
+the nav item was selected at startup while the Servers page was the one on screen.
+The model scan is also single-flight: the startup warm-up and the first page load used
+to scan at the same moment and read every model header twice (25s and 10s in the same
+second on a 68 model folder). The second caller now waits for the first and takes its
+result. The listen backlog is raised from the default of five, since a browser opens
+several connections at once and a second tab or a remote viewer doubles that.
+
+v3.67 hotfix17: the debug report gains a port behaviour section. It connects to a
+known-closed port, to the panel's own port and to each configured server port, and
+says what each one did and how long it took. A closed port refuses at once; one that
+neither answers nor refuses is being intercepted, and the report says so - worth
+knowing before llama-server tries to bind the same port.
+Observer: a click that closes nothing no longer writes a line (those entries were
+most of a trace and pushed the useful ones out), and moving between pages is now
+recorded, so a trace shows where you were.
+
+v3.68: consolidates v3.66 and v3.67 with their seventeen hotfixes, and closes out the
+slow-start work.
+- Fix: checking whether a server was up used connect_ex on a socket with a timeout.
+  On Windows that does not report a refusal - it waits out the whole timeout and
+  answers WSAEWOULDBLOCK - so every check cost its full timeout even though nothing
+  was wrong with the machine. It now uses connect, which reports a refusal at once.
+  The port behaviour section of the debug report was reading the same false answer.
+- Fix: Remote Access was written to the config but not among the known settings, so
+  it was dropped on the next read and came back Off every start. It is remembered.
+- Add: the header states Remote Access - On or Off beside Profiles, On in blue.
+- Live updates: one refresh rule shared by the event stream, the auto-refresh tick
+  and a heartbeat fallback that notices a dead stream within about five seconds.
+  Every event repaints the page in view, so provider cards no longer need a reload.
+- Start-up: model kinds are read once per file and remembered, folder scans are
+  single-flight and warmed in the background, address lookups are cached, and every
+  step of a state read is timed with the remainder named. A debug report that took
+  four seconds now takes about five milliseconds.
+- Terminals: full window covers the page, its controls hide until the mouse moves and
+  float over the text instead of pushing it, each terminal has its own Adjust menu,
+  and the source line sits above the text.
+- Memory: the launcher loaded into a server, the Server Editor's Locked or Open
+  state, the profile in use and the Observer's recording state all survive a restart.
+- Colours: providers use the same colours SkyrimNet shows, everywhere at once.
+
+v3.68 patch1: the header states more at a glance. The loaded profile's name glows
+blue beside Profiles, and the auto refresh interval appears next to the clock as
+- 1s, - 5s or - 10s, also in blue, with nothing shown when it is off. Remote Access,
+the profile name and the refresh interval all share one glow rule.
+
+v3.68 patch2: the three header markers read the same way - Remote Access-On,
+Profiles-desk, and the refresh interval as -5s beside the clock. One separator, no
+stray spaces, no dot.
+Also: the auto refresh interval is remembered and starts again on the next run.
+
+v3.68 patch3: a small space each side of the dash in the header markers - Remote
+Access - On, Profiles - p1, and - 5s beside the clock, whose own padding provides the
+space on its left so the gap matches the other two.
+
+v3.68 patch4: the header is tidier and the version now tells you something.
+- Change: the path and slot count have left the header. The slot count sits on the
+  Servers page beside Restore default servers; the install path is at the foot of
+  Folder Settings.
+- Add: the version is a button. It glows a faint green when you are on the newest
+  release, and pulses yellow with Update! beneath it when GitHub has a newer one.
+  Clicking it asks before opening the releases page in a new tab.
+- Note: this adds a second outbound request - a plain read of the public releases
+  page on github.com, once per session and cached for six hours. Nothing about your
+  setup is sent, it is host-only like every other command, and the panel works
+  normally when it cannot be reached.
+- Change: Remote Access, Profiles and the refresh interval are clickable across the
+  whole marker, value included. Remote Access opens the Live Network page, where the
+  setting lives - it does not toggle from the header.
+- Change: a little less space between the clock and its interval.
+
+v3.68 patch5: the update check compared release tags as text, so any tag that was not
+an exact match counted as newer - it announced v3.67-beta-hotfix9 as an update to
+v3.68. Tags are now read as numbers (version, then patch or hotfix number) and
+compared properly; a build newer than the newest release says so rather than nagging.
+The label reads Update available! and is centred under the version.
+Fix: SeverActions was listed with a scroll in one emoji table and a wrench in a later
+one, and the later table won. Both say scroll.
+Change: the Remote Access marker opens Permissions > Remote Access, and all three
+header markers glow blue on hover.
+
+v3.68 patch6: providers can be switched off again. The flag was still honoured by the
+proxy and the yaml writer, but every config read stamped it back on, so nothing could
+hold it. A provider switched off keeps its port shut, which is what lets a second PC
+serve that provider instead without two machines listening on the same port. The row
+dims when off, the setting survives a restart and rides along in profiles, and
+Restore default providers puts it back on with the rest of the shipped values.
+
+v3.68 patch7: the provider On/Off switch is now a power symbol at the right-hand end
+of the provider row, vertically centred, the same glyph as the Exit button at twice
+the size. It glows green while the provider is served by this panel and red while it
+is off, and says which in its tooltip.
+
+v3.68 patch8: the provider power button sat on a line of its own. The provider row is
+a wrapping flex box whose sampler chips take a full line, so no flex child could ever
+sit beside both lines. The button is now pinned to the card itself - right edge, true
+vertical middle - and the card reserves room for it.
+
+v3.68 patch9: the provider power button did nothing. It was wired to the handler the
+row's dropdowns and switches use, which listens for a change event and reads the
+element's value - a button raises neither. It has its own click action now, and its
+tooltip reads Provider state - Enabled or Provider state - Disabled.
+
+v3.68 patch10: a disabled provider fades its whole card, not just the row of fields
+inside it - the name, port and allocation line dim with the rest. The power button
+stays at full strength so it can still be read and pressed.
+
+v3.68 patch11: first step towards a second AI machine. Live Network now has Host and
+Client tabs. Give the Client tab the address of another PandorumLLM panel on your LAN
+and this one shows that machine's cards, servers and enabled providers as Client GPU1,
+Client Server1 and so on.
+Nothing is sent to the client and nothing new is exposed by it: this panel reads the
+ordinary read-only remote view the client already serves, so the client simply needs
+Remote Access switched on. The read happens on its own thread every five seconds with
+a two second limit, so a client that is switched off cannot slow this panel down - the
+Client tab just says it is not reachable. The client's address is masked for anyone
+viewing this panel remotely, and a client running a different version is called out.
+Launching, editing and everything else still happens on the machine that owns the
+GPUs; this is a view, not a remote control.
+
+v3.68 patch12: Live Network > Client is now the Host page itself, drawn from the
+client's state - the same cards, servers, providers and lines, just the other
+machine's. Only one of the two is on the page at a time, since the graph uses fixed
+element ids. The client view is look-only: host controls are hidden and nothing in it
+responds to clicks.
+The client's address moved to Proxy > Proxy Setup, beside the other addresses.
+There is no client mode to switch on. A client is simply a panel with Remote Access
+on; this one reads what it already publishes to any remote viewer.
+
+v3.68 patch13: a Full Window marker sits beside Remote Access in the header and puts
+the whole panel on the screen, the same as pressing F11. It reads On in blue while
+full screen and follows the browser, so leaving with Escape updates it too. This is
+the browser window, not the terminal's own full window view, and it works for a
+remote viewer as well since it only affects that person's screen.
+
+v3.69: consolidates v3.68 and its thirteen patches.
+- Add: a second AI machine can be watched from this one. Put its address in Proxy >
+  Proxy Setup and Live Network gains Host and Client tabs, the Client tab being the
+  same page drawn from that machine's data. There is no client mode to switch on: a
+  client is a panel with Remote Access on, and this one reads what it already shows
+  any remote viewer. Nothing is sent to it and nothing is controlled from here. The
+  read runs on its own thread with a two second limit, so a client that is off cannot
+  slow this panel down, and the client's address is masked for remote viewers.
+- Add: providers can be switched off again, with a power button at the right of each
+  provider card - green for on, red for off, and the card fades when off. A provider
+  switched off keeps its port shut, which is what lets a second PC serve it instead.
+- Add: the version in the header is a button. It glows green on the newest release,
+  pulses yellow with Update available! when GitHub has a newer one, and asks before
+  opening the releases page in a new tab. Release tags are compared as numbers.
+- Add: Fullscreen, Remote Access, Profiles and the refresh interval all state
+  themselves in the header and are clickable across the whole marker.
+- Change: the install path and slot count left the header - the count sits on the
+  Servers page, the path at the foot of Folder Settings.
+- Fix: SeverActions had a scroll in one emoji table and a wrench in a later one.
+- Remembered across restarts: Remote Access, the auto refresh interval, the launcher
+  loaded into a server, the Server Editor's Locked or Open state, the profile in use
+  and the Observer's recording state.
+
+v3.69 patch1: the header markers are spaced evenly. The gap was set on the header row,
+but Remote Access, Fullscreen and Profiles sit inside one span of their own, so it
+only ever applied between that span and the clock. The group now carries the same gap.
+Fix: the whole marker group was marked host-only, so a remote viewer lost Fullscreen
+as well - and that one only affects the screen of whoever presses it. Host-only now
+sits on Remote Access and Profiles, the two that change something shared.
+
+v3.69 patch2: addresses are blurred until you ask for them. On Proxy > Proxy Setup
+that covers the panel and remote IP fields, the green line that repeats what was set,
+the detected addresses offered as chips and the client panel address; on Permissions >
+Remote Access it covers the URL for opening the panel from another PC. Click any of
+them to reveal, and a field clears its own blur while you type in it. This uses the
+same click-to-reveal blur already used for GPU serial numbers, so there is one rule
+for it rather than two.
+
+v3.69 patch3: a revealed address covers itself again as soon as you click elsewhere,
+and revealing one hides any other that was open, so at most one is ever readable. A
+field you are typing in keeps its reveal until it loses focus. This applies to every
+blurred value, GPU serial numbers included.
+
+v3.69 patch4: the provider switch labelled Detect SN sampler parameters now reads
+Show SkyrimNet sampler values, which is what it does. Nothing else changed - the
+setting itself and its saved name are the same.
+
+v3.69 patch5: groundwork for the TTS work. A remote reader of a log feed no longer
+receives file paths - they are stripped on the host before the text is sent, not
+hidden in the page, so the rule holds however the feed is read. Drive-letter and UNC
+paths both go; dialogue lines and timing figures are untouched, and if the masker ever
+fails it hides the line rather than handing it over. Settings for a TTS server and
+wrapper pair are seeded but not yet used by any page.
+v3.70: text-to-speech gets its own page. Proxy > TTS [Alpha] holds the settings for a
+TTS server and its wrapper - the server binary, the model, the ports, the python and
+the wrapper script - and pins the card by UUID so a reboot or a reseated card cannot
+move it. Press Write start-tts.bat and the panel builds the launcher for you, in the
+launcher folder alongside the others. The launcher starts the server, waits until it
+answers, then starts the wrapper with its output mirrored into logs\tts.log, and it
+carries the handful of details that are easy to get wrong: the card re-indexes to 0
+once it has been isolated, python needs -X utf8 and -u or the log arrives empty and
+then in lumps, and the colour codes are stripped from the copy the panel reads. It
+also points the wrapper at whichever server port you set, so changing that port moves
+both halves rather than only one. A fourth terminal sits beside Proxy, Thinking and
+Split and shows that log live; a remote viewer can read it too, with any file paths
+stripped out on the host before it is sent. The wrapper itself stays yours - the panel
+writes launchers, not wrappers - and no voice traffic passes through the panel, so
+speech keeps working whether or not the panel is running.
+
+You should not have to hunt for any of those paths. Each one has a Choose file button
+that opens the same picker used elsewhere, showing only the right type of file, and if
+you already have a working TTS launcher there is an Import from a launcher button that
+reads all six settings out of it in one go - it only takes the paths and ports, nothing
+else is read from the file.
+
+Also fixed: the TTS terminal did not update on its own - you had to leave the page and
+come back. The panel writes its own proxy and thinking logs, so it always knew when those
+changed, but the TTS log is written by a separate program and nothing announced it. The
+panel now checks that file once a second while you are watching, and lines appear as they
+are written, like the other three.
+
+Also fixed: Write start-tts.bat could write into a different folder from the one shown
+as your PS1 Launcher Folder. It now always writes where Folder Settings says.
+
+Also fixed: the launcher folder viewer showed only .ps1 files, so the start-tts.bat the
+panel had just written could not be seen from inside the panel. There is now an Open
+launcher folder button on the TTS page as well.
+
+Also fixed: a GPU serial written into a server's card could still be read by someone
+viewing the panel from another PC. It is now hidden like the other serials, while the
+Live Network graph keeps drawing exactly as before.
+
+v3.70 patch1: builds can now be told apart. The version in the header, the line printed
+at startup and the comment at the top of a generated launcher all carry the patch number
+and a short build hash, so you can always check which build is actually running rather
+than guessing from the release name. The terminal also shows the time of its last refresh
+beside the source name, so a feed that has stopped updating is visible straight away
+instead of looking like a quiet log.
+
+v3.70 patch2: the panel can now do the translating itself. Under Proxy then TTS [Alpha]
+there is a choice of who answers SkyrimNet - your own wrapper, as before, or the panel.
+Choosing the panel means there is no second program to install, no python environment and
+no launcher to run by hand; point SkyrimNet's TTS endpoint at the panel and that is all.
+The trade is that voices then depend on the panel running, so it is off unless you pick it,
+and your existing setup is untouched either way. The startup ping SkyrimNet sends is
+answered locally by default, returning a moment of silence rather than spending a second of
+graphics card time generating the word "ping".
+
+v3.70 patch3: when the panel is doing the translating, the launcher it writes now starts
+only the TTS server. Before it also tried to start a wrapper, which could not work because
+the panel was already answering on that port. The model still needs hosting, so the server
+half remains and the launcher says plainly that the panel is handling the rest.
+
+v3.70 patch4: the panel as wrapper now sends the reference voice in the same form the
+standalone wrapper always did. It was passing the uploaded file straight through, and the
+TTS server rejected it; the file is now rewritten cleanly first. When the server does refuse
+something, its own explanation is written to the log instead of a bare "Bad Request", and a
+line that finds no reference voice at all says so rather than reporting that it computed one.
+
+v3.70 patch5: one button. With the panel doing the translating, the only thing still
+started by hand was the TTS server itself, so there is now a Start button on the TTS page
+that runs it with the right card, the right flags and its output kept in a log. A line
+beside it says whether both halves are up, and the state only reads ready when the server
+is answering and the panel is listening. Pressing Start when something is already serving
+does nothing rather than starting a second one, so it is safe next to a launcher you may
+still be running yourself.
+
+v3.70 patch6: the Start button now says what it is doing. The TTS server does not open its
+port until the model has finished loading, so for the first several seconds nothing looked
+different and the button appeared to have done nothing at all. It now reads Launching while
+that happens, cannot be pressed again, and the line beside it explains that it is waiting
+for the server to answer. If three minutes pass without one, it says so and points at the
+server log rather than waiting forever.
+
+v3.70 patch7: there is now a TTS Guide under User Guide. It walks through setting the whole
+thing up from nothing in eight steps, explains the difference between letting the panel do
+the translating and keeping your own wrapper, and lists what to check when it does not work.
+It also says plainly what the TTS support is: experimental, and written against one specific
+build of MOSS-TTS rather than TTS servers in general, so a different one will not work here
+even if it looks similar. The voices SkyrimNet already supports by itself need none of it.
+
+v3.71: a review pass over the new text-to-speech code, and four fixes from it. The panel's
+TTS listener accepts connections from the network so a second PC can reach it, but it was
+not checking who was calling - it now applies the same address filter the proxy has always
+used, so a machine the proxy would turn away is turned away here too. It also no longer
+trusts a caller's claim about how large a request is, refusing anything oversized instead
+of setting aside room for it. Generated speech files were piling up in a temporary folder
+for as long as the game ran and are now kept to the most recent two dozen, and starting the
+TTS server no longer leaves a file handle behind each time. Everything from v3.70 and its
+patches is included.
+
+v3.71 patch1: closing the browser now shuts the TTS server down as well. The panel already
+stopped the language model servers when the last tab closed, but a TTS server it had started
+was left running and kept the voice model sitting in graphics memory even though nothing
+could reach it any more. It is now stopped along with everything else, and the Terminate
+button does the same. A TTS server you started yourself from a launcher is deliberately left
+alone, since in that arrangement it is meant to keep working without the panel.
+
+v3.71 patch2: the Permissions page was out of date. It still described three terminals when
+there are four, and made no mention of the TTS page at all - so it understated what someone
+viewing from another PC can see and left out which TTS controls are yours alone. It now
+matches what the app actually does, and the release checks compare its claims against the
+code that enforces them, so it cannot quietly fall behind again. Opening Proxy Setup from a
+remote view is also refused immediately now rather than a moment later.
+
+v3.71 patch3: the TTS page now keeps up with the server. Pressing Terminate did stop it, but
+the page carried on showing it as ready with the Start button greyed out until you reloaded.
+The page refreshes itself along with everything else now, the panel watches the TTS server
+the same way it watches the language model servers, and starting or stopping announces the
+change straight away instead of leaving the page to notice. As on the other pages, it holds
+still while you are typing in a field so nothing is lost mid-edit.
+
+v3.71 patch4: the previous attempt at keeping the TTS page in step with the server did not
+work. The page was being redrawn, but a moment too early - before the new information had
+arrived - so it redrew itself exactly as it already was. It now redraws at the point the
+fresh status comes in, which is where the rest of the app does it, and the release checks
+drive the page through a real change rather than merely confirming the code contains an
+instruction to redraw.
+
+v3.71 patch5: the TTS terminal now has the same Adjust menu as the others, so its text
+size and font can be set independently and the setting is remembered - previously it
+borrowed the dashboard terminal's and had no controls of its own. Stopping the TTS server
+also shows a shutting down state while the server is closing, instead of appearing to be
+already stopped a moment before it is.
+
+v3.71 patch6: stopping the TTS server now shows what it is doing. The previous attempt
+could not work: the panel waited for the server to close before answering the page at all,
+so by the time anything could be displayed it was already finished. Stopping now happens in
+the background and the page is told immediately, so it reads shutting down for as long as
+the model takes to unload and only then stopped. Neither button can be pressed during that
+gap, so a restart cannot collide with a shutdown still in progress.
+
+v3.71 patch7: pressing Terminate now shows the TTS server shutting down as it happens. The
+panel deliberately holds off refreshing a page while a change is still being saved, and
+Terminate counts as one for as long as it runs, so the page waited and only found out once
+everything had already stopped. The TTS page is now told directly by the button that pressed
+it. The wording is also consistent - it says shutting down whether you stopped the server
+from its own button or from Terminate.
+
+v3.72: a sweep over the whole project, and two things from it. The proxy accepted a claim
+about how large an incoming request was and set aside room for it; like the TTS side it now
+refuses anything absurd instead. Reference voice samples were also being kept indefinitely
+in a temporary folder and are now trimmed to the most recent few dozen, which costs nothing
+since they are sent again if they are needed. Everything from v3.71 and its patches is
+included.

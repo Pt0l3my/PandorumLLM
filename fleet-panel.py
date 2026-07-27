@@ -26,7 +26,31 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 APP_NAME    = "PandorumLLM"
-APP_VERSION = "v3.67 Beta"
+APP_VERSION = "v3.72 Beta"
+APP_RELEASE_TAG = "v3.72-beta"   # the tag this build ships under
+APP_PATCH = 0                                 # patch number; 0 = none
+TERM_SCALE_KINDS = ("dashboard", "thinking", "splitd", "splitt", "tts")
+TERM_SCALE_LEGACY = ("split",)                # older configs stored one "split" entry
+TTS_LOG_NAME = "tts.log"                      # fixed name; the launcher writes it into log_dir()
+APP_VER_UI = APP_VERSION.replace(" ", "-p%d " % APP_PATCH, 1) if APP_PATCH else APP_VERSION
+
+def _build_id():
+    """Identity of the file actually running: replacing a file is not the same as
+    running it, and a stale instance on the port looks identical from the browser."""
+    try:
+        path = os.path.abspath(__file__)
+    except Exception:
+        path = "fleet-panel.py"
+    try:
+        with open(path, "rb") as f:
+            blob = f.read()
+        return {"path": path, "sha": hashlib.sha256(blob).hexdigest()[:12],
+                "kb": len(blob) // 1024,
+                "mtime": time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(path)))}
+    except Exception:
+        return {"path": path, "sha": "?", "kb": 0, "mtime": "?"}
+BUILD_ID = _build_id()
+TAKEOVER = []                                 # set when we displaced a running instance
 PORT_CANDIDATES = [50607, 50617, 50627, 50637, 50647]   # edit these if they clash (valid ports: 1-65535)
 PORT = PORT_CANDIDATES[0]                          # runtime value; set by choose_port()
 MAX_SLOTS   = 20
@@ -45,6 +69,15 @@ DEF_SETTINGS = {
     "launcherDir":  os.path.join(STACK, "ps1-launchers"),
     "templateFile": os.path.join(STACK, "launcher-template.ps1"),
     "onePC": True,
+    "networkMode": "localhost",
+    "peerAddr": "",
+    "ttsServerExe": "", "ttsModel": "", "ttsServerPort": "1240", "ttsGpuId": "",
+    "ttsPython": "", "ttsWrapper": "", "ttsWrapperPort": "7860",
+    "ttsWrapMode": "off", "ttsAnswerPing": "on",
+    "autoRefresh": 0,
+    "srvEdOpen": False,
+    "observerOn": False,
+    "activeProfile": "",
     "outputDir":    os.path.join(STACK, "ps1-launchers"),
     "logDir":       os.path.join(STACK, "logs"),
     "modelsDir":    os.path.join(STACK, "models"),
@@ -135,6 +168,7 @@ def seed_default_providers(cfg):
         p["samplerSource"] = "server"             # the shipped side
         p["detectSN"] = False
         p["emoji"] = DEFAULT_PROVIDER_EMOJI.get(nm, "")
+        p["enabled"] = True                       # shipped state is on
         seen.add(int(p.get("port")))
     missing = [pp for pp in factory if pp not in seen]
     if missing:
@@ -230,7 +264,8 @@ def load_config():
             s["params"] = seed
             changed = True
         for p in s.get("providers", []) or []:
-            p["enabled"] = True          # providers are always on; SkyrimNet simply may not call one
+            p.setdefault("enabled", True)   # a disabled provider keeps its port shut; the
+                                           # proxy and the yaml writer both honour this
             if "emoji" not in p:
                 p["emoji"] = AGENT_EMOJI.get(p.get("title", ""), "")
                 changed = True
@@ -380,7 +415,7 @@ def log_error(source, msg, record=True):
             ld = log_dir()
             ERR_FILE[0] = pick_rotating(ld, "error_", 20)
             with open(ERR_FILE[0], "w", encoding="utf-8") as f:
-                f.write("=== %s %s error log - session %s ===\n" % (APP_NAME, APP_VERSION, time.strftime("%Y-%m-%d %H:%M:%S")))
+                f.write("=== %s %s error log - session %s ===\n" % (APP_NAME, APP_VER_UI, time.strftime("%Y-%m-%d %H:%M:%S")))
         with open(ERR_FILE[0], "a", encoding="utf-8") as f:
             f.write("[%s] [%s] %s\n" % (time.strftime("%H:%M:%S"), source, str(msg).strip()[:500]))
     except Exception:
@@ -610,6 +645,8 @@ def api_profile_save(body):
         os.makedirs(PROFILE_DIR, exist_ok=True)
         with open(p, "w", encoding="utf-8") as f:
             json.dump(_profile_snapshot(cfg), f, indent=2)
+        cfg["settings"]["activeProfile"] = name
+        save_config(cfg)
     except Exception as e:
         return {"error": "cannot write the profile: %s" % e}
     panel_log("[panel] profile saved: %s" % p)
@@ -635,6 +672,7 @@ def api_profile_load(body):
     for k, v in (prof.get("settings") or {}).items():
         if v:
             cfg["settings"][k] = v
+    cfg["settings"]["activeProfile"] = name
     save_config(cfg)
     PROXY.sync()
     panel_log("[panel] profile loaded: %s" % name)
@@ -770,6 +808,8 @@ def api_path_check(body):
         except Exception:
             pass
         return {"ok": False}
+    if kind in ("logDir", "yamlOutDir", "outputDir"):
+        return {"ok": True}          # written to, not read from: existing is all it needs
     if kind == "launcherDir":
         try:
             return {"ok": any(f.lower().endswith(".ps1") for f in os.listdir(p))}
@@ -796,8 +836,10 @@ def debug_report():
     slots = cfg.get("slots", []) or []
     lines = []
     A = lines.append
-    A("PandorumLLM %s debug report" % APP_VERSION)
+    A("PandorumLLM %s debug report" % APP_VER_UI)
     A("generated %s" % time.strftime("%Y-%m-%d %H:%M:%S"))
+    A("running file %s" % BUILD_ID.get("path", "?"))
+    A("build %s, %s KB, modified %s" % (BUILD_ID.get("sha", "?"), BUILD_ID.get("kb", 0), BUILD_ID.get("mtime", "?")))
     A("")
     A("-- this machine ------------------------------------------------")
     A("  windows            : %s" % ("yes" if os.name == "nt" else "no (%s)" % sys.platform))
@@ -850,6 +892,22 @@ def debug_report():
             A("        launcher        : hand-edited")
         A("        providers       : %d" % len(s.get("providers", []) or []))
     A("")
+    A("-- port behaviour ----------------------------------------------")
+    A("  a closed port should refuse at once; waiting means something filtered it.")
+    _ctl = _free_port()
+    _rows = ([("control (closed)", _ctl)] if _ctl else []) + [("panel (listening)", PORT)]
+    _rows += [("server " + str(x.get("port") or "?"), x.get("port")) for x in slots if x.get("port")]
+    _odd = False
+    for _lab, _pt in _rows:
+        _v, _ms, _rc = _port_verdict(_pt)
+        A("  %-18s : %s in %dms%s" % (_lab, _v, _ms, (" (code %d)" % _rc) if _rc > 0 else ""))
+        if _v == "no answer":
+            _odd = True
+    if _odd:
+        A("  a port that neither answers nor refuses is being intercepted - look at")
+        A("  third-party antivirus or firewall, and at VPN or container filter drivers")
+    A("")
+
     A("-- recent problems ---------------------------------------------")
     A("  total this session : %d" % ERR_TOTAL[0])
     for kind, count in sorted(ERR_BY_TYPE.items(), key=lambda x: -x[1]):
@@ -1128,7 +1186,50 @@ def gguf_tensor_hint(path):
         pass
     return ""
 
+_KIND_FILE = os.path.join(STACK, "model-kinds.json")
+_KIND = {"map": None, "dirty": False}
+_KIND_LOCK = threading.Lock()
+def _kind_map():
+    if _KIND["map"] is None:
+        try:
+            with open(_KIND_FILE, encoding="utf-8") as f:
+                _KIND["map"] = json.load(f) or {}
+        except Exception:
+            _KIND["map"] = {}
+    return _KIND["map"]
+def _kind_flush():
+    with _KIND_LOCK:
+        if not _KIND["dirty"]:
+            return
+        data = dict(_KIND["map"] or {})
+        _KIND["dirty"] = False
+    try:
+        tmp = _KIND_FILE + ".%d.tmp" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, _KIND_FILE)
+    except Exception:
+        pass
 def model_kind(path):
+    """Cached in front of the header read: identifying a .gguf means opening it, and
+    a models folder full of multi-gigabyte files turned that into tens of seconds on
+    every scan. The key is path + size + mtime, so a changed file is re-read."""
+    try:
+        stt = os.stat(path)
+        key = "%s|%d|%d" % (os.path.abspath(path).lower(), stt.st_size, int(stt.st_mtime))
+    except Exception:
+        return _model_kind_read(path)
+    with _KIND_LOCK:
+        hit = _kind_map().get(key)
+    if hit:
+        return hit
+    val = _model_kind_read(path)
+    with _KIND_LOCK:
+        _kind_map()[key] = val
+        _KIND["dirty"] = True
+    return val
+
+def _model_kind_read(path):
     """What a .gguf actually is: a chat model, a vision projector, or a draft model.
 
     The header is asked first. The name is only consulted when the header says nothing
@@ -1158,8 +1259,9 @@ def list_models(cfg):
             roots.append(x)
     key = "|".join(roots)
     now = time.time()
-    if _models_cache["dir"] == key and now - _models_cache["t"] < 30:
+    if _models_cache["dir"] == key and now - _models_cache["t"] < 300:
         return _models_cache["items"]
+    _t_scan = time.time()
     items, seen = [], set()
     for base in roots:
         if not os.path.isdir(base):
@@ -1181,25 +1283,124 @@ def list_models(cfg):
                 items.append({"path": full, "name": os.path.relpath(full, base),
                               "kind": model_kind(full)})
     items.sort(key=lambda x: x["name"].lower())
+    _kind_flush()
+    _took = (time.time() - _t_scan) * 1000
+    if _took > 1000:
+        log_error("panel", "model folder scan: %dms for %d models (headers are read once "
+                           "per file and remembered in model-kinds.json)" % (_took, len(items)))
     _models_cache.update(t=now, dir=key, items=items)
     return items
 
 # ---------------------------------------------------------------- status / speeds
+_ST_CACHE = {}
+_ST_LOCK = threading.Lock()
+_ST_TTL = 1.2
+_ST_WAIT = 0.35    # loopback: a live server accepts at once and a dead port refuses at
+                   # once. Anything slower is a firewall/reservation dropping the SYN,
+                   # and waiting a full second per server for that answer is pointless.
+def _port_verdict(port, wait=1.5):
+    """What a connection to a local port actually does. A closed port refuses at
+    once (WSAECONNREFUSED); anything that waits out the clock is being filtered by
+    something in the path, which is worth knowing before a server tries to bind it."""
+    sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sk.settimeout(wait)
+    t0 = time.time()
+    try:
+        sk.connect(("127.0.0.1", int(port)))
+        return ("accepted", (time.time() - t0) * 1000, 0)
+    except ConnectionRefusedError:
+        return ("refused", (time.time() - t0) * 1000, 0)
+    except socket.timeout:
+        return ("no answer", (time.time() - t0) * 1000, -1)
+    except OSError as e:
+        return ("error", (time.time() - t0) * 1000, e.errno or -2)
+    finally:
+        try: sk.close()
+        except Exception: pass
+
+def _free_port():
+    """A port nothing is listening on: bind it, note it, let it go."""
+    sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sk.bind(("127.0.0.1", 0))
+        return sk.getsockname()[1]
+    except Exception:
+        return 0
+    finally:
+        try: sk.close()
+        except Exception: pass
+
+_PATH_RX = re.compile("(?:[A-Za-z]:" + chr(92)*2 + "|" + chr(92)*4 + ")[^" + chr(92) + "s" + chr(34) + chr(39) + "<>|]*")
+def _mask_paths_in(text):
+    """Strip anything path-shaped from text bound for a remote reader. Uses the same
+    masker as the state payload so there is one rule, not two."""
+    try:
+        return _PATH_RX.sub(lambda m: _mask_path(m.group(0)), text)
+    except Exception:
+        # a masker that fails must not hand back the unmasked text: fail closed
+        return "(hidden - could not be masked for a remote reader)"
+
+def _probe_slot(port):
+    """One loopback probe, resolver-free. socket.create_connection() and urlopen()
+    both call getaddrinfo even for a numeric address, and on a machine with no
+    default gateway that costs about a second EACH - three servers meant three
+    seconds on every state read. A raw socket skips it; /health is spoken over the
+    same connection instead of opening a second one."""
+    sk = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sk.settimeout(_ST_WAIT)
+    try:
+        sk.connect(("127.0.0.1", int(port)))       # connect(), not connect_ex: on
+    except Exception:                              # Windows connect_ex sits out the
+        try: sk.close()                            # timeout and answers WSAEWOULDBLOCK
+        except Exception: pass                     # instead of reporting the refusal
+        return {"state": "down"}
+    try:
+        sk.sendall(b"GET /health HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+        head = sk.recv(64).decode("latin-1", "replace")
+        if not head.startswith("HTTP/"):
+            return {"state": "wedged"}
+        code = int(head.split(" ", 2)[1])
+        if code == 503:
+            return {"state": "loading", "http": code}
+        return {"state": "serving", "http": code}
+    except Exception:
+        return {"state": "wedged"}
+    finally:
+        try: sk.close()
+        except Exception: pass
+
+def prime_slot_status(ports):
+    """Probe every server at once. Serial probes cost N x the timeout on machines
+    where a closed port is dropped rather than refused."""
+    todo = []
+    now = time.time()
+    with _ST_LOCK:
+        for p0 in ports:
+            if not p0:
+                continue
+            hit = _ST_CACHE.get(int(p0))
+            if not (hit and now - hit[0] < _ST_TTL):
+                todo.append(int(p0))
+    if len(todo) < 2:
+        return
+    ths = [threading.Thread(target=slot_status, args=(x,), daemon=True) for x in todo]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join(timeout=_ST_WAIT + 0.4)
+
 def slot_status(port):
     if not port:
         return {"state": "unknown"}
-    try:
-        s = socket.create_connection(("127.0.0.1", int(port)), timeout=1.0)
-        s.close()
-    except OSError:
-        return {"state": "down"}
-    try:
-        r = urlopen("http://127.0.0.1:%d/health" % int(port), timeout=2.0)
-        return {"state": "serving", "http": r.status}
-    except HTTPError as e:
-        return {"state": "loading" if e.code == 503 else "serving", "http": e.code}
-    except Exception:
-        return {"state": "wedged"}
+    key = int(port)
+    with _ST_LOCK:
+        hit = _ST_CACHE.get(key)
+        if hit and time.time() - hit[0] < _ST_TTL:
+            return dict(hit[1])
+    out = _probe_slot(key)
+    with _ST_LOCK:
+        _ST_CACHE[key] = (time.time(), dict(out))
+    return dict(out)
 
 NUM = r"([0-9]+(?:\.[0-9]+)?)"
 PP_RX = [re.compile(r"prompt eval time[^\n]*?\(\s*" + NUM + r"\s*tokens per second", re.I),
@@ -1270,7 +1471,7 @@ def api_state():
                      "detectSN": bool(p.get("detectSN")),
                      "samplerOverrides": {k: v for k, v in (p.get("samplerOverrides") or {}).items() if str(v).strip() != ""}} for p in (s.get("providers") or [])]}
                for s in cfg.get("slots", [])]
-    return {"app": APP_NAME, "version": APP_VERSION, "stack": STACK,
+    return {"app": APP_NAME, "version": APP_VER_UI, "build": BUILD_ID, "stack": STACK,
             "paramDefs": [{"key": k, "label": lab, "kind": kind, "def": dv, "opt": o,
                            "flag": f, "ref": ref}
                           for (k, lab, kind, dv, o, f, ref) in SERVER_PARAMS],
@@ -1281,7 +1482,8 @@ def api_state():
             "profiles": _profile_names(),
             "llamaOk": bool(cfg.get("settings", {}).get("llamacppPath"))
                        and os.path.isfile(os.path.join(cfg.get("settings", {}).get("llamacppPath", ""), "llama-server.exe")),
-            "listening": sorted(PROXY._servers.keys()),
+            "listening": sorted(PROXY._servers.keys()), "ttsWrap": TTSW.state(),
+            "ttsServer": tts_server_status(cfg),
             "launchers": list_launchers(cfg), "history": hist[:50]}
 
 def is_admin():
@@ -1343,12 +1545,37 @@ def sse_notify(kind, extra=None):
         except Exception: pass
 
 _status_sig = {"v": None}
+_tail_sig = {"v": None, "path": None}
+
+def tail_watch_sig(cfg=None):
+    """Signature of a log the panel does NOT write itself.
+
+    The proxy and thinking logs are written here, so report() can notify directly.
+    tts.log is written by a separate process, so nothing tells the panel it moved and
+    its terminal would sit still until some unrelated event happened to fire. mtime
+    plus size, because a same-second append can leave mtime unchanged on Windows.
+    """
+    try:
+        st = os.stat(os.path.join(log_dir(cfg), TTS_LOG_NAME))
+        return (st.st_mtime_ns, st.st_size)
+    except Exception:
+        return None
+
 def status_watch_loop():
+    n = 0
     while True:
-        time.sleep(3)
+        time.sleep(1)
+        n += 1
         try:
             if not SSE_CLIENTS:
                 continue
+            # one stat per second, and only while a page is actually watching
+            sig = tail_watch_sig()
+            if sig != _tail_sig["v"]:
+                _tail_sig["v"] = sig
+                sse_notify("tail")
+            if n % 3:
+                continue          # server status stays on its original 3s cadence
             cfg = load_config()
             sig = {}
             with ThreadPoolExecutor(max_workers=6) as ex:
@@ -1359,6 +1586,9 @@ def status_watch_loop():
                     return s.get("id"), "%s/%s" % (st.get("state"), st.get("http", ""))
                 for k, v in ex.map(one, cfg.get("slots", [])):
                     sig[k] = v
+            if (cfg.get("settings", {}).get("ttsServerExe") or "").strip():
+                _t = slot_status(tts_server_port(cfg))     # only when TTS is configured
+                sig["_tts"] = "%s/%s" % (_t.get("state"), _t.get("http", ""))
             if sig != _status_sig["v"]:
                 _status_sig["v"] = sig
                 sse_notify("state")
@@ -1418,10 +1648,19 @@ def full_exit(reason, kill_servers=True):
         n = sweep_launcher_shells()          # -Stop misses shells with no live port
         if n:
             panel_log("[panel] closed %d leftover launcher window(s)" % n)
+        try:
+            # a TTS server the panel started is the panel's to clean up; left running it
+            # holds the model in VRAM with nothing able to reach it
+            stop_tts_server(reason)
+        except Exception:
+            pass
     try:
         for srv in list(PROXY._servers.values()):
             import threading as _th
             _th.Thread(target=srv.shutdown, daemon=True).start()
+        if getattr(TTSW, "_srv", None):
+            import threading as _th2
+            _th2.Thread(target=TTSW._srv.shutdown, daemon=True).start()
     except Exception: pass
     time.sleep(0.5)
     os._exit(0)
@@ -1449,6 +1688,7 @@ def watchdog_loop():
 
 def api_terminate(body):
     panel_log("[panel] terminate all servers")
+    stop_tts_server("terminate button", wait=False)      # a panel-started TTS server counts as one
     return {"log": _stamp_log(run_fleet(["-Stop"]))}
 
 def api_exit(body):
@@ -1865,10 +2105,19 @@ def _list_drives():
     return ["/"]
 
 def api_browse_dirs(body):
-    """Directories-only browser for SETTING paths. Never returns files. Host-only."""
+    """Browser for SETTING paths. Host-only.
+
+    Directories only by default. When "exts" is supplied it ALSO lists files with those
+    extensions, because a path field naming a file cannot be filled from a folder list.
+    Not containment-gated, deliberately: the purpose is to reach a location that is not
+    yet configured, which is why the directory side was never gated either. Reachability
+    is the control - this endpoint is host-only.
+    """
+    exts = body.get("exts") or []
+    exts = [str(e).lower() for e in exts if str(e).startswith(".")][:8]
     path = str(body.get("path", "") or "").strip()
     if not path:
-        return {"path": "", "parent": None, "dirs": [], "drives": _list_drives()}
+        return {"path": "", "parent": None, "dirs": [], "files": [], "drives": _list_drives()}
     path = os.path.abspath(path)
     if not os.path.isdir(path):
         return {"error": "not a folder"}
@@ -1885,14 +2134,30 @@ def api_browse_dirs(body):
         return {"error": "access denied to this folder"}
     except Exception as e:
         return {"error": str(e)}
+    files = []
+    if exts:
+        try:
+            for name in sorted(os.listdir(path), key=str.lower):
+                if os.path.splitext(name)[1].lower() not in exts:
+                    continue
+                full = os.path.join(path, name)
+                try:
+                    if os.path.isfile(full):
+                        files.append({"name": name, "size": fmt_size(os.path.getsize(full))})
+                except Exception:
+                    pass
+                if len(files) >= 500:
+                    break
+        except Exception:
+            pass
     rest = os.path.splitdrive(path)[1]
     if rest in ("", os.sep, "/") or os.path.dirname(path.rstrip("\\/")) == path:
         parent = ""
     else:
         parent = os.path.dirname(path.rstrip("\\/"))
-    return {"path": path, "parent": parent, "dirs": dirs, "drives": _list_drives()}
+    return {"path": path, "parent": parent, "dirs": dirs, "drives": _list_drives(), "files": files}
 
-FOLDER_VIEW_EXT = {"models": {".gguf"}, "launcher": {".ps1"}, "yaml": {".yaml", ".yml"}, "log": {".log"}, "output": {".ps1"}}
+FOLDER_VIEW_EXT = {"models": {".gguf"}, "launcher": {".ps1", ".bat"}, "yaml": {".yaml", ".yml"}, "log": {".log"}, "output": {".ps1", ".bat"}}
 
 def api_folder_view(body):
     """List ONLY the relevant files (by extension) inside a configured folder, jailed to that folder. Host-only."""
@@ -1954,7 +2219,7 @@ def _stamp_log(text):
     return "\n".join((ts + ln) if ln.strip() else ln for ln in str(text).split("\n"))
 
 def api_launch_stack(body):
-    lines = [_stamp_log("=== %s %s - launch stack ===" % (APP_NAME, APP_VERSION))]
+    lines = [_stamp_log("=== %s %s - launch stack ===" % (APP_NAME, APP_VER_UI))]
     try:
         for _s in load_config().get("slots", []):
             if not _s.get("script"): continue
@@ -2089,7 +2354,7 @@ def api_settings(body):
         st["outputDir"] = str(body["launcherDir"])     # one folder serves as both
     if "termScales" in body and isinstance(body["termScales"], dict):
         clean = {}
-        for k in ("dashboard", "thinking", "splitd", "splitt", "split"):
+        for k in TERM_SCALE_KINDS + TERM_SCALE_LEGACY:
             d = body["termScales"].get(k)
             if isinstance(d, dict):
                 try:
@@ -2104,6 +2369,17 @@ def api_settings(body):
                     "font": fnt,
                 }
         st["termScales"] = clean
+    if "peerAddr" in body:
+        st["peerAddr"] = str(body["peerAddr"]).strip()[:80]
+    if "autoRefresh" in body:
+        try:
+            st["autoRefresh"] = max(0, min(3600, int(body["autoRefresh"])))
+        except Exception:
+            st["autoRefresh"] = 0
+    if "srvEdOpen" in body:
+        st["srvEdOpen"] = bool(body["srvEdOpen"])
+    if "observerOn" in body:
+        st["observerOn"] = bool(body["observerOn"])
     if "statsMonitoring" in body:
         st["statsMonitoring"] = bool(body["statsMonitoring"])
     if "onePC" in body:
@@ -2119,7 +2395,7 @@ def api_settings(body):
             if _k in ("bg", "card", "edge", "txt", "dim", "acc", "ok", "warn", "err") and re.fullmatch(r"#[0-9a-fA-F]{6}", str(_v)):
                 _clean[_k] = str(_v)
         st["themeVars"] = _clean
-    _HANDLED_KEYS = ("onePC", "devMode", "welcomeSeen", "termBlack", "networkMode", "themeName", "themeVars", "termScaleMode", "termFontSize", "termScaleOn", "termScales", "statsMonitoring", "customThemes")
+    _HANDLED_KEYS = ("onePC", "devMode", "welcomeSeen", "termBlack", "networkMode", "themeName", "themeVars", "termScaleMode", "termFontSize", "termScaleOn", "termScales", "statsMonitoring", "customThemes", "srvEdOpen", "observerOn", "autoRefresh", "peerAddr")
     for k in DEF_SETTINGS:
         if k not in body or k in _HANDLED_KEYS:
             continue
@@ -2134,6 +2410,10 @@ def api_settings(body):
         cfg["launcherDirs"] = [st["launcherDir"]]
     save_config(cfg)
     PROXY.sync()
+    try:
+        TTSW.sync()
+    except Exception:
+        pass
     return {"ok": True}
 
 # ---------------------------------------------------------------- creator / inspector / logs
@@ -2609,7 +2889,16 @@ def api_slot_launcher_load(body):
         text = open(path, encoding="utf-8-sig").read()
     except Exception as e:
         return {"error": "cannot read that file: %s" % e}
-    return api_slot_launcher_save({"slot": s.get("id"), "content": text})
+    res = api_slot_launcher_save({"slot": s.get("id"), "content": text})
+    if not (res or {}).get("error"):
+        # the text is copied into generated-launchers, so without this the picked
+        # file is forgotten and the picker can only show the generated copy
+        cfg2 = load_config()
+        s2 = _slot_by_id(cfg2, s.get("id"))
+        if s2 is not None:
+            s2["scriptSrc"] = path
+            save_config(cfg2)
+    return res
 
 def api_slot_launcher_default(body):
     """Drop any hand-edited launcher and go back to one built from the parameters."""
@@ -2638,6 +2927,91 @@ def api_slot_launcher_revert(body):
     if prev:
         return api_slot_launcher_save({"slot": s.get("id"), "content": prev})
     return api_slot_launcher_default({"slot": s.get("id")})
+
+APP_REPO = "Pt0l3my/PandorumLLM"
+_APP_UPD = {"t": 0.0, "res": None}
+def _ver_tuple(tag):
+    """v3.68-beta-patch4 -> (3, 68, 4); v3.67-beta-hotfix9 -> (3, 67, 9);
+    v3.65-beta -> (3, 65, 0). Comparing the tags as text called an older release
+    newer, because any difference at all counted as a difference."""
+    t = str(tag or "").lower()
+    m = re.search(r"v?([0-9]+)\.([0-9]+)", t)
+    if not m:
+        return None
+    n = re.search(r"(?:patch|hotfix|hf|p)[ _-]*([0-9]+)", t)
+    return (int(m.group(1)), int(m.group(2)), int(n.group(1)) if n else 0)
+
+PEER = {"t": 0.0, "state": None, "err": "", "addr": "", "ver": ""}
+_PEER_LOCK = threading.Lock()
+def _peer_poll_once():
+    """Read the other panel the way a browser would: its ordinary read-only remote
+    view. Nothing new is exposed on either side. Runs on its own thread with a short
+    timeout, because a client PC that is switched off must never slow this one down."""
+    try:
+        addr = str(((load_config().get("settings", {}) or {}).get("peerAddr") or "")).strip()
+    except Exception:
+        addr = ""
+    if not addr:
+        with _PEER_LOCK:
+            PEER.update(state=None, err="", addr="", ver="")
+        return
+    url = addr if addr.startswith("http") else ("http://" + addr)
+    try:
+        rq = Request(url.rstrip("/") + "/api/state", headers={"User-Agent": "PandorumLLM"})
+        data = json.loads(urlopen(rq, timeout=2.0).read().decode("utf-8"))
+        with _PEER_LOCK:
+            PEER.update(t=time.time(), state=data, err="", addr=addr,
+                        ver=str(data.get("version") or ""))
+    except Exception as e:
+        with _PEER_LOCK:
+            PEER.update(err=str(e)[:140], addr=addr)
+
+def _peer_loop():
+    while True:
+        try:
+            _peer_poll_once()
+        except Exception:
+            pass
+        time.sleep(5)
+
+def api_peer(body=None):
+    with _PEER_LOCK:
+        pr = dict(PEER)
+    age = (time.time() - pr["t"]) if pr["t"] else None
+    return {"addr": pr.get("addr", ""), "err": pr.get("err", ""),
+            "age": round(age, 1) if age is not None else None,
+            "fresh": bool(pr.get("state")) and age is not None and age < 20,
+            "version": pr.get("ver", ""), "mine": APP_VER_UI,
+            "state": pr.get("state")}
+
+def api_app_update(body=None):
+    """Ask GitHub for the newest PandorumLLM release tag.
+
+    Outbound, and the second such call in the panel. Nothing about the setup is sent -
+    it is a plain GET of a public release page. Answered from a 6 hour cache so opening
+    the panel repeatedly does not repeat the request. See SAFETY & TRUST.
+    """
+    now = time.time()
+    if _APP_UPD["res"] is not None and now - _APP_UPD["t"] < 21600:
+        return dict(_APP_UPD["res"], cached=True)
+    out = {"tag": "", "current": APP_RELEASE_TAG, "state": "unknown", "url": "https://github.com/%s/releases" % APP_REPO}
+    try:
+        rq = Request("https://api.github.com/repos/%s/releases/latest" % APP_REPO,
+                     headers={"User-Agent": "PandorumLLM", "Accept": "application/vnd.github+json"})
+        data = json.loads(urlopen(rq, timeout=10).read().decode("utf-8"))
+        tag = str(data.get("tag_name") or "").strip()
+        if tag:
+            out["tag"] = tag
+            out["url"] = str(data.get("html_url") or out["url"])
+            mine, theirs = _ver_tuple(APP_RELEASE_TAG), _ver_tuple(tag)
+            if mine and theirs:
+                out["state"] = "behind" if theirs > mine else ("current" if theirs == mine else "ahead")
+            else:
+                out["state"] = "current" if tag.lower() == APP_RELEASE_TAG.lower() else "unknown"
+    except Exception as e:
+        out["note"] = str(e)[:120]
+    _APP_UPD.update(t=now, res=dict(out))
+    return out
 
 def api_llama_update(body):
     """Ask GitHub for the newest llama.cpp release tag.
@@ -2691,16 +3065,16 @@ def api_slot_launcher(body):
     dest = os.path.join(GEN_LAUNCHER_DIR, safe + ".ps1")
     custom = (p.get("custom") or "").strip()
     if custom:
-        return {"ok": True, "path": dest, "custom": True, "content": custom}
+        return {"ok": True, "path": dest, "src": s.get("scriptSrc", ""), "custom": True, "content": custom}
     waiting = not (p.get("model") or "").strip()
     if waiting:
         # nothing is saved and nothing is launched from this: it is the launcher this
         # server will have, shown with the one thing still missing marked as such
         preview = dict(s)
         preview["params"] = dict(p, model="<no model chosen yet>")
-        return {"ok": True, "path": dest, "custom": False, "waiting": True,
+        return {"ok": True, "path": dest, "src": s.get("scriptSrc", ""), "custom": False, "waiting": True,
                 "content": build_param_launcher(cfg, preview, dest)}
-    return {"ok": True, "path": dest, "custom": False,
+    return {"ok": True, "path": dest, "src": s.get("scriptSrc", ""), "custom": False,
             "content": build_param_launcher(cfg, s, dest)}
 
 def api_creator_save(body, create=False):
@@ -2760,6 +3134,900 @@ def api_creator_remove(body):
     save_config(cfg)
     return {"ok": True}
 
+def tts_launcher_text(cfg=None):
+    """Build the TTS launcher .bat from settings.
+
+    Modelled line-for-line on the reference launcher that is known to work. Every
+    comment below marks something that has already cost debugging time; none of it
+    is decoration. Written as .bat, not .ps1, because this file is started by hand
+    and a double-clicked .ps1 opens in an editor instead of running.
+    """
+    cfg = cfg or load_config()
+    st = cfg.get("settings", {})
+    # When the panel is the wrapper it already holds the wrapper port, so a launcher
+    # that starts one too would collide. Server half only in that mode.
+    panel_wraps = str(st.get("ttsWrapMode", "off")).lower() == "on"
+    gid = st.get("ttsGpuId") or ""
+    gpu = next((g for g in cfg.get("gpus", []) if g.get("id") == gid), None)
+    uuid = (gpu or {}).get("uuid") or ""
+    gname = (gpu or {}).get("name") or ""
+    ld = log_dir(cfg)
+
+    if uuid:
+        mask = ('REM Isolate to one card by UUID, so a reboot or a reseated card cannot\n'
+                'REM change which GPU this lands on. Child windows started with START inherit it.\n'
+                'REM NOTE: after masking, the chosen card re-indexes to device 0 in-process, so the\n'
+                'REM server flag below is --main-gpu 0 (NOT its physical index). Easy to get wrong.\n'
+                'set CUDA_VISIBLE_DEVICES=' + uuid + '\n')
+    else:
+        mask = ('REM No GPU pinned in the panel, so every visible card is offered to the server.\n'
+                'REM Pick one under Proxy then TTS [Alpha] to pin it by UUID.\n')
+
+    L = []
+    a = L.append
+    a('@echo off')
+    a('REM ' + APP_NAME + ' ' + APP_VER_UI + ' (build ' + str(BUILD_ID.get("sha", "?"))
+      + ') - generated TTS launcher. Regenerating overwrites this file.')
+    if panel_wraps:
+        a('REM Starts the TTS server only - the panel is answering SkyrimNet itself, so')
+        a('REM there is no wrapper to start here and nothing to mirror into a log.')
+    else:
+        a('REM Starts the TTS server, waits for it to answer, then starts the wrapper')
+        a('REM and mirrors the wrapper output into a log the panel can render.')
+    if gname:
+        a('REM Card: ' + gname)
+    a('')
+    a('set SERVER=' + (st.get("ttsServerExe") or ""))
+    a('set MODEL=' + (st.get("ttsModel") or ""))
+    if not panel_wraps:
+        a('set WRAPPER=' + (st.get("ttsWrapper") or ""))
+        a('set PYTHON=' + (st.get("ttsPython") or ""))
+    a('set PORT=' + (str(st.get("ttsServerPort") or "1240")))
+    a('set WPORT=' + (str(st.get("ttsWrapperPort") or "7860")))
+    a('')
+    a('REM The log MUST sit in the panel log folder: the panel opens logs by name,')
+    a('REM joined to that folder, never by an arbitrary path.')
+    a('set LOGDIR=' + ld)
+    a('set LOG=%LOGDIR%\\' + TTS_LOG_NAME)
+    a('')
+    for line in mask.rstrip('\n').split('\n'):
+        a(line)
+    a('')
+    a('REM Fail loudly and stay open, rather than flashing a window and vanishing.')
+    a('if not exist "%SERVER%"  ( echo [X] server not found: %SERVER%   & pause & exit /b 1 )')
+    a('if not exist "%MODEL%"   ( echo [X] model not found: %MODEL%     & pause & exit /b 1 )')
+    if not panel_wraps:
+        a('if not exist "%WRAPPER%" ( echo [X] wrapper not found: %WRAPPER% & pause & exit /b 1 )')
+        a('if not exist "%PYTHON%"  ( echo [X] python not found: %PYTHON%   & pause & exit /b 1 )')
+    a('if not exist "%LOGDIR%"  ( echo [X] log folder not found: %LOGDIR% & pause & exit /b 1 )')
+    a('')
+    a('REM PowerShell 7 when present, Windows PowerShell otherwise. 7 writes UTF-8 without')
+    a('REM a BOM and 5.1 with one; the panel reads either.')
+    a('where pwsh >nul 2>&1 && (set PS=pwsh) || (set PS=powershell)')
+    a('')
+    a('echo Starting TTS server on port %PORT% ...')
+    a('start "TTS Server (%PORT%)" cmd /k ""%SERVER%" --model "%MODEL%" --main-gpu 0 --host 0.0.0.0 --port %PORT% --no-webui"')
+    a('')
+    a('echo Waiting for the server to answer /health ...')
+    a('set /a TRIES=0')
+    a(':waitloop')
+    a('set /a TRIES+=1')
+    a('for /f %%C in (\'curl -s -o nul -w "%%{http_code}" http://localhost:%PORT%/health 2^>nul\') do set CODE=%%C')
+    a('if "%CODE%"=="200" goto ready')
+    a('if %TRIES% geq 90 ( echo [X] server did not answer within ~180s. & pause & exit /b 1 )')
+    a('timeout /t 2 /nobreak >nul')
+    a('goto waitloop')
+    a('')
+    a(':ready')
+    a('echo Server ready.')
+    a('')
+    if panel_wraps:
+        a('echo The panel is answering SkyrimNet on port %WPORT% itself, so no wrapper is')
+        a('echo started here. Point the SkyrimNet TTS endpoint at this machine on %WPORT%.')
+        a('echo Leave this window open: closing it stops the TTS server.')
+        a('echo.')
+        a('echo Server : http://localhost:%PORT%')
+        a('timeout /t 5 /nobreak >nul')
+        return '\r\n'.join(L) + '\r\n'
+    a('')
+    a('REM Start each run on a fresh log, so the panel is not showing yesterday lines.')
+    a('del /q "%LOG%" >nul 2>&1')
+    a('')
+    a('REM The wrapper reads MOSS_TTS_URL from the environment and otherwise falls back')
+    a('REM to a hardcoded 127.0.0.1:1240 - without this line, changing the server port')
+    a('REM above moves the server while the wrapper keeps calling the old one.')
+    a('set MOSS_TTS_URL=http://127.0.0.1:%PORT%/tts')
+    a('REM Honoured only if the wrapper reads it; the reference wrapper hardcodes 7860.')
+    a('set WRAP_PORT=%WPORT%')
+    a('')
+    a('echo Starting wrapper on port %WPORT%, logging to %LOG% ...')
+    a('REM  -X utf8  : into a pipe Python falls back to the locale code page, which cannot')
+    a('REM             encode the wrapper emoji - it crashes on the first print. This forces')
+    a('REM             UTF-8; OutputEncoding below makes PowerShell decode it back.')
+    a('REM  -u       : Python line-buffers to a console but block-buffers to a pipe. Without')
+    a('REM             this the log sits empty and then arrives in 8KB lumps.')
+    a('REM  2>&1     : keep errors in the same stream so a failure reaches the log too.')
+    a('REM  The pipe inside -Command needs NO caret: cmd leaves | alone inside double quotes,')
+    a('REM  and a caret there would reach PowerShell as a stray token.')
+    a('REM  ForEach  : print the line to this window untouched, then write a copy with the')
+    a('REM             ANSI colour codes stripped for the panel to read.')
+    a('start "TTS Wrapper (%WPORT%)" %PS% -NoExit -NoProfile -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; $e=[char]27; & \'%PYTHON%\' -X utf8 -u \'%WRAPPER%\' 2>&1 | ForEach-Object { $_; ($_ -replace ($e + \'\\[[0-9;]*m\'), \'\') | Out-File -FilePath \'%LOG%\' -Append -Encoding utf8 }"')
+    a('')
+    a('echo.')
+    a('echo Server : http://localhost:%PORT%')
+    a('echo Wrapper: http://localhost:%WPORT%   - point the SkyrimNet TTS endpoint here')
+    a('echo Log    : %LOG%')
+    a('echo Open it in the panel under Proxy then TTS Terminal.')
+    a('timeout /t 5 /nobreak >nul')
+    return '\r\n'.join(L) + '\r\n'
+
+
+def api_tts_launcher(body):
+    cfg = load_config()
+    st = cfg.get("settings", {})
+    missing = [lab for key, lab in (("ttsServerExe", "server binary"), ("ttsModel", "model"),
+                                    ("ttsPython", "python"), ("ttsWrapper", "wrapper"))
+               if not (st.get(key) or "").strip()]
+    text = tts_launcher_text(cfg)
+    if not body.get("save"):
+        return {"content": text, "missing": missing}
+    # launcherDir wins. It is the field the user edits in Folder Settings; outputDir is
+    # SEEDED with a default and only overwritten when launcherDir is saved, so a config
+    # where launcherDir was never saved leaves the two disagreeing and the file lands in
+    # a folder the user was never shown.
+    #
+    # Deliberately NOT gated with _within(_all_roots()): _all_roots() is built FROM
+    # outputDir, so that test would contain the folder it is testing and could never
+    # fail - a containment check that enforces nothing. What keeps this endpoint safe is
+    # reachability: it is absent from REMOTE_POST_OK, so a remote caller is refused by
+    # the dispatcher, and the host choosing where its own launcher lands is the feature.
+    outd = os.path.abspath(st.get("launcherDir") or st.get("outputDir") or "")
+    if not (st.get("launcherDir") or st.get("outputDir")):
+        return {"error": "set the PS1 Launcher Folder under Folder Settings first - the launcher is written there"}
+    if not os.path.isdir(outd):
+        return {"error": "launcher folder does not exist: %s" % outd}
+    path = os.path.join(outd, "start-tts.bat")
+    try:
+        with open(path, "wb") as f:          # .bat: no BOM, CRLF (see the encoding table)
+            f.write(text.encode("utf-8"))
+    except Exception as e:
+        return {"error": str(e)}
+    panel_log("[panel] TTS launcher written: %s" % path)
+    return {"content": text, "path": path, "missing": missing}
+
+
+def api_tts_import(body):
+    """Read a launcher (.bat/.cmd/.ps1) and pull the TTS paths out of it.
+
+    Classifies by extension, not by variable name, so it works whichever names the
+    author used. Returns ONLY the fields it recognised - never the file contents - so
+    pointing it at the wrong file leaks nothing. Host-only.
+    """
+    path = os.path.abspath(str(body.get("path", "") or "").strip())
+    if not os.path.isfile(path):
+        return {"error": "no such file: %s" % path}
+    if os.path.splitext(path)[1].lower() not in (".bat", ".cmd", ".ps1"):
+        return {"error": "expected a .bat, .cmd or .ps1 launcher"}
+    try:
+        txt = open(path, encoding="utf-8-sig", errors="replace").read()
+    except Exception as e:
+        return {"error": str(e)}
+
+    assigns = []
+    for m in re.finditer(r"(?im)^\s*set\s+([A-Za-z_]\w*)\s*=\s*(.+?)\s*$", txt):
+        assigns.append((m.group(1).upper(), m.group(2).strip().strip('"')))
+    for m in re.finditer("(?im)^\\s*\\$([A-Za-z_]\\w*)\\s*=\\s*[\"']([^\"']+)", txt):
+        assigns.append((m.group(1).upper(), m.group(2).strip()))
+
+    out = {}
+    for name, val in assigns:
+        if not val or "%" in val or "$" in val:
+            continue
+        ext = os.path.splitext(val)[1].lower()
+        # split on BOTH separators: os.path.basename does not treat "\\" as one off
+        # Windows, so this classifier would silently mis-file every path elsewhere
+        low = re.split(r"[\\/]", val)[-1].lower()
+        if ext == ".gguf":
+            out.setdefault("ttsModel", val)
+        elif low.startswith("python") and ext == ".exe":
+            out.setdefault("ttsPython", val)
+        elif ext == ".py":
+            out.setdefault("ttsWrapper", val)
+        elif ext == ".exe":
+            out.setdefault("ttsServerExe", val)
+        elif val.isdigit() and 1000 <= int(val) <= 65535 and "PORT" in name:
+            key = "ttsWrapperPort" if ("WRAP" in name or "GRADIO" in name) else "ttsServerPort"
+            out.setdefault(key, val)
+
+    if "ttsWrapperPort" not in out:
+        m = re.search(r"(?:wrapper|gradio)[^\n]*?localhost:(\d{4,5})", txt, re.I) \
+            or re.search(r"localhost:(\d{4,5})[^\n]*(?:wrapper|gradio|skyrimnet)", txt, re.I)
+        if m:
+            out["ttsWrapperPort"] = m.group(1)
+
+    if not out:
+        return {"error": "nothing recognisable in that file - expected set NAME=path lines"}
+    cfg = load_config()
+    st = cfg.setdefault("settings", {})
+    for k, v in out.items():
+        st[k] = v
+    save_config(cfg)
+    return {"found": out, "path": path}
+
+
+# ---------------------------------------------------------------- embedded TTS wrapper
+# The panel speaks the Gradio client protocol SkyrimNet's Zonos engine uses and
+# translates it to moss-tts-server's plain JSON, so no separate wrapper process is
+# needed. OFF by default: while it is on, voices depend on the panel running.
+#
+# Protocol (DEVELOPMENT.md section 13, confirmed against a real SkyrimNet log):
+#   POST /gradio_api/upload                      -> ["<abs path>"]
+#   HEAD /gradio_api/file=<abs path>             -> 200/404
+#   POST /gradio_api/call/generate_audio         -> {"event_id": "<32 hex>"}
+#   GET  /gradio_api/call/generate_audio/<id>    -> SSE complete|error
+#   GET  /gradio_api/file=<abs path>             -> the WAV bytes
+import array, base64, io, tempfile, uuid, wave as _wave
+from urllib.parse import unquote
+
+TTS_CHUNK_CHARS = 170        # chunk cap; longer utterances drift
+TTS_CHUNK_GAP_MS = 100       # silence stitched between chunks
+TTS_MAX_WORKERS = 4
+TTS_MAX_NEW_TOKENS = 2048
+TTS_RESULT_WAIT_S = 120.0
+
+
+def tts_normalize(text):
+    """Match the reference wrapper: collapse whitespace, end with punctuation.
+
+    The trailing full stop is why SkyrimNet's `ping` arrives as `ping.` - any ping
+    check must compare AFTER this, never against the literal.
+    """
+    text = " ".join(str(text or "").split())
+    if text and text[-1] not in ".!?,;\"'":
+        text += "."
+    return text
+
+
+def tts_chunks(text, maxc=TTS_CHUNK_CHARS):
+    """Split on sentence boundaries, packing greedily up to maxc."""
+    sentences = re.findall(r"[^.!?]+[.!?]+|\S[^.!?]*$", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
+    pieces = []
+    for s in sentences:
+        if len(s) <= maxc:
+            pieces.append(s)
+            continue
+        buf = ""
+        for part in re.split(r"(?<=,)\s+", s):
+            if len(part) > maxc:
+                if buf:
+                    pieces.append(buf.strip()); buf = ""
+                line = ""
+                for w in part.split():
+                    if len(line) + len(w) + 1 > maxc:
+                        pieces.append(line.strip()); line = w
+                    else:
+                        line = (line + " " + w).strip()
+                if line:
+                    pieces.append(line.strip())
+            elif len(buf) + len(part) + 1 > maxc:
+                pieces.append(buf.strip()); buf = part
+            else:
+                buf = (buf + " " + part).strip()
+        if buf:
+            pieces.append(buf.strip())
+    out, cur = [], ""
+    for p in pieces:
+        if not cur:
+            cur = p
+        elif len(cur) + len(p) + 1 <= maxc:
+            cur = cur + " " + p
+        else:
+            out.append(cur); cur = p
+    if cur:
+        out.append(cur)
+    return out or [text]
+
+
+def tts_wav_join(parts, gap_ms=TTS_CHUNK_GAP_MS):
+    """Concatenate WAV blobs with a silence gap. Stdlib `wave` only.
+
+    All parts come from one model, so the format is uniform; the first part's
+    parameters win and any part that disagrees is skipped rather than producing
+    a garbled join.
+    """
+    frames, params, gap = [], None, b""
+    for raw in parts:
+        if not raw:
+            continue
+        try:
+            with _wave.open(io.BytesIO(raw), "rb") as w:
+                p = w.getparams()
+                data = w.readframes(w.getnframes())
+        except Exception:
+            continue
+        if params is None:
+            params = p
+            gap = b"\x00" * int(p.framerate * gap_ms / 1000.0) * p.sampwidth * p.nchannels
+        elif (p.framerate, p.sampwidth, p.nchannels) != (
+                params.framerate, params.sampwidth, params.nchannels):
+            continue
+        elif frames:
+            frames.append(gap)
+        frames.append(data)
+    if params is None:
+        return None, 0, 0
+    buf = io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(params.nchannels)
+        w.setsampwidth(params.sampwidth)
+        w.setframerate(params.framerate)
+        w.writeframes(b"".join(frames))
+    body = buf.getvalue()
+    nframes = sum(len(f) for f in frames) // (params.sampwidth * params.nchannels)
+    return body, params.framerate, nframes
+
+
+def tts_wav_normalize(raw):
+    """Re-encode a reference voice to a canonical mono PCM WAV.
+
+    The reference wrapper round-trips it through soundfile before base64, which
+    quietly strips any extra RIFF chunks the producer left behind and rewrites a
+    clean header. Handing over the original bytes instead is the difference between
+    that wrapper working and this one being answered with 400.
+    """
+    try:
+        with _wave.open(io.BytesIO(raw), "rb") as w:
+            nch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            frames = w.readframes(w.getnframes())
+    except Exception:
+        return raw                      # not a WAV we can read: send it untouched
+    if nch > 1 and sw == 2:             # downmix without audioop (gone in 3.13)
+        a = array.array("h")
+        a.frombytes(frames[:len(frames) - (len(frames) % (2 * nch))])
+        mono = array.array("h", [int(sum(a[i:i + nch]) / nch) for i in range(0, len(a), nch)])
+        frames, nch = mono.tobytes(), 1
+    out = io.BytesIO()
+    with _wave.open(out, "wb") as w:
+        w.setnchannels(nch); w.setsampwidth(sw); w.setframerate(fr)
+        w.writeframes(frames)
+    return out.getvalue()
+
+
+def tts_speaker_path(v):
+    """Pull a filesystem path out of whatever shape the speaker_audio field arrives in.
+
+    The request body is never logged by SkyrimNet, so the exact form is unconfirmed -
+    Gradio FileData is a dict, but a bare string is equally plausible. Handle both
+    rather than guess one.
+    """
+    if isinstance(v, str):
+        return v or None
+    if isinstance(v, dict):
+        for k in ("path", "name", "orig_name"):
+            if v.get(k):
+                return str(v[k])
+    return None
+
+
+class TtsWrapper:
+    """Gradio-facing listener. One per panel; bound only while enabled."""
+
+    def __init__(self):
+        self._srv = None
+        self._port = None
+        self._lock = threading.Lock()
+        self._events = {}          # event_id -> {"done":Event, "path":str, "err":str}
+        self._voice = {}           # md5 -> base64 of the reference wav
+        self._dir = None
+
+    # ---- storage: everything this listener reads or writes lives in one folder,
+    # ---- because /gradio_api/file= takes an absolute path from the caller and the
+    # ---- listener is reachable from the LAN.
+    def dir(self):
+        if not self._dir:
+            d = os.path.join(tempfile.gettempdir(), "pandorum-tts")
+            os.makedirs(d, exist_ok=True)
+            self._dir = os.path.realpath(d)
+        return self._dir
+
+    def prune(self, keep=24, keep_voices=32):
+        """Every generated line leaves a WAV behind, and every distinct reference voice
+        leaves a folder. Without this the temp folder grows for as long as the game runs.
+        Mirrors prune_keep_newest for the panel's own logs. Dropping a voice folder is
+        safe: SkyrimNet re-uploads when its HEAD check comes back 404."""
+        try:
+            root = self.dir()
+            files = [os.path.join(root, f) for f in os.listdir(root)
+                     if f.startswith("out-") and f.endswith(".wav")]
+            for p in sorted(files, key=os.path.getmtime, reverse=True)[keep:]:
+                try: os.remove(p)
+                except Exception: pass
+            dirs = [os.path.join(root, d) for d in os.listdir(root)
+                    if os.path.isdir(os.path.join(root, d))]
+            for d in sorted(dirs, key=os.path.getmtime, reverse=True)[keep_voices:]:
+                try: shutil.rmtree(d, ignore_errors=True)
+                except Exception: pass
+        except Exception:
+            pass
+
+    def owns(self, path):
+        try:
+            p = os.path.normcase(os.path.realpath(path))
+        except Exception:
+            return False
+        r = os.path.normcase(self.dir())
+        return p == r or p.startswith(r + os.sep)
+
+    def upstream(self, cfg=None):
+        st = (cfg or load_config()).get("settings", {})
+        port = str(st.get("ttsServerPort") or "1240").strip() or "1240"
+        return "http://127.0.0.1:%s/tts" % port
+
+    # ---- lifecycle
+    def sync(self):
+        cfg = load_config()
+        st = cfg.get("settings", {})
+        on = str(st.get("ttsWrapMode", "off")).lower() == "on"
+        try:
+            port = int(str(st.get("ttsWrapperPort") or "7860").strip())
+        except Exception:
+            port = 7860
+        with self._lock:
+            if self._srv and (not on or port != self._port):
+                try:
+                    srv = self._srv
+                    threading.Thread(target=srv.shutdown, daemon=True).start()
+                    panel_log("[tts] closed listener :%d" % (self._port or 0))
+                except Exception:
+                    pass
+                self._srv, self._port = None, None
+            if on and not self._srv:
+                try:
+                    srv = _QuietServer(("0.0.0.0", port), _mk_tts_handler(self))
+                    self._srv, self._port = srv, port
+                    threading.Thread(target=srv.serve_forever, daemon=True).start()
+                    panel_log("[tts] listening :%d -> %s" % (port, self.upstream(cfg)))
+                except OSError as e:
+                    panel_log("[tts] FAILED to bind :%d (%s)" % (port, e))
+                    log_error("tts", "failed to bind :%d (%s) - another wrapper may hold it" % (port, e))
+        return {"listening": self._port}
+
+    def state(self):
+        return {"on": bool(self._srv), "port": self._port}
+
+    # ---- the human log the TTS terminal renders. Written here, so the panel can
+    # ---- notify directly instead of waiting for the file watcher.
+    def log(self, line):
+        try:
+            with open(os.path.join(log_dir(), TTS_LOG_NAME), "a", encoding="utf-8") as f:
+                f.write(line.rstrip() + "\n")
+            sse_notify("tail")
+        except Exception:
+            pass
+
+    # ---- protocol steps
+    def save_upload(self, filename, data):
+        name = re.split(r"[\\/]", str(filename or "voice.wav"))[-1]
+        name = re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "voice.wav"
+        sub = os.path.join(self.dir(), hashlib.md5(data).hexdigest())
+        os.makedirs(sub, exist_ok=True)
+        path = os.path.join(sub, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
+
+    def submit(self, fields):
+        eid = uuid.uuid4().hex
+        ev = {"done": threading.Event(), "path": "", "err": ""}
+        with self._lock:
+            self._events[eid] = ev
+            for k in list(self._events)[:-40]:      # keep the last 40
+                self._events.pop(k, None)
+        text = fields[1] if len(fields) > 1 else ""
+        ref = tts_speaker_path(fields[3]) if len(fields) > 3 else None
+        threading.Thread(target=self._run, args=(eid, text, ref), daemon=True).start()
+        return eid
+
+    def result(self, eid, timeout=TTS_RESULT_WAIT_S):
+        with self._lock:
+            ev = self._events.get(eid)
+        if not ev:
+            return {"err": "unknown event"}
+        ev["done"].wait(timeout=timeout)
+        if not ev["done"].is_set():
+            return {"err": "timed out"}
+        return {"path": ev["path"], "err": ev["err"]}
+
+    def _ref_b64(self, path):
+        if not path or not os.path.isfile(path):
+            return None, False
+        try:
+            with open(path, "rb") as f:
+                raw = f.read()
+        except Exception:
+            return None, False
+        h = hashlib.md5(raw).hexdigest()
+        with self._lock:
+            hit = h in self._voice
+            if hit:
+                return self._voice[h], True
+        b64 = base64.b64encode(tts_wav_normalize(raw)).decode("ascii")
+        with self._lock:
+            self._voice[h] = b64
+            for k in list(self._voice)[:-16]:
+                self._voice.pop(k, None)
+        return b64, False
+
+    def _post_chunk(self, url, text, ref_b64):
+        body = {"text": text, "max_new_tokens": TTS_MAX_NEW_TOKENS}
+        if ref_b64:
+            body["reference_wav_b64"] = ref_b64
+        req = _ureq.Request(url, data=json.dumps(body).encode("utf-8"),
+                            headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            r = _ureq.urlopen(req, timeout=120)
+        except _uerr.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8", "replace")[:400].strip()
+            except Exception:
+                pass
+            raise RuntimeError("HTTP %s from %s%s" % (
+                e.code, url, (" - " + detail) if detail else " (no detail returned)"))
+        with r:
+            raw = r.read()
+            g = float(r.headers.get("X-MOSS-Generate-Seconds") or 0)
+            d = float(r.headers.get("X-MOSS-Decode-Seconds") or 0)
+        return raw, g, d
+
+    def _run(self, eid, text, ref_path):
+        ev = self._events.get(eid)
+        t0 = time.time()
+        cfg = load_config()
+        st = cfg.get("settings", {})
+        processed = tts_normalize(text)
+        try:
+            # SkyrimNet pings at startup with a silent reference. Answering it here costs
+            # nothing; letting it through spends 600-1100ms of GPU saying "ping".
+            if str(st.get("ttsAnswerPing", "on")).lower() == "on" and \
+                    processed.rstrip(".!?").strip().lower() == "ping":
+                out = self._silence()
+                ev["path"] = out
+                self.log("\U0001F50C Ping answered locally (no GPU)")
+                return
+            ref_b64, cached = self._ref_b64(ref_path)
+            if ref_b64 is None:
+                self.log("\u26A0\uFE0F No reference voice resolved from %s" % (ref_path or "(none sent)"))
+            else:
+                self.log("\u267B\uFE0F Reused cached voice" if cached else "\U0001F195 Recomputing voice")
+            self.log("")
+            self.log("\U0001F3AD %s: \u3030\uFE0F %s \u3030\uFE0F" % (
+                tts_voice_name(ref_path), processed))
+            self.log("")
+            url = self.upstream(cfg)
+            chunks = tts_chunks(processed)
+            raws = [None] * len(chunks)
+            gen_s = dec_s = 0.0
+            with ThreadPoolExecutor(max_workers=min(len(chunks), TTS_MAX_WORKERS)) as ex:
+                futs = {ex.submit(self._post_chunk, url, c, ref_b64): i
+                        for i, c in enumerate(chunks)}
+                for fut, i in futs.items():
+                    raw, g, d = fut.result()
+                    raws[i] = raw
+                    gen_s += g; dec_s += d
+            body, rate, nframes = tts_wav_join(raws)
+            if not body:
+                raise RuntimeError("no audio returned by the TTS server")
+            out = os.path.join(self.dir(), "out-%s.wav" % eid)
+            with open(out, "wb") as f:
+                f.write(body)
+            self.prune()
+            ev["path"] = out
+            wall = time.time() - t0
+            secs = (nframes / rate) if rate else 0.0
+            over = max(0.0, (wall - gen_s - dec_s) * 1000.0)
+            note = ("  (%d chunks)" % len(chunks)) if len(chunks) > 1 else ""
+            self.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)%s" % (
+                (secs / wall) if wall else 0.0, wall, secs, note))
+            self.log("   %-9s%6.0f ms   %7d samples" % ("generate:", gen_s * 1000.0, nframes))
+            self.log("   %-9s%6.0f ms   %7.0f ms codec" % ("overhead:", over, dec_s * 1000.0))
+            self.log("\U0001F4BE Saved: %s (%.1f KB)" % (out, len(body) / 1024.0))
+            self.log("")
+        except Exception as e:
+            ev["err"] = str(e)[:200]
+            self.log("\u274C TTS failed: %s" % ev["err"])
+            log_error("tts", "generate failed: %s" % e)
+        finally:
+            ev["done"].set()
+
+    def _silence(self, ms=120):
+        out = os.path.join(self.dir(), "silence.wav")
+        if not os.path.isfile(out):
+            with _wave.open(out, "wb") as w:
+                w.setnchannels(1); w.setsampwidth(2); w.setframerate(24000)
+                w.writeframes(b"\x00" * int(24000 * ms / 1000.0) * 2)
+        return out
+
+
+def tts_voice_name(path):
+    if not path:
+        return "Default Voice"
+    n = re.split(r"[\\/]", str(path))[-1]
+    if n.lower().endswith(".wav"):
+        n = n[:-4]
+    n = re.sub(r"([a-z])([A-Z])", r"\1 \2", n)
+    return n.replace("_", " ").title() or "Default Voice"
+
+
+def tts_parse_multipart(body, ctype):
+    """Extract (filename, bytes) pairs. `cgi` was removed in 3.13, so parse by hand."""
+    m = re.search(r"boundary=([^;]+)", ctype or "")
+    if not m:
+        return []
+    bound = b"--" + m.group(1).strip().strip('"').encode("ascii", "replace")
+    out = []
+    for part in body.split(bound):
+        if b"\r\n\r\n" not in part:
+            continue
+        head, data = part.split(b"\r\n\r\n", 1)
+        if data.endswith(b"\r\n"):
+            data = data[:-2]
+        fn = re.search(rb'filename="([^"]*)"', head)
+        if fn and data:
+            out.append((fn.group(1).decode("utf-8", "replace"), data))
+    return out
+
+
+def _mk_tts_handler(mgr):
+    class _T(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+        MAX_BODY = 32 * 1024 * 1024      # a reference voice is ~250 KB
+
+        def log_message(self, *a):
+            pass
+
+        def _allowed(self):
+            """Same allowlist the proxy applies. Both listeners bind 0.0.0.0 for 2-PC
+            mode, so without this anyone on the LAN could upload files and spend GPU
+            time here while the proxy beside it refused them."""
+            allow = getattr(PROXY, "allow", None)
+            if allow is not None and self.client_address[0] not in allow:
+                self.send_response(403)
+                self.send_header("Content-Length", "0")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                log_error("tts", "rejected %s (not in IP allowlist)" % self.client_address[0])
+                return False
+            return True
+
+        def _json(self, code, obj):
+            body = json.dumps(obj).encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def _filepath(self):
+            i = self.path.find("file=")
+            return unquote(self.path[i + 5:]) if i >= 0 else ""
+
+        def do_HEAD(self):
+            if not self._allowed(): return
+            p = self._filepath()
+            ok = bool(p) and mgr.owns(p) and os.path.isfile(p)
+            self.send_response(200 if ok else 404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+
+        def do_GET(self):
+            if not self._allowed(): return
+            if "/gradio_api/file=" in self.path:
+                p = self._filepath()
+                # the listener is on 0.0.0.0 and the path comes from the caller, so
+                # anything outside our own folder is refused rather than served
+                if not (p and mgr.owns(p) and os.path.isfile(p)):
+                    self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers(); return
+                with open(p, "rb") as f:
+                    data = f.read()
+                self.send_response(200)
+                self.send_header("Content-Type", "audio/wav")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+                return
+            m = re.search(r"/gradio_api/call/generate_audio/([0-9a-f]+)", self.path)
+            if m:
+                r = mgr.result(m.group(1))
+                if r.get("err") or not r.get("path"):
+                    payload = "event: error\ndata: {\"error\": null}\n\n"
+                else:
+                    fd = [{"path": r["path"],
+                           "url": "http://127.0.0.1:%s/gradio_api/file=%s" % (mgr._port, r["path"]),
+                           "size": None, "orig_name": os.path.basename(r["path"]),
+                           "mime_type": None, "is_stream": False,
+                           "meta": {"_type": "gradio.FileData"}}]
+                    payload = "event: complete\ndata: %s\n\n" % json.dumps(fd)
+                body = payload.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+
+        def do_POST(self):
+            if not self._allowed(): return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except Exception:
+                n = 0
+            if n > self.MAX_BODY:        # do not allocate whatever a caller claims
+                self._json(413, {"error": "body too large"})
+                return
+            body = self.rfile.read(n) if n else b""
+            if self.path.startswith("/gradio_api/upload"):
+                files = tts_parse_multipart(body, self.headers.get("Content-Type") or "")
+                if not files:
+                    self._json(400, {"error": "no file"}); return
+                paths = [mgr.save_upload(fn, data) for fn, data in files]
+                self._json(200, paths)
+                return
+            if "/gradio_api/call/generate_audio" in self.path:
+                try:
+                    data = (json.loads(body.decode("utf-8")) or {}).get("data") or []
+                except Exception:
+                    data = []
+                if not data:
+                    self._json(400, {"error": "no data"}); return
+                self._json(200, {"event_id": mgr.submit(data)})
+                return
+            self._json(404, {"error": "not found"})
+    return _T
+
+
+TTSW = TtsWrapper()
+
+
+def tts_server_port(cfg=None):
+    try:
+        return int(str((cfg or load_config()).get("settings", {}).get("ttsServerPort") or "1240"))
+    except Exception:
+        return 1240
+
+
+def tts_server_status(cfg=None):
+    """Cached, resolver-free probe - same one the fleet slots use, so this costs no
+    more on a state read than one more server would."""
+    port = tts_server_port(cfg)
+    out = dict(slot_status(port))
+    out["port"] = port
+    out["pid"] = TTS_PROC.get("pid")
+    out["stopping"] = bool(TTS_PROC.get("stopping"))
+    return out
+
+
+TTS_PROC = {"pid": None, "proc": None, "stopping": False}
+
+
+def stop_tts_server(reason="", wait=True):
+    """Stop the TTS server IF THE PANEL STARTED IT.
+
+    Deliberately not "whatever holds the port": with the panel acting only as launcher
+    writer, the server belongs to the user's own launcher and must outlive the panel.
+    The panel cleans up what it started, nothing else.
+
+    wait=False terminates on a thread and reports "stopping" until the process is gone.
+    Unloading a large model is not instant, and a synchronous stop blocks the very
+    response that would have told the page anything was happening - so the shutdown was
+    real but unobservable. The exit path still waits, since the process is about to end.
+    """
+    p = TTS_PROC.get("proc")
+    pid = TTS_PROC.get("pid")
+    if not p and not pid:
+        return False
+    TTS_PROC["stopping"] = True
+    try:
+        with _ST_LOCK:
+            _ST_CACHE.pop(tts_server_port(), None)
+        sse_notify("state")          # say so BEFORE blocking, not after
+    except Exception:
+        pass
+
+    def _finish():
+        try:
+            if p and p.poll() is None:
+                p.terminate()
+                try: p.wait(timeout=6)
+                except Exception: p.kill()
+            panel_log("[tts] stopped the server (pid %s)%s" % (pid, (" - " + reason) if reason else ""))
+        except Exception as e:
+            log_error("tts", "could not stop the server: %s" % e)
+        TTS_PROC["pid"], TTS_PROC["proc"] = None, None
+        TTS_PROC["stopping"] = False
+        try:
+            with _ST_LOCK:
+                _ST_CACHE.pop(tts_server_port(), None)
+            sse_notify("state")
+        except Exception:
+            pass
+
+    if wait:
+        _finish()
+    else:
+        threading.Thread(target=_finish, daemon=True).start()
+    return True
+
+
+def api_tts_server(body):
+    """Start or stop moss-tts-server. Host-only: absent from REMOTE_POST_OK."""
+    action = str(body.get("action", "")).lower()
+    cfg = load_config()
+    st = cfg.get("settings", {})
+    port = tts_server_port(cfg)
+
+    if action == "stop":
+        stop_tts_server("stop button", wait=False)
+        _kill_port_owner(port)        # also catches a server the panel did not start
+        with _ST_LOCK:
+            _ST_CACHE.pop(port, None)      # do not report a stale "serving"
+        panel_log("[tts] stopped the server on :%d" % port)
+        return {"ok": True, "status": tts_server_status(cfg)}
+
+    if action != "start":
+        return {"error": "unknown action"}
+
+    cur = slot_status(port)
+    if cur.get("state") in ("serving", "loading"):
+        return {"ok": True, "already": True, "status": tts_server_status(cfg)}
+
+    exe = (st.get("ttsServerExe") or "").strip()
+    model = (st.get("ttsModel") or "").strip()
+    if not exe or not os.path.isfile(exe):
+        return {"error": "TTS server binary not found: %s" % (exe or "(not set)")}
+    if not model or not os.path.isfile(model):
+        return {"error": "TTS model not found: %s" % (model or "(not set)")}
+
+    gid = st.get("ttsGpuId") or ""
+    gpu = next((g for g in cfg.get("gpus", []) if g.get("id") == gid), None)
+    uuid_ = (gpu or {}).get("uuid") or ""
+    env = os.environ.copy()
+    if uuid_:
+        # after masking, the chosen card re-indexes to 0 in-process, so --main-gpu
+        # stays 0 rather than the physical index. Same trap as the launcher.
+        env["CUDA_VISIBLE_DEVICES"] = uuid_
+    args = [exe, "--model", model, "--main-gpu", "0", "--host", "0.0.0.0",
+            "--port", str(port), "--no-webui"]
+
+    try:
+        logf = open(os.path.join(log_dir(cfg), "tts-server.log"), "ab")
+    except Exception as e:
+        return {"error": "cannot open the server log: %s" % e}
+    flags = 0
+    if os.name == "nt":       # no console window, and its own group so a Ctrl+C
+        flags = 0x08000000 | 0x00000200   # in the panel's console does not reach it
+    try:
+        p = subprocess.Popen(args, env=env, stdout=logf, stderr=subprocess.STDOUT,
+                             cwd=os.path.dirname(exe) or None, creationflags=flags)
+    except Exception as e:
+        try: logf.close()
+        except Exception: pass
+        return {"error": "could not start the server: %s" % e}
+    try:
+        logf.close()      # the child holds its own duplicate; keeping ours leaks a
+    except Exception:     # handle on every start
+        pass
+    TTS_PROC["pid"], TTS_PROC["proc"] = p.pid, p
+    with _ST_LOCK:
+        _ST_CACHE.pop(port, None)
+    panel_log("[tts] started %s on :%d (pid %d)" % (os.path.basename(exe), port, p.pid))
+    sse_notify("state")
+    return {"ok": True, "started": True, "pid": p.pid, "status": tts_server_status(cfg)}
+
+
 def api_launcher_content(body):
     cfg = load_config()
     path = os.path.abspath(body.get("path", ""))
@@ -2790,12 +4058,19 @@ def api_logs():
     out.sort(key=lambda x: x["modified"], reverse=True)
     return {"dir": ld, "files": out}
 
-def api_tail(body):
+def api_tail(body, scope="host"):
     ld = log_dir()
     kind = body.get("kind", "")
     if kind in ("dashboard", "thinking"):
         files = sorted(glob.glob(os.path.join(ld, "*_%s.log" % kind)), key=os.path.getmtime, reverse=True)
         path = files[0] if files else None
+    elif kind == "tts":
+        # a fixed feed, NOT kind=file: one known name inside the log folder. It carries
+        # no caller-supplied path, so the remote objection to kind=file does not apply,
+        # and this stays readable on remote like the other three terminals.
+        path = os.path.join(ld, TTS_LOG_NAME)
+        if not os.path.isfile(path):
+            path = None
     elif kind == "file":
         name = os.path.basename(body.get("name", ""))
         path = os.path.join(ld, name)
@@ -2804,6 +4079,8 @@ def api_tail(body):
     else:
         return {"error": "bad kind"}
     if not path:
+        if kind == "tts":
+            return {"text": "(no %s yet - run the TTS launcher; it writes into the panel log folder)" % TTS_LOG_NAME, "file": ""}
         return {"text": "(no log file yet - hit [Launch] first, or check the log folder in [Setup])", "file": ""}
     try:
         with open(path, "rb") as f:
@@ -2811,7 +4088,12 @@ def api_tail(body):
             f.seek(max(0, f.tell() - 131072))
             text = ANSI_RX.sub("", f.read().decode("utf-8", errors="ignore"))
         lines = text.splitlines()[-400:]
-        return {"text": "\n".join(lines), "file": os.path.basename(path)}
+        text = "\n".join(lines)
+        if scope != "host":
+            # decided at the boundary, not in the page: a remote reader must never be
+            # sent a path, whichever program wrote the line
+            text = _mask_paths_in(text)
+        return {"text": text, "file": os.path.basename(path)}
     except Exception as e:
         return {"error": str(e)}
 
@@ -2834,6 +4116,7 @@ AGENT_EMOJI = {"Dialogue":"\U0001F4AC","GM":"\U0001F3B2","Combat":"\u2694\uFE0F"
                "Diary":"\u270D\uFE0F","Memory":"\U0001F9E0","Vision":"\U0001F441\uFE0F",
                "IntelEngine":"\U0001F6F0\uFE0F","SeverActions":"\U0001F4DC"}
 GATE_MAX_WAIT_S = 8.0
+PROXY_MAX_BODY = 64 * 1024 * 1024   # far beyond any real prompt, but bounded
 
 class GpuGate:
     def __init__(self):
@@ -3041,6 +4324,10 @@ PROXY = ProxyManager()
 
 class _QuietServer(ThreadingHTTPServer):
     daemon_threads = True
+    # socketserver defaults the listen backlog to 5. A browser opens several
+    # connections at once (page, state, tail, the event stream) and a second tab or a
+    # remote viewer doubles that, so the surplus was being dropped rather than queued.
+    request_queue_size = 128
     def handle_error(self, request, client_address):
         pass  # dropped sockets (WinError 10054 etc.) are expected, not actionable
 
@@ -3077,6 +4364,11 @@ def _mk_handler(mgr, listen_port):
                 log_error("proxy", "rejected %s on :%d (not in IP allowlist)" % (self.client_address[0], listen_port))
                 return
             length = int(self.headers.get("Content-Length", 0) or 0)
+            if length > PROXY_MAX_BODY:      # a chat request is kilobytes; never allocate
+                self.send_response(413)      # whatever a caller claims
+                self.send_header("Content-Length", "0"); self.end_headers()
+                log_error("proxy", "refused a %d byte body on :%d" % (length, listen_port))
+                return
             body = self.rfile.read(length) if length else None
             is_chat = wants_stream = False
             if self.command == "POST" and self.path.startswith("/v1/chat/completions") and body:
@@ -3280,6 +4572,8 @@ def api_provider_edit(body):
         if any(pp is not p and int(pp.get("port") or 0) == np for _, pp in allp) or np == PORT:
             return {"error": "port %d is already taken" % np}
         p["port"] = np
+    if "enabled" in body:
+        p["enabled"] = bool(body["enabled"]) if not isinstance(body["enabled"], str) else body["enabled"].lower() in ("1", "true", "on")
     if "thinking" in body:
         p["thinking"] = bool(body["thinking"]) if not isinstance(body["thinking"], str) else body["thinking"].lower() in ("1", "true", "on")
     if "priority" in body:
@@ -3368,7 +4662,7 @@ DEFAULT_PROVIDER_EMOJI = {
     "Dialogue": "\U0001F4AC", "GM": "\U0001F3B2", "Combat": "\u2694\uFE0F", "Meta": "\U0001F9EA",
     "UT": "\U0001F310", "AI-Assistant": "\U0001F916", "ActionEval": "\U0001F3C3",
     "Charbio": "\U0001F3AD", "Diary": "\u270D\uFE0F", "Memory": "\U0001F9E0",
-    "Vision": "\U0001F441\uFE0F", "IntelEngine": "\U0001F6F0\uFE0F", "SeverActions": "\U0001F527"}
+    "Vision": "\U0001F441\uFE0F", "IntelEngine": "\U0001F6F0\uFE0F", "SeverActions": "\U0001F4DC"}
 PROV_TALK = {"dialogue", "combat", "ut", "ai-assistant"}   # these speak to the player
 PROV_NARRATE = {"gm"}                                       # writes for the player, but can wait
 PROV_SMALL = {"meta"}                                       # short, frequent, wants speed
@@ -3533,6 +4827,9 @@ def _host_allowlist():
 def origin_host_ok(handler):
     """Reject cross-origin / rebinding: Host header must be ours; Origin (if present) must match."""
     host = (handler.headers.get("Host") or "").strip().lower()
+    hp0 = host.rsplit(":", 1)[0].strip("[]") if host else ""
+    if hp0 in ("localhost", "127.0.0.1", "::1") or _ip_class(hp0) in ("local", "lan"):
+        host = ""                             # literal own/LAN address: nothing to resolve
     if host and host not in _host_allowlist():
         # allow bare-IP hosts in private range (covers LAN access), reject public names
         hp = host.rsplit(":", 1)[0].strip("[]")
@@ -3549,7 +4846,15 @@ def origin_host_ok(handler):
             return False
     return True
 
-def _local_ips():
+_LIPS = {"ips": None, "ts": 0.0}
+_LIPS_LOCK = threading.Lock()
+def _local_ips(force=False):
+    # getaddrinfo(hostname) can stall for seconds on Windows boxes without a default
+    # gateway (DNS -> LLMNR -> NetBIOS walk). It used to run on EVERY api call via the
+    # origin check and taxed the whole panel; resolve at most once a minute instead.
+    with _LIPS_LOCK:
+        if not force and _LIPS["ips"] is not None and time.time() - _LIPS["ts"] < 60:
+            return set(_LIPS["ips"])
     ips = set()
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None):
@@ -3563,7 +4868,10 @@ def _local_ips():
         s.connect(("10.255.255.255", 1)); ips.add(s.getsockname()[0]); s.close()
     except Exception:
         pass
-    return {i for i in ips if _ip_class(i) == "lan"}
+    out = {i for i in ips if _ip_class(i) == "lan"}
+    with _LIPS_LOCK:
+        _LIPS["ips"] = set(out); _LIPS["ts"] = time.time()
+    return out
 
 def primary_lan_ip():
     ips = sorted(_local_ips())
@@ -3616,11 +4924,20 @@ def redact_state(st):
     for k in ("llamacppPath", "modelsDir", "outputDir", "templateFile", "logDir", "yamlPath", "yamlDir", "mo2Path"):
         if se.get(k):
             se[k] = _mask_path(se[k])
+    if se.get("peerAddr"):
+        se["peerAddr"] = "***"
     se["_masked"] = True
     for g in st.get("gpus", []) or []:
         if g.get("uuid"): g["uuid"] = _mask_uuid(g["uuid"])
         if "index" in g: g["index"] = _MASK
+    def _mask_gpu_tag(v):
+        # slots carry a free-text gpu tag. Historically a name substring ("5090"),
+        # but launcher-template.ps1 tells users to pin by UUID, so it often holds a
+        # real serial. Mask only when it is serial-shaped: gpuId stays the graph key
+        # and a plain name tag stays readable, so the remote graph is unaffected.
+        return _mask_uuid(v) if isinstance(v, str) and v.upper().startswith("GPU-") else v
     def scrub_slot(s):
+        if s.get("gpu"): s["gpu"] = _mask_gpu_tag(s["gpu"])
         for key in ("script",):
             if s.get(key): s[key] = _mask_path(s[key])
         if s.get("model"): s["model"] = _mask_path(s["model"])
@@ -3637,6 +4954,7 @@ def redact_state(st):
         scrub_slot(s)
     for s in st.get("routing", []) or []:
         if s.get("model"): s["model"] = _mask_path(s["model"])
+        if s.get("gpu"): s["gpu"] = _mask_gpu_tag(s["gpu"])
         # gpuId is an internal correspondence key (e.g. "g1"), not host-identifying - the real
         # secret is the GPU uuid (masked separately). Keep gpuId so the remote Live Network graph
         # draws the same GPU->server->provider lines and colours as the host.
@@ -3649,7 +4967,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def send_response(self, code, message=None):
         super().send_response(code, message)
-        self.send_header("X-App", "%s %s" % (APP_NAME, APP_VERSION))
+        self.send_header("X-App", "%s %s" % (APP_NAME, APP_VER_UI))
 
     def _send(self, code, ctype, payload, extra=None):
         data = payload if isinstance(payload, bytes) else payload.encode("utf-8", "replace")
@@ -3733,7 +5051,7 @@ class Handler(BaseHTTPRequestHandler):
                 SSE_CLIENTS.discard(q)
             return
         if u.path == "/" or u.path.startswith("/index"):
-            self._send(200, "text/html; charset=utf-8", PAGE.replace("__UIV__", APP_VERSION))
+            self._send(200, "text/html; charset=utf-8", PAGE.replace("__UIV__", APP_VER_UI).replace("__TSKINDS__", json.dumps(list(TERM_SCALE_KINDS))))
         elif u.path == "/api/state":
             _st = api_state()
             if getattr(self, "_scope", "host") == "remote":
@@ -3798,6 +5116,8 @@ class Handler(BaseHTTPRequestHandler):
             "/api/assign": api_assign, "/api/edit": api_edit,
             "/api/add": api_add, "/api/remove": api_remove,
             "/api/settings": api_settings, "/api/tail": api_tail,
+            "/api/tts-launcher": api_tts_launcher, "/api/tts-import": api_tts_import,
+            "/api/tts-server": api_tts_server,
             "/api/launch-stack": api_launch_stack, "/api/show-terminal": api_show_terminal,
             "/api/creator-add": api_creator_add, "/api/creator-remove": api_creator_remove,
             "/api/launcher-content": api_launcher_content,
@@ -3832,7 +5152,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/yaml-space-save": api_yaml_space_save, "/api/yaml-space-remove": api_yaml_space_remove,
             "/api/yaml-open-native": api_yaml_open_native,
             "/api/slot-params": api_slot_params, "/api/slot-launcher": api_slot_launcher,
-            "/api/llama-update": api_llama_update,
+            "/api/llama-update": api_llama_update, "/api/app-update": api_app_update, "/api/peer": api_peer,
             "/api/slot-launcher-save": api_slot_launcher_save, "/api/slot-launcher-load": api_slot_launcher_load,
             "/api/slot-launcher-default": api_slot_launcher_default, "/api/slot-launcher-revert": api_slot_launcher_revert,
             "/api/stats-reset": api_stats_reset,
@@ -3845,7 +5165,9 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, "application/json", '{"error":"read-only remote session"}'); return
         try:
             with CFG_LOCK:            # serialize all mutating endpoints: no lost updates
-                if self.path in routes:
+                if self.path == "/api/tail":
+                    out = api_tail(body, getattr(self, "_scope", "host"))
+                elif self.path in routes:
                     out = routes[self.path](body)
                 elif self.path == "/api/creator-save":
                     out = api_creator_save(body, create=False)
@@ -3891,7 +5213,7 @@ PAGE = """<!doctype html>
          font-feature-settings:"tnum"; }
   header { display:flex; align-items:center; gap:14px; padding:14px 22px 10px; flex-wrap:wrap; }
   h1 { font-size:20px; margin:0; }
-  .ver { color:var(--dim); font-size:12px; border:none; padding:2px 4px; }
+  .ver { color:var(--dim); font-size:12px; border:none; padding:2px 4px; white-space:nowrap; flex:0 0 auto; }
   .sub { color:var(--dim); font-size:12px; }
   .wrap { display:flex; align-items:flex-start; }
   /* the nav column and the page share one top edge, 12px below the wrap:
@@ -4013,8 +5335,8 @@ PAGE = """<!doctype html>
   .addcard { text-align:center; background:none; border:none; padding:0; }
   .provs { display:flex; flex-direction:column; gap:8px; margin-top:10px; }
   .prov { display:flex; align-items:center; gap:9px; flex-wrap:wrap; background:#0d0f13;
-          box-shadow:0 0 16px -1px rgba(0,0,0,.9);
-          border:none; border-radius:10px; padding:8px 10px; }
+          box-shadow:0 0 16px -1px rgba(0,0,0,.9); position:relative;
+          border:none; border-radius:10px; padding:8px 52px 8px 10px; }
   .grip { color:#4a5162; letter-spacing:-2px; user-select:none; cursor:grab; padding:2px 4px; }
   .grip:active { cursor:grabbing; }
   .uuid { filter:blur(4px); cursor:pointer; user-select:none; transition:filter .15s; }
@@ -4095,7 +5417,7 @@ PAGE = """<!doctype html>
   .slotgrid .pcell input.pnum { max-width:124px; }
   .slotgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(430px,1fr)); gap:14px; align-items:start; }
   .slotgrid > .card { margin:0; }
-  .prov { gap:12px 14px !important; padding:12px 14px !important; }
+  .prov { gap:12px 14px !important; padding:12px 56px 12px 14px !important; }
   .prov .row, .prov > .row { align-items:center; }
   .prov .portchip { border:none !important; box-shadow:none !important; background:transparent;
                     padding:0 2px; color:var(--dim); }
@@ -4139,6 +5461,33 @@ PAGE = """<!doctype html>
   .hdr-link, .hdr-ico { color:var(--dim); cursor:pointer; user-select:none;
                         transition:color .14s, text-shadow .14s, filter .14s; }
   .hdr-link { font-size:15.6px; font-weight:600; padding:3px 5px; }
+  .hdr-note { color:var(--dim); font-size:15.6px; font-weight:600; padding:3px 5px;
+              user-select:none; white-space:nowrap; }
+  #ref-now { padding-left:0; margin-left:-4px; }   /* the clock already pads this side */
+  #hdr-prof { display:flex; align-items:center; gap:24px; }   /* same gap as the row itself */
+  .hdr-note[data-act] { cursor:pointer; }
+  .hdr-note[data-act]:hover { color:#8cc6ff; text-shadow:0 0 9px rgba(77,163,255,.95); }
+  .ver { display:inline-flex; flex-direction:column; align-items:center; line-height:1.05;
+         cursor:pointer; user-select:none; border-radius:6px; }
+  .ver .upd { font-size:9.5px; font-weight:700; letter-spacing:.3px; margin-top:1px;
+              text-align:center; white-space:nowrap; }
+  .ver.uptodate { color:#7ee081; text-shadow:0 0 5px rgba(126,224,129,.45); }
+  .ver.behind { color:#e0c23c; text-shadow:0 0 9px rgba(224,194,60,.95);
+                animation:verpulse 1.6s ease-in-out infinite; }
+  @keyframes verpulse { 0%,100% { text-shadow:0 0 5px rgba(224,194,60,.55); }
+                        50% { text-shadow:0 0 14px rgba(224,194,60,1); } }
+  .peerview [data-hostonly] { display:none !important; }
+  .peerview [data-act] { pointer-events:none; }
+  .provoff { opacity:.5; transition:opacity .15s; }
+  .provoff .provpow { opacity:2; }        /* the control itself stays readable */
+  .provpow { position:absolute; right:12px; top:50%; transform:translateY(-50%);
+             background:none !important; border:none !important; box-shadow:none !important;
+             padding:2px 6px; font-size:26px; line-height:1; cursor:pointer; color:var(--ok);
+             text-shadow:0 0 7px rgba(126,224,129,.85); transition:color .15s, text-shadow .15s; }
+  .provpow.off { color:#ff5d5d; text-shadow:0 0 7px rgba(255,93,93,.85); }
+  .provpow:hover { text-shadow:0 0 12px rgba(126,224,129,1); }
+  .provpow.off:hover { text-shadow:0 0 12px rgba(255,93,93,1); }
+  .blueglow { color:#8cc6ff; text-shadow:0 0 9px rgba(77,163,255,.95); }
   .hdr-ico { display:inline-flex; align-items:center; padding:4px 5px; }
   .hdr-ico svg { width:18px; height:18px; }
   .hdr-link:hover, .hdr-link.on { color:#8cc6ff; text-shadow:0 0 9px rgba(77,163,255,.95); }
@@ -4350,7 +5699,8 @@ PAGE = """<!doctype html>
   .mand { display:inline-block; margin-left:8px; font-size:10px; font-weight:700; letter-spacing:.05em; color:var(--acc); background:rgba(181,243,32,.12);  border-radius:5px; padding:1px 6px; vertical-align:middle; text-transform:uppercase; }
   .gs-copy { color:var(--acc); cursor:pointer; text-decoration:underline; text-underline-offset:2px; font-weight:600; }
   .copied-flash { outline:2px solid var(--acc); outline-offset:2px; border-radius:6px; }
-  .hb { filter: blur(3.5px); cursor: pointer; } .hb.show { filter: none; } .pswrap .pshl .hb { pointer-events: auto; position: relative; z-index: 2; }
+  .hb { filter: blur(3.5px); cursor: pointer; }
+  input.hb:focus { filter: none; } .hb.show { filter: none; } .pswrap .pshl .hb { pointer-events: auto; position: relative; z-index: 2; }
   /* VS Code style YAML editor */
   .vsc-wrap { border:none; border-radius:6px; background:#1e1e1e; overflow:auto; max-height:460px; margin-top:8px; }
   .vsc-inner { display:flex; align-items:stretch; min-height:100%; width:max-content; min-width:100%; }
@@ -4649,18 +5999,17 @@ body.tmaxidle #navfly { display: none; }
   #termBtn.fadered { animation:redFade 1.1s ease-out forwards; }
 </style></head><body>
 <header>
-  <img src="/icon.ico?v=210" style="width:26px;height:26px;border-radius:6px" alt=""><h1 title="Pure awesomeness">PandorumLLM</h1><span class="ver" id="ver"></span>
+  <img src="/icon.ico?v=210" style="width:26px;height:26px;border-radius:6px" alt=""><h1 title="Pure awesomeness">PandorumLLM</h1><span class="ver" id="ver" data-act="verClick" role="button" tabindex="0"></span>
   <span id="fleet-dot" style="font-size:17px" title="fleet status: not running">⚫</span>
   <button class="go" id="launchBtn" data-hostonly onclick="launchStack(this)"><span class="alt">L</span><span class="alt">a</span><span class="alt">u</span><span class="alt">n</span><span class="alt">c</span><span class="alt">h</span><svg class="arcsvg" xmlns="http://www.w3.org/2000/svg"></svg></button>
   <button class="stop" id="stackBtn" data-hostonly data-act="stackToggle" title="Fleet server stack terminal"><svg viewBox="0 0 24 20" width="17" height="15" style="vertical-align:-3px"><rect x="1" y="1" width="22" height="18" rx="2.4" fill="#05070a"/><circle cx="19.4" cy="4.3" r="1.15" class="tlit"/><circle cx="15.8" cy="4.3" r="1.15" class="tlit"/><circle cx="12.2" cy="4.3" r="1.15" class="tlit"/><rect x="3.2" y="6.6" width="17.6" height="1.7" rx="0.85" class="tlit"/><path d="M4.4 10 8.4 12.9 4.4 15.8" fill="none" class="tlitstroke" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><text class="tglyph tlit" x="16.4" y="15.9" font-size="8.6" font-family="Consolas,monospace" text-anchor="middle">_</text></svg></button><button class="stop" id="termBtn" data-hostonly onclick="terminateAll(this)"><svg viewBox="0 0 16 16" width="14" height="14" style="vertical-align:-2px;margin-right:6px"><path fill="currentColor" fill-rule="evenodd" d="M3.2 1.3h9.6c1.05 0 1.9.85 1.9 1.9v9.6c0 1.05-.85 1.9-1.9 1.9H3.2c-1.05 0-1.9-.85-1.9-1.9V3.2c0-1.05.85-1.9 1.9-1.9Zm2.6 4.5v4.4h4.4V5.8H5.8Z"/></svg>Terminate</button>
   <button class="stop" data-hostonly onclick="exitPanel(this)">&#9211; Exit</button>
-  <span class="sub" id="sub">loading...</span>
-  <span style="margin-left:auto;display:flex;align-items:center;gap:6px">
-    <span data-hostonly style="display:contents"><span id="hdr-prof"></span></span>
+  <span style="margin-left:auto;display:flex;align-items:center;gap:24px">
+    <span style="display:contents"><span id="hdr-prof"></span></span>
     <span class="refwrap" id="refwrap">
       <span class="hdr-ico" data-act="refToggle" title="server UI auto refresh" role="button" tabindex="0">
         <svg viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.4"/><path d="M8 4.4V8l2.5 1.7" stroke-linecap="round"/></svg>
-      </span>
+      </span><span class="hdr-note" id="ref-now" data-act="refToggle" role="button" tabindex="0" title="server UI auto refresh"></span>
       <span class="refpop" id="refpop">
         <span class="hint" style="width:auto">Auto refresh</span>
         <select id="auto-ref" onchange="setAutoRef(this.value)" title="auto refresh interval">
@@ -4686,13 +6035,14 @@ body.tmaxidle #navfly { display: none; }
   <button id="nav-log" onclick="showTab('log')">Log</button>
 </nav>
 <main>
-  <div id="tab-servers">
+  <div id="tab-servers" style="display:none">
     <div class="subtabs">
       <button id="ssub-slots" class="on" onclick="showSsub('slots')">Servers</button>
       <button id="ssub-inspect" onclick="showSsub('inspect')">Server Editor</button>
       <button id="ssub-stats" onclick="showSsub('stats')">Server Statistics</button>
     </div>
     <div class="row" data-hostonly style="margin:-4px 0 10px">
+      <span class="hint" id="slotcount" style="width:auto;margin-right:12px"></span>
       <button class="stop" data-act="restoreSrv" title="rebuild the shipped servers with their default parameters and launchers - any providers are moved to the unallocated row rather than removed">Restore default servers</button>
     </div>
     <div id="pane-slots"><div id="slots"></div>
@@ -4718,7 +6068,7 @@ body.tmaxidle #navfly { display: none; }
       <div id="stpane-provider"></div>
     </div>
   </div>
-  <div id="tab-network" style="display:none"></div>
+  <div id="tab-network"></div>
   <div id="tab-launcher" style="display:none">
     <div class="subtabs">
       <button id="sub-creator" class="on" onclick="showSub('creator')">Creator</button>
@@ -4733,12 +6083,14 @@ body.tmaxidle #navfly { display: none; }
       <button id="dsub-term" class="on" onclick="showDsub('term')">Dashboard</button>
       <button id="dsub-setup" onclick="showDsub('setup')">Proxy Setup</button>
       <button id="dsub-yaml" data-hostonly onclick="showDsub('yaml')">SkyrimNet YAML</button>
+      <button id="dsub-tts" data-hostonly onclick="showDsub('tts')">TTS [Alpha]</button>
     </div>
     <div id="dpane-term">
       <div class="row" style="gap:8px;margin-bottom:10px">
         <button id="tsub-proxy" class="stop on" onclick="showTsub('proxy')">Proxy Terminal</button>
         <button id="tsub-think" class="stop" onclick="showTsub('think')">Thinking Content Terminal</button>
         <button id="tsub-split" class="stop" onclick="showTsub('split')">Split View Terminal</button>
+        <button id="tsub-tts" class="stop" onclick="showTsub('tts')">TTS Terminal</button>
         <span style="margin-left:auto"></span>
         <span class="bgwrap" id="bgwrap"><button class="stop" data-act="bgToggle" title="choose the terminal background">Terminal background color</button><span class="bgpop"><button class="stop bgopt" data-act="bgPick" data-v="0">Midnight</button><button class="stop bgopt" data-act="bgPick" data-v="1">Black</button></span></span>
       </div>
@@ -4757,9 +6109,13 @@ body.tmaxidle #navfly { display: none; }
       </div>
     </div>
       </div>
+      <div id="tpane-tts" style="display:none">
+    <div id="twrap-tts"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="tts-src"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="tts" id="tmaxbtn-tts">&#9210; Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="auto" id="termscale-auto-tts">Auto</button><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="manual" id="termscale-manual-tts">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="tts" id="tscalebtn-tts">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-tts" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-tts" data-fskind="tts" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-tts" data-fontkind="tts" class="tsel tfont"></select><span class="hint" id="termscale-msg-tts" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-tts"></pre></div></div>
+      </div>
     </div>
     <div id="dpane-setup" style="display:none"></div>
     <div id="dpane-yaml" style="display:none"></div>
+    <div id="dpane-tts" style="display:none"></div>
   </div>
   <div id="tab-setup" style="display:none"></div>
   <div id="tab-custom" style="display:none"></div>
@@ -4767,9 +6123,11 @@ body.tmaxidle #navfly { display: none; }
     <div class="subtabs">
       <button id="ugsub-main" class="on" onclick="showUgSub('main')">Main Guide</button>
       <button id="ugsub-params" onclick="showUgSub('params')">Sampler Guide</button>
+      <button id="ugsub-tts" onclick="showUgSub('tts')">TTS Guide</button>
     </div>
     <div id="ugpane-main"></div>
     <div id="ugpane-params" style="display:none"></div>
+    <div id="ugpane-tts" style="display:none"></div>
   </div>
   <div id="tab-log" style="display:none">
     <div class="subtabs">
@@ -4866,13 +6224,14 @@ function permTreeHtml() {
                      "Add / remove / restore providers",
                      "Save, load and delete profiles (files in profiles\\)",
                      "Provider Statistics, and turning monitoring on or off",
+                     "TTS setup, writing its launcher, starting and stopping its server",
                      "Main Guide setup flow"];
-  const remoteItems = ["View all terminals (Proxy / Thinking / Split)",
+  const remoteItems = ["View all terminals (Proxy / Thinking / Split / TTS)",
                        "Full-window, wrap, background colour",
                        "Live Network graph & fleet status",
                        "Providers and their allocation, read-only",
                        "Read-only - changes nothing on the host",
-                       "Proxy Setup, SkyrimNet YAML and Provider Statistics are not offered",
+                       "Proxy Setup, SkyrimNet YAML, TTS [Alpha] and Provider Statistics are not offered",
                        "IP / GPU / yaml panels are hidden entirely",
                        "Any IPs, paths, GPU IDs & filenames are stripped",
                        "The statistics endpoint is not answered at all"];
@@ -4926,7 +6285,7 @@ async function loadNetInfo() {
       ? '<span style="color:var(--ok)">ON - other PCs on your LAN can open the read-only view</span>'
       : "OFF - only this PC can open the panel";
     if (url) url.innerHTML = (r.mode === "lan" && r.lanUrl)
-      ? ('Open from another PC at: <b style="color:#4da3ff;text-shadow:0 0 7px rgba(77,163,255,.6),0 0 2px rgba(77,163,255,.9)">' + esc(r.lanUrl) + '</b>')
+      ? ('Open from another PC at: <b class="hb" style="color:#4da3ff;text-shadow:0 0 7px rgba(77,163,255,.6),0 0 2px rgba(77,163,255,.9)">' + esc(r.lanUrl) + '</b>')
       : "";
     const note = document.getElementById("netmode-note");
     if (note) note.innerHTML = on ? "" : '<span style="color:var(--warn)">Remote access is OFF - only this PC can open the panel.</span>';
@@ -4962,6 +6321,7 @@ function navGo(step) {
   navSync();
 }
 function showTab(t) {
+  trace("you", "opened " + t);
   if (!navJump && navHist[navAt] !== t) {
     navHist = navHist.slice(0, navAt + 1);        // a new visit drops anything ahead
     navHist.push(t);
@@ -5001,11 +6361,22 @@ function showSub(s) {
 // ITEM 12: User Guide holds the step-by-step guide and the sampler reference
 function showUgSub(s) {
   curUgSub = s;
-  $("ugpane-main").style.display = s === "main" ? "" : "none";
-  $("ugpane-params").style.display = s === "params" ? "" : "none";
-  $("ugsub-main").classList.toggle("on", s === "main");
-  $("ugsub-params").classList.toggle("on", s === "params");
-  if (s === "params") renderParams(); else renderHelper();
+  ["main", "params", "tts"].forEach(x => {          // one list, so a fourth guide is one entry
+    const p = $("ugpane-" + x), b = $("ugsub-" + x);
+    if (p) p.style.display = x === s ? "" : "none";
+    if (b) b.classList.toggle("on", x === s);
+  });
+  if (s === "params") renderParams();
+  else if (s === "tts") renderTtsGuide();
+  else renderHelper();
+}
+// generic click-to-copy for a code span, so a URL can be copied without the app
+// ever making an outbound request of its own
+function copyCode(el) {
+  const t = (el && el.textContent) || "";
+  const flash = () => { el.classList.add("copied-flash"); setTimeout(() => el.classList.remove("copied-flash"), 1000); };
+  if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(flash, flash);
+  else flash();
 }
 
 function showSsub(s) {
@@ -5022,7 +6393,7 @@ function showSsub(s) {
 }
 // Server Editor: read-only by default, unlocked with the padlock. Saving re-reads the
 // parameters out of the text, so the server cards stay a true view of what will run.
-let srvEd = { hist: [], at: -1, locked: true };
+let srvEd = { hist: [], at: -1, locked: null };   // null = not yet taken from settings
 function renderSrvInspector() {
   if (!state) return;
   const pane = $("pane-inspect");
@@ -5031,6 +6402,7 @@ function renderSrvInspector() {
     return '<option value="' + esc(s.id) + '"' + (s.id === window.__srvInspId ? " selected" : "") + '>'
       + esc((s.label || s.id) + "  :" + s.port) + '</option>';
   }).join("");
+  if (srvEd.locked === null) srvEd.locked = !((state.settings || {}).srvEdOpen);
   const lk = srvEd.locked;
   pane.innerHTML = '<div class="card"><div class="row" style="gap:8px;align-items:center">'
     + '<span class="hint" style="width:auto">Server</span>'
@@ -5073,6 +6445,24 @@ async function srvInspect() {
   const path = $("srvinsp-path"), note = $("srvinsp-note");
   if (r.error) { view.value = r.error; if (path) path.textContent = ""; return; }
   if (path) path.textContent = r.path;
+  // the picker mirrors the launcher actually saved on this server - not a session
+  // variable - so it survives restarts. A saved path outside the launcher folder
+  // (a hand-edit in generated-launchers) is shown as a synthetic "(current)" entry.
+  const pick = r.src || r.path || "";        // the file the user chose, not the copy
+  window.__srvEdPath = pick;
+  const pin = $("srvinsp-path-in");
+  if (pin && pick) {
+    let has = false;
+    for (const o of pin.options) if (o.value === pick) { has = true; break; }
+    if (!has) {
+      const o = document.createElement("option");
+      o.value = pick;
+      o.textContent = pick.split(String.fromCharCode(92)).pop()
+        + (r.src ? "  (loaded" : "  (current") + (r.custom ? ", hand-edited)" : ")");
+      pin.insertBefore(o, pin.options[1] || null);
+    }
+    pin.value = pick;
+  }
   view.value = r.content || "";
   srvEd.hist = [view.value]; srvEd.at = 0;
   if (note) {
@@ -5285,10 +6675,52 @@ function queueStats() {
 
 // header chrome (version, stack line, elevation banner, profiles) is global page state -
 // it repaints on every load() regardless of tab, in exactly one place
+let updInfo = null;                    // {state, tag, url} once GitHub has answered
+function paintVersion() {
+  const el = $("ver");
+  if (!el || !state) return;
+  const behind = updInfo && updInfo.state === "behind";
+  const current = updInfo && (updInfo.state === "current" || updInfo.state === "ahead");
+  el.className = "ver" + (behind ? " behind" : (current ? " uptodate" : ""));
+  el.title = behind ? ("a newer release is on GitHub: " + updInfo.tag)
+           : (current ? ((updInfo.state === "ahead") ? ("newer than the newest release on GitHub (" + updInfo.tag + ")")
+                                                     : "this is the newest release")
+                      : "click to check GitHub for a newer release");
+  el.innerHTML = esc(state.version) + (behind ? '<span class="upd">Update available!</span>' : "");
+}
+async function checkAppUpdate() {
+  try {
+    const r = await post("/api/app-update", {});   // host-only, like every other POST
+    updInfo = r && r.state ? r : null;
+  } catch (e) { updInfo = null; }
+  paintVersion();
+}
+function verClick() {
+  const u = (updInfo && updInfo.url) || "https://github.com/Pt0l3my/PandorumLLM/releases";
+  const head = (updInfo && updInfo.state === "behind")
+      ? ("A newer release is on GitHub: <b>" + esc(updInfo.tag) + "</b>")
+      : ((updInfo && updInfo.state === "current")
+          ? "This is the newest release."
+          : (updInfo && updInfo.state === "ahead")
+          ? ("This build is newer than the newest release on GitHub (<b>" + esc(updInfo.tag) + "</b>).")
+          : "GitHub has not been asked yet, or could not be reached.");
+  showModal('<h2 style="margin:2px 0 6px">Releases</h2>'
+    + '<p style="line-height:1.6;margin:8px 0 16px">' + head
+    + '<br>Open the releases page on github.com in a new tab?</p>'
+    + '<div class="row" style="justify-content:flex-end;gap:8px">'
+    + '<button class="stop" onclick="closeModal()">No</button>'
+    + '<button onclick="closeModal(); window.open(' + String.fromCharCode(39) + u
+    + String.fromCharCode(39) + ', ' + String.fromCharCode(39) + "_blank"
+    + String.fromCharCode(39) + ')">Yes</button></div>');
+}
 function paintChrome() {
   if (!state) return;
-  $("ver").textContent = state.version;
-  $("sub").textContent = state.stack + "   |   slots: " + state.slots.length + "/20";
+  paintVersion();
+  const sc = $("slotcount");
+  if (sc) sc.textContent = "slots: " + (state.slots || []).length + "/20";
+  const bi = state.build || {};
+  $("ver").title = bi.path ? (bi.path + String.fromCharCode(10) + "build " + bi.sha
+      + "  -  " + bi.kb + " KB  -  modified " + bi.mtime) : "";
   $("banner").style.display = state.elevated ? "none" : "block";
   const hp = $("hdr-prof");
   if (hp && !window.__profOpen) { const nh = profRow(); if (hp.innerHTML !== nh) hp.innerHTML = nh; }
@@ -5419,7 +6851,9 @@ function renderSetup() {
           + '</div>'
           + warn + '<div class="setnote" id="setnote-'+k+'"></div>' + extra;
       }).join("")
-    + '<div id="set-feedback" style="margin-top:12px;font-weight:600;min-height:1.2em"></div></div>';
+    + '<div id="set-feedback" style="margin-top:12px;font-weight:600;min-height:1.2em"></div></div>'
+    + '<div class="hint" style="max-width:820px;margin-top:10px">Installed at '
+    + esc((state && state.stack) || "") + '</div>';
   // restore unsaved edits the user had typed/pasted before this re-render
   SET_FIELDS.forEach(([k]) => {
     const el = $("set-"+k);
@@ -5554,7 +6988,7 @@ function renderDebug() {
   pane.dataset.built = "1";
   pane.innerHTML = '<div class="card">'
     + '<div class="row" style="gap:8px">'
-    + '<button class="stop" id="dbg-rec" data-act="dbgRec">Start recording</button>'
+    + '<button class="stop" id="dbg-rec" data-act="dbgRec">' + (traceOn ? "Stop recording" : "Start recording") + '</button>'
     + '<button class="stop" data-act="dbgClear">Clear</button>'
     + '<button class="stop" data-act="dbgCopy">Copy</button>'
     + '<button class="stop" data-act="dbgSave">Save to a file</button>'
@@ -5573,8 +7007,9 @@ function traceDraw() {
   out.textContent = traceLog.length ? traceText() : (traceOn ? "recording..." : "(not recording)");
   if (traceOn) out.scrollTop = out.scrollHeight;
 }
-function traceToggle() {
+function traceToggle(quiet) {
   traceOn = !traceOn;
+  if (!quiet) post("/api/settings", { observerOn: traceOn });
   if (traceOn) {
     traceLog = []; traceT0 = performance.now();
     if (!traceRaf) traceRaf = setInterval(traceTick, 250);
@@ -5763,17 +7198,17 @@ function termFontStack(label) {
   for (let i = 0; i < TERM_FONTS.length; i++) if (TERM_FONTS[i][0] === label) return TERM_FONTS[i][1];
   return TERM_FONTS[0][1];
 }
-const TS_KINDS = ["dashboard", "thinking", "splitd", "splitt"];
-let termScales = {
-  dashboard: { mode: "manual", size: 12, on: true, font: TERM_FONT_DEFAULT },
-  thinking:  { mode: "manual", size: 12, on: true, font: TERM_FONT_DEFAULT },
-  splitd:    { mode: "manual", size: 12, on: true, font: TERM_FONT_DEFAULT },
-  splitt:    { mode: "manual", size: 12, on: true, font: TERM_FONT_DEFAULT }
-};
-let tailNormalW = { dashboard: 0, thinking: 0, split: 0 };   // keyed by Full Window wrapper
-function tKind() { return curTsub === "think" ? "thinking" : curTsub === "split" ? "splitd" : "dashboard"; }
-function tsForId(id) { return id === "tail-thinking" ? termScales.thinking : id === "tail-splitd" ? termScales.splitd : id === "tail-splitt" ? termScales.splitt : termScales.dashboard; }
-function maxKindForId(id) { return id === "tail-thinking" ? "thinking" : (id === "tail-splitd" || id === "tail-splitt") ? "split" : "dashboard"; }
+const TS_KINDS = __TSKINDS__;   // injected from TERM_SCALE_KINDS - one list, not two
+let termScales = {};
+TS_KINDS.forEach(function(k) { termScales[k] = { mode: "manual", size: 12, on: true, font: TERM_FONT_DEFAULT }; });
+let tailNormalW = { dashboard: 0, thinking: 0, split: 0, tts: 0 };   // keyed by Full Window wrapper
+const TSUB_KIND = { think: "thinking", split: "splitd", tts: "tts" };   // sub-tab -> scale kind
+function tKind() { return TSUB_KIND[curTsub] || "dashboard"; }
+function tsForId(id) {                       // "tail-<kind>" is the naming rule; honour it
+  return termScales[String(id || "").replace("tail-", "")] || termScales.dashboard;
+}
+const MAXGROUP = { thinking: "thinking", splitd: "split", splitt: "split", tts: "tts" };
+function maxKindForId(id) { return MAXGROUP[String(id || "").replace("tail-", "")] || "dashboard"; }
 function maxScaleRatio(el) {
   const normal = tailNormalW[maxKindForId(el.id)] || 0, full = el.clientWidth || 0;
   if (normal <= 0 || full <= 0) return 1;
@@ -5810,7 +7245,7 @@ function sizeTailEl(el, txt) {
   el.style.fontSize = fs.toFixed(1) + "px";
 }
 function applyTermScale() {
-  ["tail-dashboard", "tail-thinking", "tail-splitd", "tail-splitt"].forEach(function(id) { sizeTailEl(document.getElementById(id)); });
+  ["tail-dashboard", "tail-thinking", "tail-splitd", "tail-splitt", "tail-tts"].forEach(function(id) { sizeTailEl(document.getElementById(id)); });
 }
 function fillFsSel(sel) {
   if (!sel || sel.options.length) return;
@@ -6489,9 +7924,16 @@ function fleetWatch() {
   window.__prevServing = new Set(serving.map(s => s.id));
 }
 let autoRefT = null;
-function setAutoRef(v) {
+function paintAutoRef(s) {
+  const el = $("ref-now");
+  if (!el) return;
+  el.innerHTML = s > 0 ? ('- <span class="blueglow">' + s + 's</span>') : "";
+}
+function setAutoRef(v, quiet) {
   if (autoRefT) { clearInterval(autoRefT); autoRefT = null; }
-  const s = parseInt(v);
+  const s = parseInt(v) || 0;
+  paintAutoRef(s);
+  if (!quiet) post("/api/settings", { autoRefresh: s });
   if (s > 0) autoRefT = setInterval(() => {
     const busy = uiBusy();
     if (busy) { trace("refresh", "tick skipped", busy); return; }
@@ -6506,7 +7948,12 @@ function paintProfiles() {
 // clicking anywhere outside the panel retracts it
 // every drop-out panel closes through here, so opening one always shuts the others
 function closeMenus(keep) {
-  trace("menu", keep ? ("opening " + keep + ", closing the rest") : "closing all");
+  // only worth a line when something was actually open: a click anywhere calls this,
+  // and logging every one of them buried the useful entries
+  const rw = $("refwrap"), bw = $("bgwrap");
+  const wasOpen = !!(window.__profOpen || window.__gpuOpen
+      || (rw && rw.classList.contains("on")) || (bw && bw.classList.contains("on")));
+  if (keep || wasOpen) trace("menu", keep ? ("opening " + keep + ", closing the rest") : "closing all");
   if (keep) uiTipHide();                          // a panel is opening; drop any note
   if (keep !== "prof" && window.__profOpen) { window.__profOpen = false; paintProfiles(); }
   if (keep !== "ref") {
@@ -6583,7 +8030,7 @@ document.addEventListener("pointerdown", function(e) {
   if (act === "bgPick") {
     e.preventDefault();
     window.__termBlack = hit.dataset.v === "1";
-    ["tail-dashboard","tail-thinking","tail-splitd","tail-splitt"].forEach(function(id) {
+    ["tail-dashboard","tail-thinking","tail-splitd","tail-splitt","tail-tts"].forEach(function(id) {
       const p = $(id); if (p) p.classList.toggle("blackbg", !!window.__termBlack); });
     post("/api/settings", { termBlack: window.__termBlack });
     document.querySelectorAll(".bgopt").forEach(function(b) {
@@ -6608,21 +8055,230 @@ async function profSel(sel) {
 }
 async function refreshTail(which) {
   const r = await post("/api/tail", { kind: which });
-  const pre = $("tail-" + which), src = $(which === "dashboard" ? "dash-src" : "think-src");
+  const pre = $("tail-" + which), src = $(which === "dashboard" ? "dash-src" : which === "tts" ? "tts-src" : "think-src");
   if (!pre) return;
   const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
   paintTail(which, r.text || r.error || "");
-  { const x = r.file ? ("source: " + r.file + " (live tail, ANSI stripped)") : ""; src.textContent = x; src.title = x; }
+  { const t = new Date().toTimeString().slice(0, 8);
+    const x = r.file ? ("source: " + r.file + " (live tail, ANSI stripped) - refreshed " + t) : "";
+    if (src) { src.textContent = x; src.title = x; } }
   if (stick) pre.scrollTop = pre.scrollHeight;
+}
+
+/* ---------- TTS [Alpha] ---------- */
+let ttsBusy = "";        // "" | "start" | "stop"
+const TTS_FIELDS = [
+  ["ttsServerExe", "TTS Server Binary (moss-tts-server.exe)", [".exe"]],
+  ["ttsModel", "TTS Model (.gguf)", [".gguf"]],
+  ["ttsServerPort", "TTS Server Port", null],
+  ["ttsPython", "Python Executable (the venv that runs the wrapper)", [".exe"]],
+  ["ttsWrapper", "Wrapper Script (.py)", [".py"]],
+  ["ttsWrapperPort", "Wrapper Port (point the SkyrimNet TTS endpoint here)", null]
+];
+const TTS_STEPS = [
+  ["Get the pieces", "You need <b>moss-tts-server.exe</b> and a MOSS GGUF model. The panel supplies neither - it starts them and talks to them, but it does not ship or download them."],
+  ["Set the log folder", "<b>Folder Settings</b> - only the log folder matters here. Everything else on that page belongs to the LLM fleet."],
+  ["Point at the binary and the model", "<b>Proxy</b> then <b>TTS [Alpha]</b>. Fill in <b>TTS Server Binary</b> and <b>TTS Model</b>. Paste the paths, use <b>Choose file</b>, or - if you already run a working TTS launcher - press <b>Import from a launcher</b> and it reads them straight out of it."],
+  ["Pick the GPU", "Leave it blank and every visible card is offered to the server. Pick one and it is pinned by its UUID, so a reboot or a reseated card cannot move it onto a different GPU."],
+  ["Choose who translates", "Set <b>Who translates for SkyrimNet</b> to <b>The panel</b>. It takes the wrapper port straight away and the line underneath says whether that succeeded. If it did not, something else is already on that port - usually a wrapper of your own still running."],
+  ["Start the server", "Press <b>Start TTS</b> and wait for <b>ready</b>. The model takes a few seconds to load and the server does not answer until it has, so the button reads <b>Launching</b> in the meantime."],
+  ["Point SkyrimNet at the panel", "In SkyrimNet: <b>Voice</b> then <b>Text-to-Speech</b>, engine <b>Zonos</b>, and set the endpoint to this machine on the wrapper port."],
+  ["Test it", "Press SkyrimNet's own <b>Test</b> button. The line appears in <b>Proxy</b> then <b>TTS Terminal</b> within a second or two, with its timings."]
+];
+function renderTtsGuide() {
+  const pane = $("ugpane-tts");
+  if (!pane) return;
+  const st = (state && state.settings) || {};
+  const wp = esc(st.ttsWrapperPort || "7860");
+  pane.innerHTML =
+      '<div class="banner" style="display:block;margin:0 0 14px;line-height:1.6">'
+    + '<b>Experimental, and engine-specific.</b> This page describes the alpha TTS support, '
+    + 'which was built and tested against one particular build of MOSS-TTS: '
+    + '<code onclick="copyCode(this)" title="click to copy" style="background:#12161d;border:1px solid var(--edge);border-radius:6px;padding:2px 7px;user-select:all;cursor:pointer">https://github.com/sammcj/openmoss</code> '
+    + '. The request shape, the response headers and the server flags all follow that build, '
+    + 'so a different TTS server will not work here even if it also loads a GGUF.</div>'
+
+    + '<div class="card" style="max-width:900px;line-height:1.65">'
+    + '<h2 style="margin:0 0 8px">Why this exists at all</h2>'
+    + '<div class="hint" style="line-height:1.65">SkyrimNet speaks to its supported voices directly - '
+    + 'Piper, XTTS, Chatterbox, ElevenLabs and the rest need nothing from this page. MOSS-TTS is not one of them. '
+    + 'What SkyrimNet does support is <b>Zonos</b>, so something has to sit in the middle and present MOSS-TTS as if it were Zonos. '
+    + 'That translator is what the panel can now be.</div></div>'
+
+    + '<div class="card" style="max-width:900px;margin-top:14px">'
+    + '<h2 style="margin:0 0 10px">Setting it up from scratch</h2>'
+    + TTS_STEPS.map((s, i) =>
+        '<div style="display:flex;gap:12px;margin-bottom:14px;align-items:flex-start">'
+        + '<div style="flex:none;width:26px;height:26px;border-radius:50%;background:#12161d;'
+        + 'border:1px solid var(--edge);display:flex;align-items:center;justify-content:center;'
+        + 'color:var(--ok);font-size:12.5px">' + (i + 1) + '</div>'
+        + '<div style="flex:1;min-width:0"><div style="color:var(--txt);margin-bottom:2px">' + s[0] + '</div>'
+        + '<div class="hint" style="line-height:1.6">' + s[1] + '</div></div></div>').join("")
+    + '<div class="hint" style="line-height:1.6;margin-top:4px">Steps 3 to 5 are the only real configuration. '
+    + 'There is no launcher to run, no python environment to build and no wrapper to install.</div></div>'
+
+    + '<div class="card" style="max-width:900px;margin-top:14px;line-height:1.65">'
+    + '<h2 style="margin:0 0 8px">The two modes</h2>'
+    + '<div class="hint" style="line-height:1.65"><b>Your own wrapper</b> - the panel writes a launcher that starts '
+    + 'the server and your wrapper together, then reads the log the wrapper produces. Nothing passes through the panel, '
+    + 'so voices keep working whether or not it is open. This is the default.<br><br>'
+    + '<b>The panel</b> - no separate wrapper at all. The panel answers SkyrimNet on port ' + wp + ' itself and '
+    + 'translates for it. Simpler to set up, but voices then depend on the panel running: close it and speech stops.</div></div>'
+
+    + '<div class="card" style="max-width:900px;margin-top:14px;line-height:1.65">'
+    + '<h2 style="margin:0 0 8px">When something is wrong</h2>'
+    + '<div class="hint" style="line-height:1.65">'
+    + '<b>The state never reaches ready.</b> The server did not come up. Its own output is in '
+    + '<code>tts-server.log</code>, under <b>Log</b> then <b>Files</b>.<br><br>'
+    + '<b>Not listening on the wrapper port.</b> Something else holds it - most often a wrapper of your own '
+    + 'still running from a launcher. Stop it and switch the mode again.<br><br>'
+    + '<b>A line fails in the TTS terminal.</b> The message carries whatever the TTS server itself said, '
+    + 'not just a status code, so read it before changing anything.<br><br>'
+    + '<b>SkyrimNet reports a TTS failure but the terminal is empty.</b> SkyrimNet is not reaching the panel at all. '
+    + 'Check the endpoint address and that it names this machine on port ' + wp + '.</div></div>';
+}
+
+function renderTts() {
+  const pane = $("dpane-tts");
+  if (!pane || !state) return;
+  const st = state.settings || {};
+  const mode = String(st.ttsWrapMode || "off").toLowerCase();
+  const ping = String(st.ttsAnswerPing || "on").toLowerCase();
+  const w = state.ttsWrap || {};
+  const sv = state.ttsServer || {};
+  const svUp = sv.state === "serving", svLoad = sv.state === "loading";
+  const svGoing = !!sv.stopping || sv.state === "wedged";   // reported, or port held and silent
+  const busy = ttsBusy;
+  const ready = svUp && !busy && (mode === "on" ? w.on : true);
+  const keep = {};                       // never wipe a path mid-paste (same rule as Folder Settings)
+  TTS_FIELDS.forEach(f => { const el = $("tts-" + f[0]); if (el) keep[f[0]] = el.value; });
+  const gsel = (state.gpus || []).map(g =>
+      '<option value="' + esc(g.id) + '"' + (st.ttsGpuId === g.id ? " selected" : "") + '>'
+      + esc((g.name || g.id) + "   " + (g.uuid || "")) + '</option>').join("");
+  pane.innerHTML = '<div class="card set" style="max-width:860px">'
+    + '<div class="hint" style="margin-bottom:12px;line-height:1.6">'
+    + 'Alpha. The panel writes the launcher; the wrapper stays yours. No TTS traffic passes '
+    + 'through the panel, so SkyrimNet talks to the wrapper directly and voices keep working '
+    + 'whether or not this panel is running.</div>'
+    + '<div class="row" style="gap:8px;margin-bottom:14px;align-items:center">'
+    + '<button class="stop" data-act="ttsImport" title="read the paths straight out of a launcher you already use - nothing else is read from the file">'
+    + ICO.file + ' Import from a launcher</button>'
+    + '<span class="hint" id="tts-imp" style="width:auto">points at your existing .bat and fills these in</span></div>'
+    + TTS_FIELDS.map(f =>
+        '<label>' + esc(f[1]) + '</label><div class="row" style="flex-wrap:nowrap">'
+        + '<input class="txt" id="tts-' + f[0] + '" onchange="saveTts()" value="'
+        + esc(st[f[0]] || "").replace(/"/g, "&quot;") + '">'
+        + (f[2] ? '<button class="stop" data-act="ttsPick" data-k="' + f[0] + '">Choose file</button>' : '')
+        + '</div>').join("")
+    + '<label>Who translates for SkyrimNet</label><div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsWrapMode" onchange="saveTtsMode()">'
+    + '<option value="off"' + (mode === "on" ? "" : " selected") + '>Your own wrapper (the panel only writes the launcher)</option>'
+    + '<option value="on"' + (mode === "on" ? " selected" : "") + '>The panel (no separate wrapper process)</option>'
+    + '</select></div>'
+    + '<div class="hint" style="margin:-4px 0 12px;line-height:1.6">'
+    + (mode === "on"
+        ? ('The panel answers SkyrimNet on port ' + esc(st.ttsWrapperPort || "7860") + ' itself. '
+           + 'Stop your own wrapper first or the port is taken, and remember voices stop when the panel does. '
+           + (w.on ? '<span style="color:var(--ok)">Listening on ' + esc(String(w.port)) + '.</span>'
+                   : '<span style="color:var(--err)">Not listening - the port may be in use.</span>'))
+        : 'The panel writes a launcher for your wrapper and reads its log. Nothing passes through the panel.')
+    + '</div>'
+    + '<label>Answer SkyrimNet startup ping locally</label><div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsAnswerPing" onchange="saveTts()">'
+    + '<option value="on"' + (ping === "off" ? "" : " selected") + '>Yes - return silence, never touch the GPU</option>'
+    + '<option value="off"' + (ping === "off" ? " selected" : "") + '>No - generate it like any other line</option>'
+    + '</select></div>'
+    + '<label>GPU (pinned by UUID, so a reboot cannot move it)</label>'
+    + '<div class="row" style="flex-wrap:nowrap"><select class="txt" id="tts-ttsGpuId" onchange="saveTts()">'
+    + '<option value="">(no pin - every visible card is offered)</option>' + gsel + '</select></div>'
+    + (mode === "on"
+        ? ('<div class="card" style="margin:4px 0 16px;padding:14px 16px">'
+           + '<div class="row" style="gap:10px;align-items:center">'
+           + '<button data-act="ttsStart"' + (busy || svUp || svLoad || svGoing ? " disabled" : "")
+           + ' title="start the TTS server; the panel is already answering SkyrimNet">'
+           + (busy === "start" ? "Launching\u2026" : svLoad ? "Loading the model\u2026" : "\u25B6 Start TTS")
+           + '</button>'
+           + '<button class="stop" data-act="ttsStop"' + (busy || svGoing || !(svUp || svLoad) ? " disabled" : "")
+           + ' title="stop the TTS server">' + (busy === "stop" ? "Stopping\u2026" : "\u25A0 Stop") + '</button>'
+           + '<span class="pill ' + (ready ? "serving" : (busy || svLoad || svGoing) ? "loading" : "down") + '">'
+           + (ready ? "ready" : busy === "start" ? "starting" : busy === "stop" ? "shutting down"
+              : svGoing ? "shutting down" : svLoad ? "model loading" : "stopped") + '</span>'
+           + '<span class="hint" id="tts-run" style="width:auto">'
+           + (busy === "start"
+               ? "started the server - waiting for it to answer on " + esc(String(sv.port || ""))
+                 + " (the model takes a moment to load)"
+               : busy === "stop" ? "shutting the server down\u2026"
+               : ('server ' + (svUp ? "up" : svLoad ? "loading" : svGoing ? "shutting down" : "down") + ' on ' + esc(String(sv.port || ""))
+                  + ' \u00B7 panel ' + (w.on ? "answering on " + esc(String(w.port)) : "not listening")))
+           + '</span></div></div>')
+        : '')
+    + '<div class="row" style="gap:8px;margin-top:16px;align-items:center">'
+    + '<button class="stop" data-act="ttsGen" title="build the launcher from these settings without writing it">Preview launcher</button>'
+    + '<button class="stop" data-act="ttsSave" title="write start-tts.bat into the launcher folder">Write start-tts.bat</button>'
+    + '<button class="stop" data-act="ttsOpenDir" title="show the launcher folder this is written to">'
+    + ICO.folder + ' Open launcher folder</button>'
+    + '<span class="hint" id="tts-msg" style="width:auto"></span></div>'
+    + '<textarea id="tts-view" class="edit" spellcheck="false" readonly style="width:100%;height:42vh;'
+    + 'margin-top:10px;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5;white-space:pre;overflow:auto"></textarea>'
+    + '</div>';
+  TTS_FIELDS.forEach(f => { const el = $("tts-" + f[0]); if (el && keep[f[0]] !== undefined) el.value = keep[f[0]]; });
+}
+async function saveTtsMode() { saveTts(); await load(); renderTts(); }
+function saveTts() {
+  const body = {};
+  TTS_FIELDS.forEach(f => { const el = $("tts-" + f[0]); if (el) body[f[0]] = el.value; });
+  const g = $("tts-ttsGpuId");
+  if (g) body.ttsGpuId = g.value;
+  ["ttsWrapMode", "ttsAnswerPing"].forEach(k => { const e = $("tts-" + k); if (e) body[k] = e.value; });
+  post("/api/settings", body);
+}
+async function ttsServer(action) {
+  if (ttsBusy) return;                     // one press at a time
+  ttsBusy = action;
+  renderTts();                             // disable and relabel before the request goes out
+  try {
+    const r = await post("/api/tts-server", { action: action });
+    if (r && r.error) {
+      ttsBusy = ""; renderTts();
+      const m = $("tts-run"); if (m) m.textContent = r.error;
+      return;
+    }
+    if (action === "stop") { await load(); return; }
+    // the server does not bind until the model is loaded, so "down" right after the
+    // start is normal - keep looking rather than reporting failure
+    for (let i = 0; i < 90; i++) {
+      await new Promise(z => setTimeout(z, 2000));
+      await load();
+      const s = (state && state.ttsServer) || {};
+      if (s.state === "serving") return;
+      if (curTab === "dashboard" && curDsub === "tts") renderTts();
+    }
+    const m = $("tts-run");
+    if (m) m.textContent = "the server did not answer within 3 minutes - check tts-server.log";
+  } finally {
+    ttsBusy = "";
+    if (curTab === "dashboard" && curDsub === "tts") renderTts();
+  }
+}
+async function ttsLauncher(save) {
+  saveTts();                                    // generate from what is on screen, not last save
+  const r = await post("/api/tts-launcher", { save: !!save });
+  const v = $("tts-view"), m = $("tts-msg");
+  if (!v) return;
+  if (r.error) { v.value = r.error; if (m) m.textContent = ""; return; }
+  v.value = r.content || "";
+  let msg = r.path ? ("written: " + r.path) : "preview only - nothing written yet";
+  if ((r.missing || []).length) msg += "   still empty: " + r.missing.join(", ");
+  if (m) m.textContent = msg;
 }
 
 /* ---------- dashboard sub-tabs + SN routing editor ---------- */
 let curDsub = "term";
 let curTsub = "proxy";
 function showDsub(s) {
-  if (s === "yaml" && state && state.scope === "remote") s = "term";
+  if ((s === "setup" || s === "yaml" || s === "tts") && state && state.scope === "remote") s = "term";
   curDsub = s;
-  ["term","setup","yaml"].forEach(x => {
+  ["term","setup","yaml","tts"].forEach(x => {
     const p = $("dpane-"+x), b = $("dsub-"+x);
     if (p) p.style.display = x === s ? "" : "none";
     if (b) b.classList.toggle("on", x === s);
@@ -6630,18 +8286,25 @@ function showDsub(s) {
   if (s === "term") showTsub(curTsub);
   if (s === "setup") renderRouting();
   if (s === "yaml") { renderYaml(); loadYamlData(); }
+  if (s === "tts") renderTts();
 }
 function showTsub(v) {
   curTsub = v;
-  ["proxy","think","split"].forEach(x => {
+  ["proxy","think","split","tts"].forEach(x => {
     const p = $("tpane-"+x), b = $("tsub-"+x);
     if (p) p.style.display = x === v ? "" : "none";
     if (b) b.classList.toggle("on", x === v);
   });
   syncTermScaleUI();
-  if (v === "proxy") refreshTail("dashboard");
-  if (v === "think") refreshTail("thinking");
-  if (v === "split") refreshSplit();
+  refreshCurTerm();
+}
+// The ONE mapping from the open terminal to its feed. showTsub (on open) and
+// liveRefresh (every tick) both call this - do not spell it out anywhere else.
+function refreshCurTerm() {
+  if (curTsub === "proxy") refreshTail("dashboard");
+  else if (curTsub === "think") refreshTail("thinking");
+  else if (curTsub === "split") refreshSplit();
+  else if (curTsub === "tts") refreshTail("tts");
 }
 async function refreshSplit() {
   const d = await post("/api/tail", { kind: "dashboard" });
@@ -6661,7 +8324,7 @@ function provCard(p, s) {
   const prio = [0,1,2].map(n => '<option value="'+n+'"'+(n===pv?" selected":"")+'>'+n+" - "+["High","Normal","Low"][n]+'</option>').join("");
   const st = p.stats ? ' <span class="chip">reqs '+p.stats.n+' &middot; '+esc(p.stats.last)+'</span>' : "";
   const src = (p.samplerSource || "server");
-  return '<div class="prov" data-pid="'+p.id+'" id="prov-'+p.id+'" style="border-left:3px solid '+dashColor(p.title||p.id)+';padding-left:9px;border-radius:6px">'
+  return '<div class="prov" data-pid="'+p.id+'" id="prov-'+p.id+'" style="border-left:3px solid '+dashColor(p.title||p.id)+';border-radius:6px'+'">'
     + '<select class="edit" style="width:62px;min-width:62px;padding:7px 22px 7px 8px;background-position:right 6px center" title="emoji (shown in dashboard + thinking logs)" data-act="provField" data-field="emoji" data-id="'+p.id+'">'+eopts+'</select>'
     + '<input class="edit" style="max-width:150px" value="'+esc(p.title).replace(/"/g,"&quot;")+'" data-act="provField" data-field="title" data-id="'+p.id+'">'
     + '<input class="edit" style="max-width:68px" value="'+esc(p.port)+'" title="SN provider port (4 digits)" data-act="provField" data-field="port" data-id="'+p.id+'">'
@@ -6670,11 +8333,13 @@ function provCard(p, s) {
     + '<option value="server"'+(src==="server"?" selected":"")+'>Server Side</option>'
     + '<option value="skyrimnet"'+(src==="skyrimnet"?" selected":"")+'>SkyrimNet Side</option></select>'
     + swToggle(p.thinking, 'data-act="provField" data-field="thinking" data-id="'+p.id+'"', "Thinking")
-    + swToggle(p.detectSN, 'data-act="provField" data-field="detectSN" data-id="'+p.id+'" title="show the value SkyrimNet sends in brackets beside each set value"', "Detect SN sampler parameters")
+    + swToggle(p.detectSN, 'data-act="provField" data-field="detectSN" data-id="'+p.id+'" title="show the value SkyrimNet sends in brackets beside each set value"', "Show SkyrimNet sampler values")
     + (p.thinking && s.reasoning === "off" ? '<span title="this server was launched with reasoning OFF - the thinking toggle cannot engage until the launcher enables --reasoning" style="color:var(--warn);cursor:help">⚠</span>' : "")
     + (p.thinking && p.diaryGrammar ? '<span title="grammar rail active (GBNF) - the grammar constrains output from the first token, so thinking cannot appear on this provider even when enabled" style="color:var(--warn);cursor:help">🧩</span>' : "")
     + st
     + (p.custom ? '<button class="x" title="remove this added provider" data-act="provDel" data-id="'+p.id+'">&#10005;</button>' : '')
+    + '<button class="provpow' + (p.enabled === false ? ' off' : '') + '" data-act="provPower" data-id="'+p.id+'"'
+        + ' title="Provider state - ' + (p.enabled === false ? 'Disabled' : 'Enabled') + '">&#9211;</button>'
     + '<div class="row" style="flex-basis:100%;gap:6px;margin-top:4px;align-items:center">' + provSampChips(p)
     + (Object.keys(p.samplerOverrides || {}).length
         ? ' <button class="stop" style="padding:4px 10px;font-size:11.5px" data-act="provSampRevert" data-id="'+p.id+'" title="clear all forced overrides for this provider - each param falls back to whatever SkyrimNet / the server sends">\u21BA Revert Params</button>'
@@ -7001,10 +8666,35 @@ async function yamlAction(url, el) {
     l.style.display = "block";
   }
 }
+function fullWinOn() {
+  return !!(document.fullscreenElement || document.webkitFullscreenElement);
+}
+function toggleFullWin() {
+  const el = document.documentElement;
+  try {
+    if (fullWinOn()) {
+      const off = document.exitFullscreen || document.webkitExitFullscreen;
+      if (off) off.call(document);
+    } else {
+      const on = el.requestFullscreen || el.webkitRequestFullscreen;
+      if (on) on.call(el);
+    }
+  } catch (e) { trace("you", "full window refused", String(e).slice(0, 60)); }
+}
+// the browser can leave full screen on its own (Escape), so follow the event
+document.addEventListener("fullscreenchange", function() { paintProfiles(); });
+document.addEventListener("webkitfullscreenchange", function() { paintProfiles(); });
 function profRow() {
   const open = !!window.__profOpen;
-  return '<span class="profwrap">'
-    + '<span class="hdr-link' + (open ? " on" : "") + '" data-act="profToggle" role="button" tabindex="0" title="save, load or delete a full setup">Profiles</span>'
+  const act = ((state && state.settings) || {}).activeProfile || "";
+  if (window.__profPick === undefined && act) window.__profPick = act;
+  const rem = (((state && state.settings) || {}).networkMode === "lan");
+  return '<span class="hdr-note" data-hostonly data-act="remJump" role="button" tabindex="0" title="open Permissions > Remote Access">Remote Access - '
+    + (rem ? '<span class="blueglow">On</span>' : 'Off') + '</span>'
+    + '<span class="hdr-note" data-act="fullWin" role="button" tabindex="0" title="fill the screen, the same as F11">Fullscreen - '
+    + (fullWinOn() ? '<span class="blueglow">On</span>' : 'Off') + '</span>'
+    + '<span class="profwrap" data-hostonly>'
+    + '<span class="hdr-link' + (open ? " on" : "") + '" data-act="profToggle" role="button" tabindex="0" title="save, load or delete a full setup">Profiles' + (act ? ' - <span class="blueglow">' + esc(act) + '</span>' : "") + '</span>'
     + (open
         ? '<span class="profpop" id="profpop">'
           + '<select class="prof-sel" onchange="profSel(this)"><option value="">&#8212; pick a profile &#8212;</option>'
@@ -7329,12 +9019,12 @@ function ipCard() {
     + '</div>'
     + (pcModeMsg ? '<div class="row" style="margin-top:8px"><span class="hint" style="color:' + (pcModeMsg.err ? 'var(--err)' : 'var(--ok)') + '">' + esc(pcModeMsg.msg) + '</span></div>' : '')
     + '<div class="row" style="margin-top:10px"><span class="hint" style="width:230px">PandorumLLM PC (this machine)</span>'
-    + '<input class="edit" id="ip-panel" style="max-width:160px" value="'+esc(st.panelIp||"")+'" placeholder="enter IP address">'
+    + '<input class="edit hb" id="ip-panel" onfocus="this.classList.add(&quot;show&quot;)" style="max-width:160px" value="'+esc(st.panelIp||"")+'" placeholder="enter IP address">'
     + '<button data-act="ipSet" data-key="panelIp" data-input="ip-panel">\U0001F4BE Set IP address</button>'
     + '<span id="ipstat-panelIp"></span>' 
     + '<span class="hint" id="ip-sugg"></span></div>'
     + '<div class="row" id="remote-row" style="margin-top:8px' + (oneOn ? ';display:none' : '') + '"><span class="hint" style="width:230px">Remote PC (SkyrimNet PC)</span>'
-    + '<input class="edit" id="ip-remote" style="max-width:160px" value="'+esc(st.remoteIp||"")+'" placeholder="enter IP address">'
+    + '<input class="edit hb" id="ip-remote" onfocus="this.classList.add(&quot;show&quot;)" style="max-width:160px" value="'+esc(st.remoteIp||"")+'" placeholder="enter IP address">'
     + '<button data-act="ipSet" data-key="remoteIp" data-input="ip-remote">\U0001F4BE Set IP address</button>'
     + '<span id="ipstat-remoteIp"></span>' + '</div></div>';
 }
@@ -7344,7 +9034,7 @@ async function detectIp(el) {
   el.disabled = false;
   const box = $("ip-sugg");
   box.innerHTML = (r.ips||[]).map(ip =>
-    '<span class="chip clickable" data-act="ipUse" data-ip="'+esc(ip)+'">'+esc(ip)+'</span>').join(" ") || "none found";
+    '<span class="chip clickable" data-act="ipUse" data-ip="'+esc(ip)+'"><span class="hb">'+esc(ip)+'</span></span>').join(" ") || "none found";
 }
 let slotMsg = {};
 let recoMsg = "";
@@ -7379,7 +9069,7 @@ function provPrio(id) {
   return n + " - " + ["High", "Normal", "Low"][n];
 }
 const UI_VERSION = "__UIV__";
-let tailMaxState = { dashboard: false, thinking: false, split: false };
+let tailMaxState = { dashboard: false, thinking: false, split: false, tts: false };
 // Full-window chrome reveal - the ONE mechanism for all three terminal views.
 // Controls start hidden; any mouse move (or key) shows them; 2.5s of stillness hides
 // them again, unless a control inside the full-window pane holds focus.
@@ -7439,7 +9129,7 @@ function ipStatusFor(key, cur) {
     return '<span class="hint" style="color:var(--warn)">\u270F click "Set IP Address" to save</span>';
   const msg = ipMsg[key];
   if (msg) return '<span class="hint" style="color:var(--ok)">' + esc(msg) + '</span>';
-  if (saved) return '<span class="hint" style="color:var(--ok)">\u2705 set: ' + esc(saved) + '</span>';
+  if (saved) return '<span class="hint" style="color:var(--ok)">\u2705 set: <span class="hb">' + esc(saved) + '</span></span>';
   return "";
 }
 function updateIpStatus(key, inputId) {
@@ -7649,14 +9339,81 @@ async function saveSlotParam(sid, key, val) {
   renderSlots(true);
   if (curTab === "network") renderNetwork();
 }
+let curNsub = "host", peerData = null;
+function showNsub(x) {
+  curNsub = x;
+  ["host", "client"].forEach(function(k) {
+    const bt = $("nsub-" + k);
+    if (bt) bt.classList.toggle("on", k === x);
+  });
+  const pn = $("nsub-pane");
+  if (!pn) return;
+  // only one pane exists at a time: the graph uses fixed element ids, so two copies
+  // on the page at once would have the line drawing pointing at the wrong one
+  pn.className = x === "client" ? "peerview" : "";
+  if (x === "host") {
+    pn.innerHTML = netCard();
+    requestAnimationFrame(function() { netEqualize(); drawNetLines(); });
+    return;
+  }
+  pn.innerHTML = '<div class="hint">reading the client...</div>';
+  post("/api/peer", {}).then(function(r) {
+    if (curNsub !== "client" || !$("nsub-pane")) return;
+    drawPeer(r);
+  }).catch(function() { drawPeer(null); });
+}
+function drawPeer(r) {
+  const pn = $("nsub-pane");
+  if (!pn) return;
+  const addr = (r && r.addr) || "";
+  if (!addr) {
+    pn.innerHTML = '<div class="card"><div class="hint">No client set. Add its address in '
+      + 'Proxy &gt; Proxy Setup, and switch Remote Access on over there.</div></div>';
+    return;
+  }
+  if (!r || !r.fresh) {
+    pn.innerHTML = '<div class="card"><div class="hint" style="color:var(--warn)">Client not reachable at '
+      + esc(addr) + ((r && r.err) ? ' - ' + esc(r.err) : "")
+      + '</div><div class="hint" style="margin-top:6px">It needs PandorumLLM running with Remote Access on.</div></div>';
+    return;
+  }
+  let note = '<div class="hint" style="margin-bottom:8px">' + esc(addr)
+    + ' &middot; seen ' + (r.age === null ? "-" : (r.age + "s ago")) + '</div>';
+  if (r.version && r.mine && r.version !== r.mine)
+    note += '<div class="hint" style="color:var(--warn);margin-bottom:8px">Client is running '
+      + esc(r.version) + ', this panel is ' + esc(r.mine) + ' - what it reports may not line up.</div>';
+  // the Host page, drawn from the client' + String.fromCharCode(39) + 's state instead of ours
+  const keep = state;
+  try {
+    state = r.state;
+    pn.innerHTML = note + netCard();
+  } finally {
+    state = keep;
+  }
+  requestAnimationFrame(function() { netEqualize(); drawNetLines(); });
+}
+function peerSetupCard() {
+  const addr = ((state && state.settings) || {}).peerAddr || "";
+  return '<div class="card" data-hostonly><div class="row" style="gap:8px;align-items:center;flex-wrap:wrap">'
+    + '<span class="hint" style="width:auto">Client panel address</span>'
+    + '<input class="edit hb" id="peer-addr" onfocus="this.classList.add(&quot;show&quot;)" style="max-width:260px" placeholder="192.168.1.20:50607" value="'
+    + esc(addr).replace(/"/g, "&quot;") + '">'
+    + '<button class="stop" data-act="peerSave">Save</button></div>'
+    + '<div class="hint" style="margin-top:6px">A second PC running PandorumLLM with Remote Access on. '
+    + 'Its cards, servers and providers then appear under Live Network &gt; Client. Nothing is sent to it '
+    + 'and it is never controlled from here - it only has to be switched on and reachable.</div></div>';
+}
 function renderNetwork() {
   if (!state) return;
   const pane = $("tab-network");
   if (!pane) return;
-  pane.innerHTML = netCard();
-  requestAnimationFrame(function() { netEqualize(); drawNetLines(); });
+  pane.innerHTML = '<div class="subtabs" style="margin-bottom:10px">'
+    + '<button id="nsub-host" class="on" onclick="showNsub(' + String.fromCharCode(39) + 'host' + String.fromCharCode(39) + ')">Host</button>'
+    + '<button id="nsub-client" onclick="showNsub(' + String.fromCharCode(39) + 'client' + String.fromCharCode(39) + ')">Client</button>'
+    + '</div>'
+    + '<div id="nsub-pane"></div>';
+  showNsub(curNsub);
 }
-// ITEM 4: every provider in one flat stack, each showing the server it is allocated to
 function renderProviders(force) {
   if (!state) return;
   const pane = $("pmpane-providers");
@@ -7681,7 +9438,7 @@ function renderProviders(force) {
     const alloc = e.s
       ? '<span style="color:var(--ok);font-weight:600">\u2705 Allocated to ' + esc(e.s.label || e.s.id) + '</span>'
       : '<span style="color:var(--dim)">Unallocated</span>';
-    h += '<div class="card">'
+    h += '<div class="card' + (e.p.enabled === false ? ' provoff' : '') + '">'
       + '<div class="row" style="gap:10px">'
       + '<span class="label provlink" data-act="gotoProv" data-id="' + esc(e.p.id) + '"'
       + ' style="--pgl:' + dashColor(e.p.title || e.p.id) + '" title="show this provider in Live Network">'
@@ -7991,6 +9748,12 @@ function renderCurrent(force) {
     else renderSlots(force);
     return;
   }
+  if (curTab === "dashboard" && curDsub === "tts") {
+    const ae = document.activeElement, pane = $("dpane-tts");
+    if (!(ae && pane && pane.contains(ae) && ["INPUT","SELECT","TEXTAREA"].includes(ae.tagName)))
+      renderTts();
+    return;
+  }
   renderRouting(force);
 }
 function renderRouting(force) {
@@ -8011,7 +9774,8 @@ function renderRouting(force) {
     (byGpu[k] = byGpu[k] || []).push(s);
   });
   const h = ''
-    + ipCard();
+    + ipCard()
+    + peerSetupCard();
   $("dpane-setup").innerHTML = h;
   if (keepP !== null && $("ip-panel")) $("ip-panel").value = keepP;
   if (keepR !== null && $("ip-remote")) $("ip-remote").value = keepR;
@@ -8343,6 +10107,11 @@ document.addEventListener("mouseup", () => {
 });
 document.addEventListener("click", ev => {
   const hbEl = ev.target && ev.target.closest ? ev.target.closest(".hb") : null;
+  // a revealed value covers itself again as soon as you look elsewhere; a field you
+  // are typing in keeps its own reveal until it loses focus
+  document.querySelectorAll(".hb.show").forEach(function(x) {
+    if (x !== hbEl && x !== document.activeElement) x.classList.remove("show");
+  });
   if (hbEl) { hbEl.classList.toggle("show"); return; }
   const el = ev.target.closest ? ev.target.closest("[data-act]") : null;
   if (!el) return;
@@ -8350,7 +10119,7 @@ document.addEventListener("click", ev => {
   if (d.act === "revealUuid") { el.classList.toggle("show"); return; }
   if (d.act === "sampChip") { sampEdit(el); return; }
   if (d.act === "provSampChip") { provSampEdit(el); return; }
-  if (d.act === "srvEdLock") { srvEd.locked = !srvEd.locked; renderSrvInspector(); return; }
+  if (d.act === "srvEdLock") { srvEd.locked = !srvEd.locked; post("/api/settings", { srvEdOpen: !srvEd.locked }); renderSrvInspector(); return; }
   if (d.act === "srvEdUndo") { srvEdStep(-1); return; }
   if (d.act === "srvEdRedo") { srvEdStep(1); return; }
   if (d.act === "srvEdValidate") { srvEdValidate(); return; }
@@ -8553,6 +10322,16 @@ document.addEventListener("click", ev => {
     const sp = $("stpane-provider"); if (sp) sp.innerHTML = renderProviderStats();
     return;
   }
+  if (d.act === "ttsPick") {
+    const f = TTS_FIELDS.find(x => x[0] === d.k);
+    if (f && f[2]) pickTtsFile(f[0], f[2]);
+    return;
+  }
+  if (d.act === "ttsImport") { _pickField = "__ttsimport"; _pickPrefix = "tts-"; _pickExts = [".bat", ".cmd", ".ps1"]; browseTo(""); return; }
+  if (d.act === "ttsStart" || d.act === "ttsStop") { ttsServer(d.act === "ttsStart" ? "start" : "stop"); return; }
+  if (d.act === "ttsOpenDir") { openFolder("launcherDir"); return; }
+  if (d.act === "ttsGen") { ttsLauncher(false); return; }
+  if (d.act === "ttsSave") { ttsLauncher(true); return; }
   if (d.act === "termScaleMode") { setTermScaleMode(d.mode, d.kind); return; }
   if (d.act === "termSizeReset") {
     const k = d.kind;
@@ -8629,7 +10408,7 @@ document.addEventListener("click", ev => {
     return;
   }
   if (d.act === "restoreProv") {
-    uiConfirm("This resets the shipped default providers back to their original state (title, port, priority, thinking, and which server they sit on)." + String.fromCharCode(10) + String.fromCharCode(10) + "Any custom providers you added are kept as-is.", { okLabel: "Restore", title: "Restore Default Providers" }).then(ok => {
+    uiConfirm("This resets the shipped default providers back to their original state (title, port, priority, thinking, On/Off, and which server they sit on)." + String.fromCharCode(10) + String.fromCharCode(10) + "Any custom providers you added are kept as-is.", { okLabel: "Restore", title: "Restore Default Providers" }).then(ok => {
       if (!ok) return;
       post("/api/provider-restore-defaults", {}).then(async r => {
         if (r && r.error) { uiAlert(r.error); return; }
@@ -8649,6 +10428,17 @@ document.addEventListener("click", ev => {
     post("/api/helper-reset", {}).then(async () => { window.__helperLines = []; window.__helperPrev = {}; await load(); renderHelper(); });
     return;
   }
+  if (d.act === "fullWin") { toggleFullWin(); return; }
+  if (d.act === "peerSave") {
+    const el = $("peer-addr");
+    post("/api/settings", { peerAddr: el ? el.value.trim() : "" }).then(async function() {
+      await load(); renderRouting(true);
+    });
+    return;
+  }
+  if (d.act === "provPower") { provEdit(d.id, { enabled: el.classList.contains("off") }); return; }
+  if (d.act === "verClick") { verClick(); return; }
+  if (d.act === "remJump") { showTab("perms"); showPsub("settings"); return; }
   if (d.act === "tmaxAdjust") {
     const c = d.tc ? $(d.tc) : el.closest(".tchrome");   // each terminal owns its menu; data-tc lets a stand-in button reach it
     if (c) c.classList.toggle("adjopen");
@@ -8765,13 +10555,20 @@ async function provEdit(id, patch) {
 /* ---------- setup path buttons ---------- */
 // ---- in-UI directory picker (folders only, jailed by the server) ----
 let _pickField = null, _pickCur = "";
+let _pickPrefix = "set-", _pickExts = null;
 function pickPath(k) {
-  _pickField = k;
+  _pickField = k; _pickPrefix = "set-"; _pickExts = null;
   const start = ($("set-"+k) && $("set-"+k).value) || "";
   browseTo(start);
 }
+// file mode: same browser, plus files of the given types. Clicking one picks it.
+function pickTtsFile(k, exts) {
+  _pickField = k; _pickPrefix = "tts-"; _pickExts = exts;
+  const cur = ($("tts-"+k) && $("tts-"+k).value) || "";
+  browseTo(cur ? cur.replace(/[\\/][^\\/]*$/, "") : "");
+}
 async function browseTo(path) {
-  const r = await post("/api/browse-dirs", { path: path || "" });
+  const r = await post("/api/browse-dirs", { path: path || "", exts: _pickExts || [] });
   if (r && r.error) { uiAlert(r.error); return; }
   _pickCur = r.path || "";
   let rows = "";
@@ -8786,23 +10583,60 @@ async function browseTo(path) {
       const full = base + String.fromCharCode(92) + d;
       rows += '<div class="pickrow" data-nav="' + esc(full) + '"><span style="color:#d9b04a">' + ICO.folder + '</span> ' + esc(d) + '</div>';
     });
+    (r.files || []).forEach(f => {
+      const full = base + String.fromCharCode(92) + f.name;
+      rows += '<div class="pickrow" data-file="' + esc(full) + '"><span style="color:var(--dim)">' + ICO.file
+            + '</span> ' + esc(f.name) + ' <span class="hint" style="width:auto;margin-left:6px">' + esc(f.size) + '</span></div>';
+    });
+    if (_pickExts && !(r.files || []).length && !(r.dirs || []).length)
+      rows += '<div class="hint" style="padding:8px">(nothing of that type here)</div>';
   }
-  let html = '<h2 style="margin:0 0 4px">Pick A Folder</h2>'
-    + '<div class="hint" style="margin-bottom:8px">Only folders are shown. Click to open a folder, then choose it below. Drag the bottom-right corner to resize.</div>'
+  const fileMode = !!_pickExts;
+  let html = '<h2 style="margin:0 0 4px">' + (fileMode ? 'Pick A File' : 'Pick A Folder') + '</h2>'
+    + '<div class="hint" style="margin-bottom:8px">'
+    + (fileMode
+        ? ('Click a folder to open it, then click the file itself. Showing ' + _pickExts.join(" ") + ' only.')
+        : 'Only folders are shown. Click to open a folder, then choose it below.')
+    + ' Drag the bottom-right corner to resize.</div>'
     + '<div class="hint" style="word-break:break-all;margin-bottom:8px"><b>' + (r.path ? esc(r.path) : "(this PC - pick a drive)") + '</b></div>'
     + '<div id="pickrows" style="flex:1;min-height:120px;overflow:auto;border:1px solid var(--edge);border-radius:8px;padding:6px;background:#0f1319">' + rows + '</div>'
     + '<div class="row" style="justify-content:space-between;gap:8px;margin-top:14px">'
     + '<button class="stop" onclick="browseTo(' + String.fromCharCode(39) + String.fromCharCode(39) + ')"' + (r.path ? '' : ' disabled') + '>\u2B05 Drives</button>'
     + '<div class="row" style="gap:8px">'
     + '<button class="stop" onclick="closeModal()">Cancel</button>'
-    + (r.path ? '<button onclick="pickChoose()">\u2713 Choose This Folder</button>' : '')
+    + (r.path && !fileMode ? '<button onclick="pickChoose()">\u2713 Choose This Folder</button>' : '')
     + '</div></div>';
   showModal(html, true);
   const rowsEl = document.getElementById("pickrows");
   if (rowsEl) rowsEl.addEventListener("click", ev => {
+    const frow = ev.target.closest("[data-file]");
+    if (frow) { pickFileChoose(frow.getAttribute("data-file")); return; }
     const row = ev.target.closest("[data-nav]");
     if (row) browseTo(row.getAttribute("data-nav"));
   });
+}
+async function pickFileChoose(full) {
+  if (_pickField === "__ttsimport") {
+    closeModal();
+    const r = await post("/api/tts-import", { path: full });
+    const m = $("tts-imp");
+    if (r && r.error) { if (m) m.textContent = r.error; return; }
+    await load(); renderTts();
+    const got = Object.keys(r.found || {});
+    const msg = $("tts-imp");
+    if (msg) msg.textContent = got.length
+      ? ("filled " + got.length + " of 6 from " + full.split(String.fromCharCode(92)).pop())
+      : "nothing recognised in that file";
+    return;
+  }
+  const el = $(_pickPrefix + _pickField);
+  if (el) el.value = full;
+  closeModal();
+  const body = {}; body[_pickField] = full;
+  const r = await post("/api/settings", body);
+  if (r && r.error) { uiAlert(r.error); return; }
+  await load();
+  if (_pickPrefix === "tts-") renderTts(); else renderSetup();
 }
 async function pickChoose() {
   if (_pickField && _pickCur) {
@@ -8826,7 +10660,7 @@ async function openFolder(k) {
   if (!which) { uiAlert("This folder has no viewer."); return; }
   const r = await post("/api/folder-view", { which });
   if (r && r.error) { uiAlert(r.error); return; }
-  const extLabel = { models:".gguf", launcher:".ps1", output:".ps1", log:".log", yaml:".yaml" }[which] || "";
+  const extLabel = { models:".gguf", launcher:".ps1 and .bat", output:".ps1 and .bat", log:".log", yaml:".yaml" }[which] || "";
   let html = '<h2 style="margin:0 0 4px">Folder Contents</h2>'
     + '<div class="hint" style="margin-bottom:8px">Showing only ' + extLabel + ' files' + (r.capped ? ' (first ' + r.count + ')' : '') + ' - ' + r.count + ' file(s).</div>'
     + '<div style="max-height:48vh;overflow:auto;border:1px solid var(--edge);border-radius:8px;background:#0f1319">';
@@ -9868,10 +11702,20 @@ async function terminateAll(btn) {
   window.__terminating = true; window.__launching = false;
   fleetWatch();
   btn.disabled = true; btn.innerHTML = termLabel("Working...");
-  const r = await post("/api/terminate", {});
-  stackSet(r.log || r.error || "");
-  btn.disabled = false; btn.innerHTML = termLabel("Terminate");
-  load();
+  // Terminate stops the TTS server too, but it is one long write and queueLoad defers
+  // every reload while a write is in flight - so the pane could never see the state
+  // between running and stopped. Mark it here, exactly as the Stop button does.
+  const hadTts = !!(state && state.ttsServer
+                    && ["serving", "loading"].indexOf(state.ttsServer.state) >= 0);
+  if (hadTts && !ttsBusy) { ttsBusy = "stop"; if (curTab === "dashboard" && curDsub === "tts") renderTts(); }
+  try {
+    const r = await post("/api/terminate", {});
+    stackSet(r.log || r.error || "");
+  } finally {
+    if (hadTts && ttsBusy === "stop") ttsBusy = "";
+    btn.disabled = false; btn.innerHTML = termLabel("Terminate");
+    await load();
+  }
 }
 async function exitPanel(btn) {
   if (!await uiConfirm("Exit PandorumLLM?\\nThis shuts down the panel AND terminates all LLM servers.")) return;
@@ -9911,9 +11755,7 @@ function queueRouting() {
 // heartbeat fallback all come through here - nothing else may spell this out again.
 function liveRefresh(src) {
   if (curTab === "dashboard" && curDsub === "term" && src !== "state") {
-    if (curTsub === "proxy") refreshTail("dashboard");
-    if (curTsub === "think") refreshTail("thinking");
-    if (curTsub === "split") refreshSplit();
+    refreshCurTerm();
   }
   if (curTab === "dashboard" && curDsub === "yaml" && !(document.activeElement && document.activeElement.closest && document.activeElement.closest("#dpane-yaml"))) renderYaml();
   if (curTab === "helper") renderHelper();
@@ -10020,9 +11862,99 @@ function maybeWelcome() {
     + '<button onclick="welcomeGoHelper()">\u2728 Take me to the user guide</button></div>'
   );
 }
-load().then(maybeWelcome).then(syncFieldInk);
+showTab("network");        // the start page, matching the nav item that starts selected
+load().then(maybeWelcome).then(syncFieldInk).then(function() {
+  // the Observer was left running last session: pick it up again, without
+  // writing the setting back (that would be a no-op write on every page load)
+  if (state && state.settings && state.settings.observerOn && !traceOn) traceToggle(true);
+  // pick the auto refresh interval back up, without writing the setting again
+  const ar = ((state && state.settings) || {}).autoRefresh || 0;
+  setTimeout(checkAppUpdate, 1500);   // after the page is up, once per session
+  if (ar > 0) {
+    const sel = $("auto-ref");
+    if (sel) sel.value = String(ar);
+    setAutoRef(ar, true);
+  }
+});
 </script></body></html>
 """
+
+# ---- self-timing: /api/state and the debug report name their own slow phases ----
+_PH = threading.local()
+def _ph_reset():
+    _PH.t = {}
+def _ph_add(name, dt):
+    d = getattr(_PH, "t", None)
+    if d is not None:
+        d[name] = d.get(name, 0.0) + dt
+def _timed(name, fn):
+    def w(*a, **k):
+        t0 = time.time()
+        try:
+            return fn(*a, **k)
+        finally:
+            _ph_add(name, time.time() - t0)
+    return w
+slot_status = _timed("port-probes", slot_status)
+prime_slot_status = _timed("port-probes", prime_slot_status)
+list_launchers = _timed("launcher-folder-scan", list_launchers)
+_MODELS_LOCK = threading.Lock()
+_list_models_once = list_models
+def list_models(cfg):
+    """Single-flight. The startup warm-up and the first page load used to scan at the
+    same moment and read every header twice; now the second caller waits for the
+    first and takes its result from the cache."""
+    with _MODELS_LOCK:
+        return _list_models_once(cfg)
+list_models = _timed("model-folder-scan", list_models)
+_model_kind_read = _timed("model-header-reads", _model_kind_read)
+api_path_check = _timed("folder-checks", api_path_check)
+list_templates = _timed("template-scan", list_templates)
+parse_ps1_port = _timed("launcher-parse", parse_ps1_port)
+parse_ps1_model = _timed("launcher-parse", parse_ps1_model)
+parse_ps1_reasoning = _timed("launcher-parse", parse_ps1_reasoning)
+parse_log_reasoning = _timed("log-samplers", parse_log_reasoning)
+load_config = _timed("config-read", load_config)
+_local_ips = _timed("address-lookup", _local_ips)
+network_is_down = _timed("address-lookup", network_is_down)
+speeds_for_slot = _timed("log-speeds", speeds_for_slot)
+parse_log_samplers = _timed("log-samplers", parse_log_samplers)
+parse_ps1_samplers = _timed("launcher-parse", parse_ps1_samplers)
+_api_state_raw = api_state
+def _ph_parts(dt_ms):
+    """Phase list with the leftover named, so a slow call is never unexplained."""
+    ph = dict(getattr(_PH, "t", {}) or {})
+    named = sum(ph.values()) * 1000
+    rest = dt_ms - named
+    if rest > 1:
+        ph["everything-else"] = rest / 1000.0
+    return sorted(ph.items(), key=lambda x: -x[1])
+
+def api_state(*a, **k):
+    _ph_reset(); t0 = time.time()
+    try:
+        prime_slot_status([x.get("port") for x in (load_config().get("slots") or [])])
+    except Exception:
+        pass
+    out = _api_state_raw(*a, **k)
+    dt = (time.time() - t0) * 1000
+    if dt > 500:
+        parts = ", ".join("%s=%dms" % (k2, v * 1000) for k2, v in _ph_parts(dt))
+        log_error("panel", "slow /api/state: %dms (%s)" % (dt, parts))
+    return out
+_debug_report_raw = debug_report
+def debug_report():
+    _ph_reset(); t0 = time.time()
+    try:
+        prime_slot_status([x.get("port") for x in (load_config().get("slots") or [])])
+    except Exception:
+        pass
+    txt = _debug_report_raw()
+    dt = (time.time() - t0) * 1000
+    parts = "\n".join("    %-21s: %dms" % (k2, v * 1000) for k2, v in _ph_parts(dt))
+    return (txt.rstrip("\n")
+            + "\n\n-- report internals --------------------------------------------\n"
+            + "  built in %dms\n" % dt + (parts + "\n" if parts else ""))
 
 def _connect_verdict(port):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -10111,6 +12043,12 @@ def choose_port(deadline_s=6.5):
                 pass
             if ours:
                 try:
+                    was = hdr.split(APP_NAME, 1)[1].strip() if APP_NAME in hdr else ""
+                    if was and was != APP_VER_UI:
+                        TAKEOVER.append("took over a running %s - this one is %s" % (was, APP_VER_UI))
+                except Exception:
+                    pass
+                try:
                     _ureq.urlopen(_ureq.Request("http://127.0.0.1:%d/api/handoff" % cand,
                                   data=b"{}", method="POST"), timeout=2).read()
                 except Exception:
@@ -10190,8 +12128,12 @@ def main():
                 ld = log_dir()
                 prune_keep_newest(ld, "*_dashboard.log", 4)   # this session's file makes 5
                 prune_keep_newest(ld, "*_thinking.log", 4)
-                log_error("panel", "session start %s" % APP_VERSION, record=False)
+                log_error("panel", "session start %s" % APP_VER_UI, record=False)
                 PROXY.sync()    # embedded SN proxy listeners come up with the panel
+                try:
+                    TTSW.sync()     # embedded TTS wrapper, only if it has been switched on
+                except Exception:
+                    log_error("tts", "wrapper sync at startup failed")
                 try:
                     api_detect_gpus({})
                 except Exception:
@@ -10206,7 +12148,15 @@ def main():
 
         _th.Thread(target=_background_init, daemon=True).start()
         srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-        print("%s %s   : http://localhost:%d/" % (APP_NAME, APP_VERSION, PORT))
+        print("%s %s   : http://localhost:%d/" % (APP_NAME, APP_VER_UI, PORT))
+        print("file         : %s" % BUILD_ID.get("path", "?"))
+        print("build        : %s  (%s KB, %s)" % (BUILD_ID.get("sha", "?"), BUILD_ID.get("kb", 0), BUILD_ID.get("mtime", "?")))
+        for _t in TAKEOVER:
+            print("NOTE         : %s" % _t)
+        # the first model scan reads a header per file; do it now, off the request
+        # path, so the first page load is not the thing that waits for it
+        _th.Thread(target=lambda: list_models(load_config()), daemon=True).start()
+        _th.Thread(target=_peer_loop, daemon=True).start()
         print("From the LAN : http://<this-machine-ip>:%d/" % PORT)
         print("Config       : %s" % CONFIG)
         try:

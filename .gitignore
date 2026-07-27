@@ -1,5 +1,6 @@
 # --- runtime state: created when the panel runs, never committed -------------
 fleet-config.json
+model-kinds.json
 panel-port.txt
 profiles/
 logs/

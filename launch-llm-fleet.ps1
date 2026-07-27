@@ -244,4 +244,4 @@ if (-not $Slot -and -not $Stop) {
 }
 
 # Manual full-fleet run:
-# & "C:\start-llm-stack\launch-llm-fleet.ps1"
+# & "C:\PandorumLLM\launch-llm-fleet.ps1"

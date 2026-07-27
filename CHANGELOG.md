@@ -4,9 +4,228 @@ Every released version, newest first. Compiled from the changelog in `README.txt
 which has had a paragraph appended on every release — so this is the real record,
 not a reconstruction.
 
-**Current version:** v3.65 Beta.
+**Current version:** v3.72 Beta.
 
 ---
+
+## v3.72
+- Fix: the proxy read whatever body length a caller claimed. Capped like the TTS listener;
+  an oversized claim is refused with 413 rather than allocated. Both bind 0.0.0.0, so the
+  cap belonged on both.
+- Fix: uploaded reference voices were never pruned. Kept to the newest 32 alongside the
+  generated audio; SkyrimNet re-uploads if its check comes back 404.
+- Consolidates v3.71 and its patches.
+
+## v3.71 patch7
+- Fix: Terminate still showed nothing on the TTS page. `queueLoad` defers every reload
+  while a write is in flight and Terminate is one long write, so the state event arrived
+  and the reload was postponed until it finished - by which point the server was already
+  stopped. `terminateAll` now marks the pane itself, as the Stop button does, and clears
+  it in a `finally`.
+- Change: one phrase for the state. It read "stopping" from the button and "shutting down"
+  from the reported flag; both now say shutting down.
+
+## v3.71 patch6
+- Fix: patch5's shutting-down state could never appear. `stop_tts_server` waited for the
+  process to exit before returning, so the port was already released and the status went
+  straight to down - and the wait blocked the very response that would have reported it.
+  Stop and Terminate now terminate on a thread, announce the change before blocking, and
+  report `stopping` until the process is gone. The exit path still waits.
+- Fix: Start was pressable mid-shutdown, racing the terminate. Both buttons are now
+  disabled between running and stopped.
+
+## v3.71 patch5
+- Add: the TTS terminal has the Adjust menu the other three have - text scaling, size and
+  font. It was left out because `tts` was never registered as a scale kind.
+- Change: the kind list is now one tuple in Python, injected into the page, instead of a
+  copy in each. `api_settings` filtered against the Python copy, so a kind the page knew
+  about was dropped on save with no error. A `tts` scale setting now round-trips.
+- Add: a server holding its port but no longer answering reads as **shutting down** rather
+  than jumping straight to stopped, and Stop is disabled while it does.
+
+## v3.71 patch4
+- Fix: patch3's redraw was in the wrong place and changed nothing. `liveRefresh` runs
+  *before* `queueLoad` fetches, so the pane was redrawn faithfully with the state it already
+  had. Moved to `renderCurrent`, which `load()` calls once fresh state has arrived - it fell
+  through to `renderRouting`, which returns unless Proxy Setup is open, so nothing redrew.
+- Add: the gate drives the pane in jsdom through an actual state change rather than checking
+  that a redraw call exists somewhere. The structural check passed while the bug was live.
+
+## v3.71 patch3
+- Fix: the TTS page did not follow the server's state. Terminate stopped it, but the pill
+  still read ready and Start stayed disabled until the page was reloaded. Three causes, all
+  fixed: `liveRefresh` never redrew the pane, the status watcher tracked only fleet slots so
+  the TTS port changing produced no event, and stopping left the cached status saying
+  "serving". Starting and stopping now announce themselves and drop the cache.
+- Change: the pane stands aside while a field on it has focus, as the YAML pane does.
+
+## v3.71 patch2
+- Fix: the Permission Tree still described three terminals and said nothing about TTS at
+  all. It now names the TTS terminal a remote viewer can see, lists TTS setup among the
+  host-only powers, and includes TTS [Alpha] among the pages withheld from remote.
+- Add: the gate checks the tree's claims against the code enforcing them - the terminals it
+  names against the terminal list, and every page it calls withheld against either
+  `data-hostonly` or a scope redirect. Section 8 specified this check; it had never been written.
+- Change: `showDsub` refuses Proxy Setup at the click for a remote viewer, as it already did
+  for SkyrimNet YAML and TTS. It was previously corrected only on the next refresh.
+
+## v3.71 patch1
+- Fix: closing the last browser tab shut the LLM fleet down but left a panel-started TTS
+  server running, holding the model in VRAM with nothing able to reach it. `full_exit` now
+  stops it and closes the TTS listener alongside the proxy's. Terminate does the same.
+- Change: only a server the panel started is stopped. In launcher mode the server belongs
+  to the user's own launcher and must outlive the panel, so it is left alone.
+
+## v3.71
+- Fix: the embedded TTS listener did not filter clients by IP. It binds 0.0.0.0 for 2-PC
+  mode, so anyone on the LAN could upload a file or spend GPU time on it while the proxy
+  beside it refused them. It now applies the same allowlist the proxy does.
+- Fix: the TTS listener read whatever body length a caller claimed. Capped at 32 MB; a
+  larger claim is refused with 413 rather than allocated.
+- Fix: generated audio accumulated in the temp folder for as long as the game ran. Pruned
+  to the newest 24, mirroring how the panel prunes its own logs.
+- Fix: starting the TTS server leaked a file handle per press - the child holds its own
+  duplicate, and the parent's copy was never closed on the success path.
+- Consolidates v3.70 and its patches.
+
+## v3.70 patch7
+- Add: User Guide > TTS Guide. Eight-step setup from scratch, the two modes explained, and
+  a troubleshooting section. States plainly that the support is experimental and built
+  against one specific MOSS-TTS build (sammcj/openmoss), so a different TTS server will not
+  work even if it also loads a GGUF.
+- Change: `showUgSub` iterates one list instead of naming each pane and button, so a fourth
+  guide is a single entry rather than four more lines.
+
+## v3.70 patch6
+- Fix: Start gave no feedback. The server does not bind its port until the model has loaded,
+  so status still read "down" straight after the press and the button sprang back to
+  "Start TTS" as though nothing had happened. It now reads "Launching...", stays disabled,
+  and the state line says it is waiting for the server to answer. Times out at three
+  minutes pointing at `tts-server.log`.
+
+## v3.70 patch5
+- Add: Start/Stop for the TTS server on the TTS page, so with the panel acting as wrapper
+  there is nothing left to run by hand. Pins the GPU by UUID in the child environment,
+  passes `--main-gpu 0` after masking, and writes the server's output to `tts-server.log`.
+- Add: a readiness line covering both halves - server up on its port, panel answering on
+  the wrapper port - and a pill that only reads ready when both are true.
+- Change: start is a no-op when the port is already serving, so pressing it twice or
+  starting alongside a hand-run launcher cannot produce a second server.
+
+## v3.70 patch4
+- Fix: the embedded wrapper handed the uploaded reference voice to moss-tts-server as-is and
+  was answered 400. The reference wrapper round-trips it through soundfile first, which
+  strips stray RIFF chunks and rewrites a clean header; the same is now done with `wave`,
+  downmixing to mono without `audioop` (removed in 3.13).
+- Fix: an upstream failure logged only "HTTP Error 400: Bad Request", discarding the server's
+  own explanation. The response body and the URL are now included.
+- Fix: "Recomputing voice" was printed both when a voice was computed and when no reference
+  resolved at all. The second case now says so and names the path it tried.
+
+## v3.70 patch3
+- Fix: with the panel acting as the wrapper, the generated launcher still started a wrapper
+  too and collided on the port every run. It now writes a server-only launcher in that mode
+  and says so, since the model still has to be hosted somewhere.
+
+## v3.70 patch2
+- Add: the panel can be the TTS wrapper itself. It answers SkyrimNet's Gradio protocol on
+  the wrapper port and translates to moss-tts-server's JSON, so no separate wrapper process
+  or venv is needed. Stdlib only - `http.server`, `urllib`, `wave`, `base64`.
+- Change: **off by default.** While on, voices depend on the panel running; the launcher
+  route is unchanged and remains the default.
+- Add: the startup ping is answered locally by default - returns silence, never reaches the
+  GPU. Compared after normalisation, since the trailing full stop makes it arrive as "ping.".
+- Fix (new code): `/gradio_api/file=` takes a caller-supplied absolute path and the listener
+  binds 0.0.0.0, so it serves only files inside its own folder; uploads are sanitised into it.
+
+## v3.70 patch1
+- Add: the header, the startup banner and the generated launcher all carry the patch number
+  and build hash, so a build can be identified from any of them. Every v3.70 build reported
+  the same string, which made "is the fix installed?" unanswerable.
+- Add: the terminal source line shows when the feed last refreshed, so a stalled live tail is
+  visible without waiting for new content.
+
+## v3.70
+- Add: Proxy > TTS [Alpha]. Settings for a TTS server/wrapper pair (binary, model, ports,
+  python, wrapper script) plus a GPU pinned by UUID, and a generator that writes
+  `start-tts.bat` into the launcher folder.
+- Add: fourth terminal beside Proxy/Thinking/Split tailing `tts.log`. Served as a fixed
+  `api_tail` kind rather than `kind=file`, so it stays readable on remote with paths masked.
+- Fix: the generated launcher exports `MOSS_TTS_URL` from the configured server port. Without
+  it the wrapper fell back to a hardcoded 1240 and changing the port broke the pair.
+- Fix: a serial-shaped GPU tag on a server survived `redact_state` and reached remote viewers.
+  Masked in both slots and routing; a plain name tag and `gpuId` are untouched, so the remote
+  Live Network graph still draws.
+- Add: file picking for the TTS paths. The existing folder browser takes an optional
+  extension filter and lists matching files; `Choose file` sits beside each path field.
+- Add: `Import from a launcher` reads the paths straight out of an existing .bat/.cmd/.ps1
+  and fills all six fields. Classifies by extension, not variable name, and returns only the
+  fields it recognised - never the file contents.
+- Fix: the TTS terminal did not stream. `sse_notify("tail")` only fires from `report()`,
+  which runs when the panel writes the proxy/thinking logs itself - nothing tells it that
+  `tts.log`, written by a separate process, has moved. `status_watch_loop` now stats it once
+  a second (only while an SSE client is connected) and notifies through the same path.
+  Server-status polling keeps its original 3s cadence.
+- Fix: the TTS terminal only updated when the page was reloaded or the tab re-entered.
+  The terminal-to-feed mapping existed in both `showTsub` and `liveRefresh` and only the
+  first was updated; both now call one `refreshCurTerm()`.
+- Fix: `Write start-tts.bat` wrote to `outputDir` rather than `launcherDir`. outputDir is
+  seeded with a default and only mirrors launcherDir on save, so on a config where the two
+  disagree the file landed in a folder Folder Settings never showed. launcherDir now wins.
+- Fix: the launcher folder viewer only listed `.ps1`, so the `start-tts.bat` the panel had
+  just written was invisible from inside the panel. Viewer now lists both; the sweep and the
+  Server Editor list stay `.ps1`-only, since a .bat is not a server launcher.
+- Add: `gate.py` - the release gate from DEVELOPMENT.md section 8 as a runnable script
+  (115 checks: encoding, version agreement, redaction, remote boundary, duplication, visual
+  invariants, generated .bat rules, jsdom behaviour).
+
+## v3.69 patch1-5
+- Change: header markers evenly spaced; Fullscreen visible to remote viewers (it only
+  affects the screen of whoever presses it), Remote Access and Profiles stay host-only.
+- Add: addresses blurred until clicked, and re-blurred on clicking away, on Proxy Setup and
+  Permissions > Remote Access. Reuses the existing click-to-reveal blur.
+- Change: provider switch renamed to Show SkyrimNet sampler values.
+- Fix: a remote reader of a log feed no longer receives file paths. Stripped on the host
+  before sending, not hidden in the page; fails closed if masking throws.
+
+## v3.69
+- Add: Fullscreen marker in the header, using the browser's own full screen.
+- Consolidates v3.68 and its thirteen patches.
+
+## v3.68
+- Add: host/client Live Network. Point Proxy Setup at another panel's address and the Client
+  tab draws the same page from that machine's state. Pull, not push: it reads the read-only
+  remote view the client already serves, on its own thread with a two second limit.
+- Add: providers can be switched off again; a power button per provider card, green on, red
+  off. A provider switched off keeps its port shut, which is what lets a second PC serve it.
+- Add: the version in the header is a button - green on the newest release, pulsing yellow
+  with Update available! when GitHub has a newer one. Tags compared as numbers.
+- Change: install path and slot count left the header for the Servers page and Folder
+  Settings; Remote Access, Profiles and the refresh interval state themselves in the header.
+- Fix: SeverActions had a scroll in one emoji table and a wrench in a later one.
+- Remembered across restarts: Remote Access, auto refresh, the launcher loaded into a server,
+  the Server Editor's lock state, the profile in use and the Observer's recording state.
+
+## v3.67
+- Fix: the port probe used connect_ex on a socket with a timeout, which on Windows waits out
+  the whole timeout and answers WSAEWOULDBLOCK instead of reporting a refusal. Every check
+  cost its full timeout; connect() reports at once.
+- Fix: identifying a .gguf opens it. That was done for every model on every scan and held
+  only thirty seconds, so a folder of large models cost 25s repeatedly and server cards sat
+  on "Model could not be loaded". Now indexed per file, held five minutes, warmed at startup.
+- Add: every step of a state read is timed with the remainder named, in the debug report and
+  in the error log for anything over half a second.
+- Add: the panel says which file it is running - path, hash, size and date.
+- Change: full window terminals cover the page; controls hide until the mouse moves and float
+  over the text; each terminal has its own Adjust menu.
+
+## v3.66
+- Fix: the per-tab live-refresh rule existed in two drifted copies. One liveRefresh() now,
+  copy count gated at build.
+- Fix: a state event repainted only the server slots, so provider cards never updated live.
+- Add: every event carries a sequence number echoed by the heartbeat; a dead stream is caught
+  within about five seconds and the connection rebuilt.
+- Change: provider colours match SkyrimNet's chips everywhere at once.
 
 ## v3.65
 
