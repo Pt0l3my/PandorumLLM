@@ -55,7 +55,7 @@ def rd(rel):
 section("file set")
 
 SHIPPED = ["fleet-panel.py", "README.txt", "PandorumLLM.exe", "PandorumLLM.ico",
-           "force-stop.bat", "launch-llm-fleet.ps1", "launcher-template.ps1",
+           "force-stop.bat", "StartPandorumLLM.bat", "launch-llm-fleet.ps1", "launcher-template.ps1",
            "fleet-config.default.json", "templates/single-gpu.ps1",
            "ps1-launchers/README.txt", "launcher-src/launcher.cpp",
            "launcher-src/app.rc", "launcher-src/app.manifest",
@@ -338,6 +338,770 @@ check('svGoing' in JS and '"wedged"' in JS, "a port held but silent also reads a
 check('shutting down' in JS, "the pane says so rather than jumping straight to stopped")
 
 
+section("launch button arc toggle")
+# a boolean that reaches the catch-all is str()'d, and JS reads "False" as truthy -
+# the bug that made 2-PC mode keep reverting (gotcha 5)
+check('"launchArc": True' in py or '"launchArc": False' in py,
+      "launchArc is seeded as a real bool, not a string")
+_as = py[py.index("def api_settings"):py.index("def api_settings") + 6000]
+check('"exitOnClose", "launchArc"' in _as or '"launchArc", "exitOnClose"' in _as,
+      "launchArc is coerced to bool rather than stringified by the catch-all")
+_af = JS[JS.index("function arcFire"):JS.index("function arcFire") + 500]
+check("launchArc === false" in _af, "the effect is guarded inside arcFire itself")
+# the property is "no arcFire call site guards itself", not "the string appears twice":
+# reading the setting to render the switch, or to pick the guide fallback, is not a guard
+_sites = [m.start() for m in re.finditer(r"\barcFire\(", JS)]
+_selfguarded = [JS[max(0, s - 200):s] for s in _sites
+                if "launchArc" in JS[max(0, s - 200):s]]
+check(not _selfguarded, "no arcFire call site guards itself - the guard is inside arcFire",
+      "%d of %d sites carry their own check" % (len(_selfguarded), len(_sites)))
+check(len(_sites) >= 6, "all the arc call sites are covered by that one guard",
+      "%d sites" % len(_sites))
+check('data-act="launchArcToggle"' in PAGE or "launchArcToggle" in JS,
+      "the toggle exists on the Customization page")
+check('d.act === "launchArcToggle"' in JS, "and has a handler")
+_rc2 = JS[JS.index("function renderCustom"):JS.index("function renderCustom") + 3000]
+check("swToggle(arcOn" in _rc2, "it uses the shared switch control, not a bespoke one")
+# step 8 calls helperGo with no selector because the arc was meant to do the pointing;
+# with the arc off the step had nothing to point at
+_ld = JS[JS.index("function launchDemo"):JS.index("function flashTargets")]
+check("launchArc === false" in _ld and "flashTargets" in _ld,
+      "the guide step falls back to the standard highlight when the arc is off")
+check(_ld.index("launchArc === false") < _ld.index("lbdemo"),
+      "and returns before the arc loop rather than running both")
+# a checkbox sits inside a label, so a click lands on the styling span where .checked is
+# undefined. Switches belong on "change", where every other one already is.
+_clickblk = JS[JS.rindex('document.addEventListener("click"'):]
+check("launchArcToggle" not in _clickblk,
+      "the switch is not handled on click, where the target is the label")
+_chg = JS[JS.index('d.act === "provField"') - 900:JS.index('d.act === "provField"')]
+check("launchArcToggle" in _chg, "it is handled on change, beside the other switches")
+
+
+section("TTS engine adapter")
+check('"ttsEngine": "moss"' in py, "engine defaults to moss - an existing install is unchanged")
+
+_sp = py[py.index("def tts_acpp_speak"):py.index("def tts_server_port")]
+check('"/v1/audio/speech"' in _sp, "audio.cpp adapter targets the OpenAI speech route")
+check('"voice_ref"' in _sp and "b64" not in _sp,
+      "reference passed as a path, never base64 - the server takes a local path")
+check("reference_text" in _sp, "reference transcript is forwarded when present")
+check("HTTPError" in _sp and "e.read()" in _sp,
+      "upstream failures surface the server's own body, as the MOSS path does")
+
+_cf = py[py.index("def tts_acpp_config"):py.index("def tts_acpp_speak")]
+check('"device": 0' in _cf and "CUDA_VISIBLE_DEVICES" in _cf,
+      "config pins by env mask with device 0, not by index",
+      "an index reorders across driver updates; the UUID does not")
+check("lazy_load" not in _cf.split('"""')[2] if '"""' in _cf else True,
+      "lazy_load is off so /health answering means the model is really loaded")
+check("busy_timeout_ms" in _cf,
+      "a bound on queued requests - the server serializes per model")
+check("reference_cache_slots" in _cf,
+      "the encoded-reference cache is raised from its default of one")
+check("min(int(" in _cf and "1024" in _cf, "and a typo cannot ask for an absurd number")
+check("ttsAcppRefSlots" in JS, "the cache size is the user's to set, not a fixed guess")
+
+_run = py[py.index("def _run"):py.index("def _silence")]
+check('tts_engine(cfg) == "audiocpp"' in _run, "the generate path branches on engine")
+check(_run.index("ttsAnswerPing") < _run.index('tts_engine(cfg) == "audiocpp":'),
+      "the local ping answer runs before either engine arm, not once per engine")
+_acpp_arm = _run[_run.index('== "audiocpp"'):_run.index("ref_b64, cached")]
+check("tts_chunks" not in _acpp_arm and "ThreadPoolExecutor" not in _acpp_arm,
+      "no chunking or concurrency on the audio.cpp arm - the server does both itself")
+check("tts_wav_join" not in _acpp_arm, "and no WAV stitching, since one request returns one file")
+
+_srv = py[py.index("def api_tts_server"):py.index("def api_launcher_content")]
+check('eng == "audiocpp"' in _srv, "starting the server branches on engine")
+check('"--config"' in _srv, "audio.cpp is started from a config the panel writes")
+check("os.path.isdir" in _srv, "the audio.cpp model is validated as a folder, not a file")
+
+_fs = JS[JS.index("const TTS_FIELDSETS"):JS.index("function ttsFields")]
+check('"ttsPython"' not in _fs.split("audiocpp:")[1], "audio.cpp field set has no python path")
+check('"ttsWrapper"' not in _fs.split("audiocpp:")[1], "and no wrapper script path")
+check("ttsPickDir" in JS and "pickTtsFolder" in JS, "the model folder can be picked, not only typed")
+
+# generated lines used to land in a temp folder with an opaque name
+_sn = py[py.index("def tts_save_named"):py.index("def tts_diagnose")]
+check("%Y%m%d_%H%M%S" in _sn, "saved lines are named as the reference wrapper named them")
+check("[^A-Za-z0-9_-]" in _sn, "the speaker name is made filesystem-safe")
+check("os.path.exists(path)" in _sn, "two lines in the same second do not overwrite each other")
+# check the code, not the prose - the docstring says "nothing is pruned" and a
+# substring test on the whole function matched its own comment
+_sn_code = re.sub(r'""".*?"""', "", _sn, flags=re.S)
+check(not re.search(r"os\.(remove|unlink)|rmtree|\.prune\(", _sn_code),
+      "nothing is deleted from the user's own folder", _sn_code[:120])
+_acpp2 = py[py.index('== "audiocpp"'):py.index("ref_b64, cached")]
+check('os.path.join(self.dir(), "out-%s.wav" % eid)' in _acpp2,
+      "the SERVED file stays in the jail; the named copy is alongside")
+check("tts_save_named" in _acpp2, "and the audio.cpp arm keeps one")
+check('"ttsOutDir"' in JS.split("moss:")[1].split("audiocpp:")[0]
+      and '"ttsOutDir"' in JS.split("audiocpp:")[1][:900],
+      "the output folder is offered for both engines")
+check("gen_s or dec_s" in _acpp2,
+      "the time is split only when the server reports it, not invented")
+check("srv_s = time.time() - _t_post" in py,
+      "the request is timed, so server time and panel overhead are measured not guessed")
+check("audio.cpp response headers seen" in py,
+      "unrecognised response headers are logged once, so the real names can be learned")
+check("TTS_ACPP_FRAME_RATE" in py, "token counts use Higgs' own frame rate, not MOSS'")
+
+# the LLM side scans a models folder and offers a dropdown; TTS now works the same way
+_ls = py[py.index("def list_tts_models"):py.index("def api_tts_models")]
+check(".gguf" in _ls and "model.safetensors" in _ls,
+      "the scanner finds both shapes audio.cpp loads: a .gguf file and a safetensors folder")
+check("PART_RX" in _ls, "sharded models appear once, not once per part")
+check("shadowed" in _ls,
+      "a safetensors folder holding a .gguf is marked - audio.cpp silently loads the gguf")
+check("count(os.sep) > 3" in _ls, "walk is depth-bounded like list_models")
+check("_tts_models_cache" in _ls, "and cached, so opening the page does not rescan every time")
+_ro = set(re.findall(r'"(/[^"]+)"', re.search(r"REMOTE_READ_OK = \{(.*?)\}", py, re.S).group(1)))
+_po = set(re.findall(r'"(/[^"]+)"', re.search(r"REMOTE_POST_OK = \{(.*?)\}", py, re.S).group(1)))
+check("/api/tts-models" not in (_ro | _po), "the model list is host-only - it discloses paths")
+
+_sg = py[py.index("def api_tts_server"):py.index("def api_launcher_content")]
+check("os.path.exists" in _sg, "a selected model may be a file or a folder")
+check("loads instead of the" in _sg,
+      "starting refuses a safetensors folder shadowed by a gguf rather than loading the wrong one")
+check("ttsModelSel" in JS and "ttsModelRescan" in JS, "the page offers selection and a rescan")
+
+
+section("error handlers do not throw")
+# an error handler that throws replaces the real failure with its own, which is how a
+# connection blip surfaced as "can't access property textContent"
+for _m in re.finditer(r"catch\s*\([^)]*\)\s*\{([^{}]*)\}", JS):
+    _body = _m.group(1)
+    _bad = re.findall(r'\$\("([^"]+)"\)\s*\.\w+\s*=', _body)
+    check(not _bad, "catch block does not assign through an unguarded $()", str(_bad))
+
+
+section("audio.cpp folder + guide")
+_fa = py[py.index("def find_acpp_exe"):py.index("def api_acpp_update")]
+check("os.walk" in _fa and "count(os.sep) > 4" in _fa,
+      "the server is found under a folder, prebuilt (flat) or source build (nested)")
+check('"ttsAcppDir"' in JS, "the user names a folder, not an executable")
+check('["ttsAcppExe"' not in JS, "and cannot point the field at an arbitrary .exe")
+_bt = JS[JS.index("async function browseTo"):JS.index("async function browseTo") + 700]
+check("path: \"\"" in _bt,
+      "a browse that lands on a non-folder falls back rather than dead-ending")
+check("Proxy TTS Port" in PAGE and "Wrapper Port (point" not in PAGE,
+      "the port is named for what it is, not for the wrapper that may not exist")
+check("/api/acpp-update" in py and "0xShug0/audio.cpp" in py,
+      "audio.cpp has an update check, on the same terms as the llama.cpp one")
+_au = py[py.index("def api_acpp_update"):py.index("def tts_save_named")]
+check("body=None" in _au and "urlopen" in _au, "it runs only when asked")
+_hg = JS[JS.index("function renderHiggsGuide"):JS.index("function renderMossGuide")]
+for _n in ("audio.cpp/releases", "audio.cpp-gguf", "q8_0", "bf16", "Models"):
+    check(_n in _hg, "the Higgs guide names %s" % _n)
+check("String.fromCharCode(92)" in _hg,
+      "backslashes are built, not escaped - the PAGE string eats them otherwise")
+# the engines are pages WITHIN the TTS guide, not siblings of it
+_us = JS[JS.index("function showUgSub"):JS.index("function showUgSub") + 400]
+check('"higgs"' not in _us, "Higgs is not a top-level guide tab")
+check("tgpane-higgs" in JS and "tgpane-moss" in JS, "both engines live inside the TTS guide")
+check('class="subtabs"' in JS[JS.index("function renderTtsGuide"):JS.index("function hgStep")],
+      "and use the same tab styling as everywhere else")
+
+# a copyable block should look copyable, and say so when it worked
+check("copy:" in PAGE and "<svg" in PAGE[PAGE.index("copy:"):PAGE.index("copy:") + 200],
+      "the copy affordance is an SVG - emoji render as ?? on the target font")
+_css = "\n".join(re.findall(r"<style>(.*?)</style>", PAGE, re.S))
+check(".gcode" in _css and "gcodePulse" in _css, "clicking one pulses in the accent colour")
+_cc = JS[JS.index("function copyCode"):JS.index("function copyCode") + 600]
+check("gcopy" in _cc, "the icon does not travel to the clipboard with the text")
+check(":not(.gcode)" in _css,
+      "the old outline flash does not fire on top of the pulse - one effect, not two")
+
+# the audio.cpp folder gets what the llama.cpp folder has
+_fe = JS[JS.index("function ttsFieldExtra"):JS.index("async function recheckAcpp")]
+check("acppchk" in _fe, "a warning when no server is found under the folder")
+check("audio.cpp/releases" in _fe, "the releases address, copyable")
+check("acppCheck" in _fe, "and an update check beside it")
+# "function renderTts" also matches renderTtsGuide - be exact
+_rt = JS.index("function renderTts()")
+check("recheckAcpp" in JS[_rt:_rt + 1600],
+      "the folder is re-checked whenever the pane is drawn")
+
+# the terminal should say what it is doing, as the reference wrapper did
+check("Loading %s..." in py and "Using device: cuda" in py,
+      "starting the server announces itself in the terminal")
+check("ready for voice synthesis" in py, "and says when it is actually ready")
+check("Stopping the TTS server" in py and "TTS server stopped" in py,
+      "stopping says so too - the reference wrapper never did")
+check("said_ready" in py, "ready is announced once per start, not once per poll")
+_el = py[py.index("def tts_engine_label"):py.index("def tts_gpu_label")]
+check("ttsAcppModel" in _el, "the banner names the model actually loaded")
+
+# the saved line repeats a folder the user chose; the filename is the new information
+# built once now and called from both arms, so one occurrence is correct
+check(py.count("os.path.basename(kept or out)") == 1,
+      "both engines log the filename, not the whole path")
+
+# Higgs reads inline tags out of the line and acts on them
+_tg = py[py.index("def tts_apply_tags"):py.index("def tts_normalize")]
+for _fam in ("emotion", "style", "prosody", "sfx"):
+    check('"%s"' % _fam in py[py.index("TTS_TAGS = {"):py.index("TTS_TAG_ANY_RX")],
+          "the %s tag family is known" % _fam)
+check("TTS_TAG_ANY_RX" in _tg,
+      "an unrecognised tag is removed, not forwarded - the model would read it aloud")
+# SkyrimNet strips < | > from every line, so the native shape never arrives. Watching
+# for it alone would have passed through nothing, forever, while looking correct.
+check("TTS_CAPS_RX" in py,
+      "the [FAMILY-VALUE] form is translated - that is what actually survives SkyrimNet")
+# a bare sfx token is inert; the model card's onomatopoeia has to abut it
+check("TTS_ONOMATOPOEIA" in py and '"sigh": "Ahh"' in py,
+      "sound effects get the onomatopoeia the model was trained on")
+check(len(TTS_SFX := re.findall(r'"sfx": \(([^)]*)\)', py)) == 1
+      and len(re.findall(r'"[a-z_]+"', TTS_SFX[0])) == 9,
+      "all nine sound effects are known, and only those nine")
+# a long_pause on a line edge runs the decoder to its cap and returns nothing
+check("_tts_drop_edge_pauses" in py,
+      "a pause with no speech beside it is dropped - it can hang the engine")
+check("TTS_SENT_RX" in py and "_tts_render(tags) + body" in py,
+      "sentence-level tags are moved to the front of their sentence")
+check("kept.setdefault" in py, "competing tags are deduped rather than stacked")
+check("TTS_ORDER" in py, "and emitted in the model card's stacking order")
+
+# SkyrimNet's own vocabularies, so its stock prompt works without being edited
+check("TTS_ALIAS" in py and '"angry": ("emotion", "anger")' in py,
+      "SkyrimNet's own [angry] / [sigh] tags map onto Higgs where they can")
+check("TTS_ALIAS_DROP" in py,
+      "and the ones with no counterpart are named rather than guessed at")
+_al = py[py.index("    def alias(m):"):py.index("    text = TTS_PAUSE_ANY_RX.sub(pause, text)")]
+check("return m.group(0)" in _al,
+      "unrecognised brackets are left alone - dialogue may contain [something]")
+check("if hit or word in TTS_ALIAS_DROP" in _al,
+      "a recognised tag is removed even when tags are off, never read aloud")
+check(py.index("text = TTS_ALIAS_RX.sub(alias, text)")
+      < py.index("text = TTS_PAUSE_ANY_RX.sub(pause, text)"),
+      "the alias pass runs first, or the MOSS matcher swallows a bare [pause]")
+check("spoken = TTS_TAG_ANY_RX.sub" in py,
+      "the spoken line still ends in punctuation after tags are rewritten")
+_i = py.index("TTS_CAPS_RX = re.compile")
+_caps = py[_i:_i + 400]                    # the file is CRLF; do not anchor on \n
+for _f in ("EMOTION", "PROSODY", "STYLE", "SFX"):
+    check(_f in _caps, "the %s family is translated" % _f)
+_hgg = JS[JS.index("function renderHiggsGuide"):JS.index("function renderMossGuide")]
+check("Chatterbox" in _hgg and "allowed" in _hgg,
+      "the guide says tags need Chatterbox and its allowed list, not just the switch")
+# a tag must abut the thing it affects - checked as the property, since the
+# implementation moved from a regex to building the string that way
+check("_tts_render(tags) + body" in py,
+      "a sentence-level tag is emitted flush against its sentence")
+check('"<|sfx:%s|>%s" % (value, word)' in py,
+      "and a sound effect flush against its onomatopoeia")
+# this check used to assert MOSS understood no tags. It does: [pause 3.2s]. The engine
+# is passed in now so each catalogue is applied to its own engine.
+check("tts_engine(cfg))" in py[py.index("processed = tts_apply_tags"):
+                               py.index("processed = tts_apply_tags") + 300],
+      "the engine decides which catalogue applies, rather than being assumed")
+check('"ttsTags": "off"' in py, "and off by default, so nothing changes uninvited")
+check('id="tts-ttsTags"' in JS and "body.ttsTags" in JS, "the switch exists and saves")
+
+# MOSS has one marker of its own; the two catalogues must not bleed into each other
+check("TTS_PAUSE_RX" in py and "pause" in py[py.index("TTS_PAUSE_RX"):py.index("TTS_PAUSE_RX") + 120],
+      "MOSS's [pause Ns] marker is known")
+check("TTS_PAUSE_MAX_S" in _tg, "and a runaway pause is clamped rather than obeyed")
+check('engine == "audiocpp"' in _tg and "moss = keep and engine" in _tg,
+      "each engine keeps only the tags it understands")
+# the on-page tag explanation was removed by request; the guide carries it
+check("Audio Tags" in JS, "the setting is present without the explanation beside it")
+
+# the update result reads like the llama.cpp one
+_ac = JS[JS.index('d.act === "acppCheck"'):JS.index('d.act === "acppCheck"') + 1400]
+# one yellow throughout now, by request, rather than the llama.cpp scheme
+check("ACPP_MSG" in _ac and "#f2c14e" in _ac,
+      "the audio.cpp update result is yellow throughout")
+
+check("#dpane-tts .set > label" in _css, "the TTS settings have room between them")
+
+
+section("launcher trust surface")
+# Defender's ML classifier flagged v3.72 as Wacatac.B!ml. The strongest signal was a
+# program that silently relaunched itself elevated and hidden - what droppers do. The
+# panel never needed administrator rights; the manifest always said so.
+_cpp = rd("launcher-src/launcher.cpp").decode("utf-8", "replace")
+check('lpVerb = L"runas"' not in _cpp, "the launcher does not relaunch itself elevated")
+# and nothing may still tell the user that not being elevated is a problem
+check("NOT elevated" not in PAGE and "not elevated" not in py.split("def main")[0],
+      "no leftover warning that the panel should be elevated - it never is now")
+check(".banner" not in "\n".join(re.findall(r"<style>(.*?)</style>", PAGE, re.S)),
+      "and no orphaned styling for it")
+# an unsigned launcher has only its behaviour to argue with. Every API it imports that a
+# text editor would not need is a point against it.
+check("winsock" not in _cpp.lower() and "WSAStartup" not in _cpp,
+      "no networking - it reads the port the panel wrote, rather than probing for one")
+check("socket(" not in _cpp, "no sockets at all")
+check("pythonw.exe" in _cpp,
+      "pythonw is preferred, so no process has to be started hidden")
+_code = re.sub(r"//[^\n]*", "", _cpp)          # comments explain the change; check the code
+check("CREATE_NO_WINDOW" in _code and "flags = 0" in _code
+      and _code.index("flags = 0") < _code.index("CREATE_NO_WINDOW"),
+      "CREATE_NO_WINDOW is a fallback for console builds, not the default")
+_rc = rd("launcher-src/app.rc").decode("utf-8", "replace")
+for _f in ("CompanyName", "FileDescription", "InternalName", "OriginalFilename",
+           "LegalCopyright", "ProductName"):
+    check(_f in _rc, "the version resource declares %s - sparse metadata is itself a signal" % _f)
+check("supportedOS" in rd("launcher-src/app.manifest").decode("utf-8", "replace"),
+      "the manifest declares which Windows versions it supports")
+check("SEE_MASK_NOASYNC" not in _cpp, "and does not hide a self-launch behind UAC")
+check("asInvoker" in rd("launcher-src/app.manifest").decode("utf-8", "replace"),
+      "the manifest still asks for no more rights than the user has")
+check(os.path.isfile(os.path.join(ROOT, "StartPandorumLLM.bat")),
+      "a plain-text launcher exists, so an antivirus block cannot lock anyone out")
+_bat = rd("StartPandorumLLM.bat")
+check(not _bat.startswith(b"\xef\xbb\xbf"), "the .bat is BOM-less, as cmd requires")
+check(b"panel-port.txt" in _bat, "it waits for the port the panel actually chose")
+check(b"powershell" not in _bat.lower() and b"Invoke-WebRequest" not in _bat,
+      "and does nothing an antivirus would reasonably object to")
+
+
+section("higgs installer")
+# the panel fetching and unpacking executables is the largest thing it does for a
+# user, so the constraints are checked rather than trusted
+_hi = py[py.index("def higgs_install_worker"):py.index("def api_higgs_install")]
+_ha = py[py.index("def api_higgs_install"):py.index("def api_higgs_install") + 900]
+check("/api/higgs-install" not in (_ro | _po), "the installer is host-only")
+check('body or {}).get("confirm")' in _ha, "and refuses without an explicit confirmation")
+check("cancel" in _ha and "HIGGS_INSTALL[\"cancel\"] = True" in _ha, "it can be stopped")
+_uz = py[py.index("def _hi_unzip"):py.index("def _hi_free_bytes")]
+check("refusing an archive entry outside" in _uz and "os.path.realpath" in _uz,
+      "an archive entry that would land outside the folder is refused")
+check("refusing an absolute path" in _uz, "and so is an absolute path inside an archive")
+check('if p not in ("", ".", "..")' not in _uz,
+      "hostile entries are refused, not silently flattened into the folder")
+_dl = py[py.index("def _hi_download"):py.index("def _hi_unzip")]
+check("Range" in _dl and ".part" in _dl, "a part-finished download resumes rather than restarts")
+check("HIGGS_INSTALL[\"cancel\"]" in _dl, "and notices a cancel mid-stream")
+check("disk_usage" in py, "free space is checked before 5 GB is fetched")
+check("could not be saved" in _hi and "Set these by hand" in _hi,
+      "a locked config at the last step does not report the whole install as failed")
+# a finished install that looks identical to one that never ran is not feedback
+_row = JS[JS.index("function higgsInstallRow"):JS.index("async function higgsInstall")]
+check("g.done" in _row, "a finished install says so, rather than falling back to the button")
+check("higgsDismiss" in _row and '"dismiss"' in py, "and can be dismissed")
+check("Engine already unpacked" in _hi,
+      "pressing it again skips what is already there, so it is cheap to retry")
+_sc = py[py.index("def save_config(cfg):"):py.index("DEFAULT_PROVIDER_SEED")]
+check("PermissionError" in _sc and "time.sleep" in _sc,
+      "an atomic write retries a transient Windows lock rather than losing the settings")
+check("os.remove(tmp)" in _sc, "and never leaves a .tmp file behind when it gives up")
+check("api.github.com" in _hi and "huggingface.co" in _hi,
+      "both sources are the published ones")
+# the profile archives carry a commit hash; the shared runtime does not
+_ea = py[py.index("HIGGS_ENGINE_ASSETS = ("):py.index("HIGGS_GGUF_REPO")]
+check(".zip" not in _ea and "audiocpp-" not in _ea,
+      "engine assets are matched by WORDS, not filenames - names carry a build hash")
+check('"win"' in _ea, "win not windows, so a win64 archive still matches")
+check("balance" in _ea and "portable" in _ea,
+      "the profile is a preference with fallbacks, not a requirement")
+check("avoid" in _hi, "the runtime is excluded from the build match, not colliding with it")
+check("for w in need)" in _hi, "so a rename or reordering does not break the install")
+check("It has:" in _hi,
+      "and a mismatch lists what the release actually carries, not just what is missing")
+_cf = JS[JS.index("async function higgsInstall"):JS.index("async function higgsCancel")]
+for _s in ("github.com", "huggingface.co", "5.1 GB", "Nothing about your setup"):
+    check(_s in _cf, "the confirmation states: %s" % _s)
+
+
+section("tts terminal tags")
+check("def tts_tags_display" in py,
+      "the terminal shows tags as the model wrote them, not as Higgs takes them")
+_pt = JS[JS.index("function paintTail"):JS.index("function stepAt")]
+check('which === "tts"' in _pt, "the TTS terminal is painted, not dumped as plain text")
+_ps = JS[JS.index("function paintSpoken"):JS.index("function paintTail")]
+check("#2ef2ff" in _ps, "and tags are picked out in cyan")
+check("#ffffff" in _ps and "#ff5dc8" in _ps and "#f2c14e" in _ps,
+      "with white stars, a magenta speaker and the line in gold")
+# every tag needs a word, or the terminal shows a raw identifier
+_tw = py[py.index("TTS_TAG_WORDS = {"):py.index("def tts_tags_display")]
+_names = set(re.findall(r'\("(\w+)", "(\w+)"\)', _tw))
+_all = set()
+_cat = py[py.index("TTS_TAGS = {"):py.index("# The model card's own spellings")]
+for _fam, _vals in re.findall(r'"(\w+)": \(([^)]*)\)', _cat):
+    for _v in re.findall(r'"(\w+)"', _vals):
+        _all.add((_fam, _v))
+check(_all and not (_all - _names),
+      "every tag has a word for the terminal", str(sorted(_all - _names))[:120])
+# Static analysis cannot tell a correct "\\]" from a broken one here - it flagged a
+# valid [^\\]] class. The property is that the terminal paints the right spans, so it
+# is tested by painting one (in the jsdom section below), not by reading the source.
+check(_pt.count("esc(") >= 6 and "innerHTML" in _pt,
+      "every part of a log line is escaped - it carries NPC dialogue")
+# the PAGE string swallows an unescaped backslash, and python warns about it
+import warnings
+with warnings.catch_warnings():
+    warnings.simplefilter("error", SyntaxWarning)
+    try:
+        compile(py, "fleet-panel.py", "exec")
+        _clean = True
+    except SyntaxWarning:
+        _clean = False
+    except SyntaxError as _e:
+        _clean = "invalid escape" not in str(_e)
+check(_clean, "no invalid escape sequences - they warn today and fail tomorrow")
+
+
+section("local voice clips")
+# SkyrimNet resamples every reference to 16 kHz before uploading, including its own
+# 44.1 kHz voice-samples. A clip read off disk keeps what Higgs has room for.
+_vi = py[py.index("def tts_voice_index"):py.index("def tts_ref_canonical")]
+check("st_mtime" in _vi, "the folder is indexed once and rebuilt only when it changes")
+check('re.split(r"[\\\\/]"' in _vi,
+      "the upload name is split on BOTH separators - os.path.basename ignores backslash off Windows")
+check('.endswith(".wav")' in _vi,
+      "only .wav is accepted - this panel has no converter and MOSS is handed the bytes")
+check("local = tts_local_sample(ref_path, cfg)" in py,
+      "a local clip replaces the upload before the reference is used")
+check('"  [local clip]"' in py,
+      "and the terminal says when one was used - on the Saved line, not the speaker")
+check('"ttsVoiceDir"' in JS, "the folder is a setting on the TTS page")
+
+
+section("child processes and terminal toggles")
+# pythonw has NO console, so a console child spawned with no flags gets a NEW visible
+# one. python.exe with CREATE_NO_WINDOW had a hidden console children inherited.
+check("NOWIN = {" in py and "0x08000000" in py, "a no-window flag set exists for children")
+_spawns, _bare = [], []
+for _m in re.finditer(r"subprocess\.(run|Popen|check_output)\(", py):
+    _seg, _d, _e = py[_m.start():_m.start() + 900], 0, None
+    for _i, _ch in enumerate(_seg):
+        if _ch == "(":
+            _d += 1
+        elif _ch == ")":
+            _d -= 1
+            if _d == 0:
+                _e = _i
+                break
+    _call = _seg[:(_e or 400) + 1]
+    _spawns.append(_call)
+    if "NOWIN" not in _call and "creationflags" not in _call and "xdg-open" not in _call:
+        _bare.append(_call.split("\n")[0][:70])
+check(len(_spawns) >= 8, "every spawn is accounted for", "%d found" % len(_spawns))
+check(not _bare, "none of them can pop a console window", str(_bare))
+
+check('"termStamps": "on"' in py and '"termInsTts": "off"' in py,
+      "the terminal toggles are settings, so they survive a reload")
+# count BUTTONS: the sync function selects on the same attribute, so counting every
+# mention counts my own querySelectorAll as a sixth terminal
+# 5 panes plus one copy in the outer bar for full-window split view
+check(PAGE.count(">Timestamps</button>") == 6, "Timestamps is on all five terminals",
+      str(PAGE.count(">Timestamps</button>")))
+check(PAGE.count(">Insert TTS</button>") == 4,
+      "Insert TTS only on the three that show a dialogue completion",
+      str(PAGE.count(">Insert TTS</button>")))
+check("syncTermToggleUI" in JS[JS.index("function refreshCurTerm"):
+                               JS.index("function refreshCurTerm") + 400],
+      "the lit state is applied on every draw, not only after a click")
+check("#f2c14e" in JS, "the spoken line is gold, not the theme accent")
+check('"launchArc": False' in py, "the launch arc is off by default")
+# the engine needs the tag flush against its word; a reader needs a space
+_dp = py[py.index("def tts_tags_display"):py.index("def tts_normalize")]
+check('"*%s* "' in _dp, "the terminal spaces a tag from the word after it")
+_ap = py[py.index("def tts_apply_tags"):py.index("def tts_apply_tags") + 2200]
+check('"*%s* "' not in _ap, "but the engine still gets it flush, as Boson require")
+_lg = py[py.index("    def log(self, line):"):py.index("    def save_upload")]
+check("%H:%M:%S" in _lg,
+      "the TTS log is stamped, so a spoken line can be placed beside its completion")
+_sp = JS[JS.index("function spliceTts"):JS.index("function spliceTts") + 2200]
+check("stampSecs" in _sp, "spoken lines are paired to a completion by time")
+check("TTS_BURST_GAP" in JS and "ttsBursts()" in _sp,
+      "a streamed reply's chunks are grouped into one burst, not matched line by line")
+check("TTS_NEAR_DLG" in _sp,
+      "and the burst attaches where it STARTS - TTS fires before the timing line lands")
+check("dialogue/i.test" in _sp, "and to a dialogue completion, not any completion")
+_at = py[py.index("def api_tail"):py.index("def api_tail") + 1600]
+check("PANEL_START" in _at,
+      "a fleet log from a previous run of the panel is not shown as if it were this one")
+check("waiting for this session" in _at, "and says so plainly instead of looking stale")
+check("a.at - b.at" in JS,
+      "spoken lines are read in time order rather than reversing")
+check("b - a" in _sp, "inserted bottom-up, so earlier positions stay valid")
+check("paintSpoken" in JS[JS.index("if (which !== \"dashboard\")"):
+                          JS.index("if (which !== \"dashboard\")") + 2000],
+      "a spliced line is painted like it is in the TTS terminal, not left plain")
+check(JS.count("function paintSpoken") == 1, "one painter, shared by both terminals")
+
+
+section("spoken line in the proxy log")
+_lg2 = py[py.index("def _run"):py.index("def _silence")]
+check("(local clip)" not in _lg2,
+      "no suffix on the speaker - it broke the name and was not wanted")
+check('"  [local clip]"' in py, "the fact is reported on the Saved line instead")
+_ps2 = JS[JS.index("function paintSpoken"):JS.index("function paintTail")]
+# the mask is gone: the icon varies, so the read is structural - checked in the mood
+# section below
+check("bare.indexOf" in _ps2, "the speaker is read without depending on which icon leads")
+check("sayRx" not in _ps2,
+      "not by a regex whose colon class swallowed the timestamp")
+check(TTS_LOG_CLEAR := ("TTS_LOG_NAME)" in py and 'with open(_tl, "w"' in py),
+      "the TTS log starts empty each session, like the fleet logs do")
+
+
+section("split panes and insertion marker")
+_pt2 = JS[JS.index("function paintTail"):JS.index("function stepAt")]
+# the splice places lines BY timestamp, so stripping them first left it nothing to work
+# with and the insertions silently vanished
+check(_pt2.index("spliceTts(text)") < _pt2.index("stripStamps(text)"),
+      "the splice runs before stamps are stripped, or insertions disappear with them")
+# the arrow became a channel tree; the marker checks live in the tree section below
+check("TREE_MID" in JS, "an inserted line is marked")
+_st = JS[JS.index("function stripStamps"):JS.index("function ttsSpokenLines")]
+check("TSTAMP_RX" in _st,
+      "hiding stamps keeps the marker - the glyph sits after the stamp, so removing "
+      "the stamp leaves it alone")
+# strip comments: the note explaining "No new RegExp(...)" matched the test itself
+check("new RegExp(" not in re.sub(r"//[^\n]*", "", _st),
+      "and reuses the working literal rather than rebuilding it")
+
+_sf = JS[JS.index("const SPLIT_FEEDS"):JS.index("async function refreshSplit")]
+check('"dashboard", "Proxy"' in _sf and '"tts", "TTS"' in _sf,
+      "each split pane can show the proxy, thinking content or TTS")
+check("splitins-" in _sf and 'display = (splitFeed(side) === "dashboard")' in _sf,
+      "Insert TTS is hidden on a pane not showing the proxy - it was on both before")
+check('"splitSrcD": "dashboard"' in py, "the choice is a setting, so it survives a reload")
+_chg = JS[JS.index('d.act === "ttsModelSel"') - 400:JS.index('d.act === "ttsModelSel"')]
+check("splitFeed" in _chg, "the selector is handled on change, not click")
+
+
+section("tts tree and existing install")
+_sl = JS[JS.index("function spliceTts"):JS.index("function spliceTts") + 2600]
+check("TREE_MID" in JS and "TREE_END" in JS,
+      "an inserted burst is drawn as a tree, the last chunk closing it")
+check("TREE_PAD" in JS, "and sits in from the row it hangs off")
+check("LONE_MARK = TREE_PAD" in JS,
+      "a line hanging off nothing starts in the SAME column as one that does")
+check("width:2ch" in JS, "the marker takes the width of the drawn branch")
+check("LONE_MARK" in JS and "anchored" in _sl,
+      "a line hanging off nothing - the player speaking - gets a plain arrow, not a branch")
+check("last.who === s.who" in JS,
+      "a burst requires the same SPEAKER: gap alone merged the player's line with the reply")
+# a stretched glyph overlapped the row below and the glow doubled at the join
+check("scaleY" not in JS, "the branch is not a stretched glyph")
+check(".tbr::before" in _css and "height:100%" in _css,
+      "it is DRAWN one row tall, so it meets the next one and no more")
+check(_css.count("0 0 20px var(--acc)") >= 2, "with a three-layer glow")
+check(".tbrend::before" in _css and "height:50%" in _css,
+      "and the last one stops at the elbow")
+check("s.stamp" in _sl, "the glyph comes AFTER the timestamp, not before it")
+_ps3 = JS[JS.index("function paintSpoken"):JS.index("function paintTail")]
+check("var(--acc)" in _ps3 and "text-shadow" in _ps3,
+      "the marker glows in the accent colour")
+
+# the binary reports no version of its own, so the tag is recorded when installed
+check('"ttsAcppVersion"' in py, "the audio.cpp release tag is a setting")
+check('st["ttsAcppVersion"] = tag' in py, "written at install time")
+check('out["local"] = acpp_local_version' in py,
+      "and reported by the version check, which the binary cannot answer")
+
+# files can be present while the settings are not - a failed config save did exactly that
+_hp = py[py.index("def higgs_present"):py.index("def api_higgs_adopt")]
+check(".gguf" in _hp and "find_acpp_exe" in _hp,
+      "an install already on disk is detected: server plus at least one model")
+check('"adoptable": bool(exe and models and not wired)' in _hp,
+      "and only offered when the settings are not already pointing somewhere")
+check("/api/higgs-adopt" not in (_ro | _po), "adopting is host-only")
+check("higgsAdopt" in JS, "the page offers to use it rather than asking for four paths")
+
+
+section("npc name from the prompt")
+# the voice sample is named after the voicetype; the character's name is in the dialogue
+# prompt the proxy already forwards
+_ns = py[py.index("def note_speaker"):py.index("def speaker_for_voice")]
+check("SPEAKER_SCAN" in _ns and "[:SPEAKER_SCAN]" in _ns,
+      "only the first few KB of a request is scanned, not 45 KB of prompt")
+check("json" not in _ns, "and it is not JSON-parsed on every request")
+check("_spk_recent.append((time.time(), name))" in _ns,
+      "only the NAME is kept - never the prompt")
+_sv = py[py.index("def speaker_for_voice"):py.index("def tts_voice_name")]
+check("del _spk_recent[idx]" in _sv,
+      "a paired request is CONSUMED, so a second voice cannot inherit the same name")
+check("if known:" in _sv and "return known" in _sv,
+      "and a learned pairing is never relearned, so one wrong guess cannot spread")
+check("note_speaker(body)" in py[py.index("def _mk_handler"):py.index("def _mk_handler") + 4000],
+      "read from the request the proxy is already carrying, with no extra model call")
+check("def tts_speaker_label" in py and "or tts_voice_name(path)" in py,
+      "the terminal shows the character where known and the voicetype otherwise")
+
+
+section("player vs npc naming")
+# the player's line is spoken when THEY speak, before the next dialogue request - so it
+# was pairing with the previous turn's character and stealing that name
+check("PLAYER_VOICES" in py, "the player's own voice is named apart from the learned ones")
+check("Party's" in py,
+      "the player is named by the PARTY, which is always theirs")
+check('You are speaking to' not in py.split("PLAYER_RX")[1][:200],
+      "NOT by 'speaking to', which names the LISTENER - one NPC addressing another put "
+      "that NPC's name on the player's own line")
+check('or "Player"' in py, "and falls back to Player rather than borrowing a name")
+check("PLAYER_SCAN" in py, "the party marker sits far into the body, so it is scanned wider")
+check("if not _spk_player[0]:" in py, "but only until it is found once")
+_sv2 = py[py.index("def speaker_for_voice"):py.index("def acpp_local_version")]
+check("if key in PLAYER_VOICES" in _sv2 and "return _spk_player[0]" in _sv2,
+      "so it never enters the learned map and cannot take an NPC's name")
+
+# the binary answers no --version; a hand install has no recorded tag either
+_lv = py[py.index("def acpp_local_version"):py.index("def api_acpp_update")]
+check("README" in _lv, "a version is read off disk when the panel did not install it")
+# the README turned out to carry no version, so try what else might answer
+check("/health" in _lv and "/v1/models" in _lv,
+      "a running server is asked, since the binary itself answers no --version")
+check("TTS_SERVER_LOG_NAME" in _lv,
+      "and its own startup output, which the panel already captures")
+check("VersionInfo" in _lv, "and the file's own Windows version resource")
+check('return ""' in _lv,
+      "returning nothing is a valid answer - better than inventing a number")
+check("CHANGELOG.md" in _lv, "and a changelog shipped beside it counts too")
+check('st.get("ttsAcppVersion")' in _lv, "with a recorded tag preferred over a guess")
+check("acpp_local_version(c)" in py, "and recorded when an existing install is adopted")
+
+
+section("mood icon on a spoken line")
+_mi = py[py.index("def tts_mood_icon"):py.index("def tts_tags_display")]
+check("for want in (\"emotion\", \"style\", \"sfx\")" in _mi,
+      "an emotion colours the sentence, so it outranks a one-moment sound")
+_missing = []
+_cat = py[py.index("TTS_TAGS = {"):py.index("# The model card's own spellings")]
+_mood = py[py.index("TTS_MOOD = {"):py.index("TTS_MOOD_PLAIN")]
+for _fam, _vals in re.findall(r'"(\w+)": \(([^)]*)\)', _cat):
+    if _fam == "prosody":
+        continue
+    for _v in re.findall(r'"(\w+)"', _vals):
+        if ('("%s", "%s")' % (_fam, _v)) not in _mood:
+            _missing.append("%s:%s" % (_fam, _v))
+check(not _missing, "every emotion, style and sound has an icon", str(_missing)[:120])
+check("TTS_MOOD_PLAIN" in py, "and a plain line has one too")
+# the icon varies now, so nothing may key off which one it is
+check("MASK" not in JS, "a spoken line is found by the wave markers, not by the icon")
+check("const SAID" in JS, "which do not change with the mood")
+_ps4 = JS[JS.index("function paintSpoken"):JS.index("function paintTail")]
+check("bare.indexOf(\" \")" in _ps4,
+      "and the speaker is read structurally: first token is the icon, then the name")
+
+
+section("launch buttons")
+check('arcLabel("Launch LLM")' in JS, "the fleet button says what it launches")
+check('id="launchTtsBtn"' in PAGE, "and there is a second one for the TTS server")
+check("function launchTts" in JS and "function syncTtsButton" in JS,
+      "with its own start and its own state")
+_tb = JS[JS.index("function syncTtsButton"):JS.index("async function launchStack")]
+for _cls in ("lbload", "lbrun"):
+    check(_cls in _tb, "it uses the same %s effect as the fleet button" % _cls)
+check("arcFire(tb" in _tb, "and the same arcs")
+# every launch rule was keyed on one id, so the TTS button matched none of them
+_lone = [" ".join(s.split())[:60] for s, _ in
+         re.findall(r"([^{}]*launchBtn[^{}]*)\{([^{}]*)\}", _css)
+         if "launchTtsBtn" not in s and "button.go" not in s]
+check(not _lone, "every launch style covers both buttons", str(_lone))
+# a disabled button emits no pointer events, so it lost its hover crackle when running
+check("lb.disabled" not in JS and "tb.disabled" not in JS,
+      "neither button is disabled - that killed hover the moment it was running")
+check("lbbusy" in JS and "lbbusy" in _css,
+      "they are marked busy instead, and the click is refused in the handler")
+# the crackle rides on the arc effect, which is off by default - so hover needs its own
+check("#launchBtn:hover, #launchTtsBtn:hover" in _css,
+      "hover lifts the glow without depending on the arc effect being on")
+check("srv.stopping" in JS,
+      "Terminate stops the TTS server, and the button says so while it unloads")
+check("NO_CFG_LOCK" in py and "/api/launch-stack" in py.split("NO_CFG_LOCK")[1][:200],
+      "a launch does not hold the config lock, so one button cannot block the other")
+check("class _NullLock" in py, "with a stand-in lock rather than a branch around the body")
+check("[Alpha]" not in PAGE, "the TTS tab is no longer labelled Alpha")
+_row2 = JS[JS.index("function higgsInstallRow"):JS.index("async function higgsInstall")]
+check("1 click install into the PandorumLLM" in _row2, "the install hint says what it is")
+check("Prefer to do it yourself" not in JS, "and the page carries less prose")
+check("ACPP_MSG" in JS, "the version report is one colour throughout")
+check('closest("#launchBtn, #launchTtsBtn")' in JS,
+      "the hover arcs cover both, not only the first")
+check(JS.count("syncTtsButton()") >= 2,
+      "and it is called on a refresh pass, not only defined")
+check("Set these on the TTS page first" in JS,
+      "pressing it with nothing configured says what is missing rather than failing")
+check(">TTS</label>" in JS and "Higgs Audio v3 (4B) - runs on audio.cpp" in JS,
+      "the setting names the TTS; the engine follows from it")
+check("ttsEngineSel" in JS,
+      "and it is still keyed on the engine value, so no config needs migrating")
+
+
+section("wrapping and per-terminal stamps")
+_ps5 = JS[JS.index("function paintSpoken"):JS.index("function paintTail")]
+check("text-indent:-" in _ps5 and "padding-left:" in _ps5,
+      "a wrapped spoken line hangs under the dialogue, not back at the tree column")
+check("function termCols" in JS,
+      "the indent is measured in COLUMNS - an emoji is two cells, so counting characters "
+      "would under-measure it")
+check("function joinLines" in JS and "display:block" in JS,
+      "a block ends its own line, so no newline is added after one")
+check("row-gap" in _css and "flex-wrap: wrap" in _css,
+      "the terminal bar wraps rather than stacking its buttons on each other")
+check(".tbar > button { flex: 0 0 auto; }" in _css, "and no button is squeezed to nothing")
+# in full window, split view stacks an outer chrome (Full Window / Normal Size) over one
+# chrome per pane (Timestamps / Adjust) - both absolute at top:0, so they overlapped
+# in full window the right pane's controls belong in the outer bar, where its Adjust
+# already went - pushing the pane bar down left them orphaned a row below their Adjust
+check(".tmax #tchrome-splitt .tbar > button { display: none; }" in _css,
+      "the right pane's own buttons are hidden in full window")
+check(PAGE.count(">Timestamps</button>") == 6,
+      "and a copy lives in the outer bar, as its Adjust does",
+      str(PAGE.count(">Timestamps</button>")))
+check("splitins-t-max" in JS, "including Insert TTS, kept in step with the feed")
+check("srv.pid" in JS,
+      "the TTS button clears itself when the process is gone - terminating before it "
+      "served left it reading Starting TTS for ever")
+check('"termStampsOff"' in py, "timestamps are remembered per terminal")
+check("function termStampsOn(which)" in JS, "and each terminal is asked about itself")
+# in split view the feed shown and the pane showing it are different names; a per-pane
+# setting has to follow the PANE or the button toggles something else
+check('paintTail(kd, d.text || d.error || "", $("tail-splitd"), "splitd")' in JS,
+      "a split pane tells paintTail which pane it is, not only which feed")
+check("const who = pane || which;" in JS, "and the timestamps follow the pane")
+check(PAGE.count('data-act="termStamps" data-kind=') == 6,
+      "every button says which terminal it belongs to",
+      str(PAGE.count('data-act="termStamps" data-kind=')))
+
+
+section("v3.73 sweep")
+# NO_CFG_LOCK removed the serialization these two had been relying on
+check("_FLEET_LOCK" in py and "_TTSSRV_LOCK" in py,
+      "launching and starting TTS each have their own lock, so neither can double-start")
+check("acquire(blocking=False)" in py,
+      "and a second press is told so rather than queued behind the first")
+for _e in ("/api/launch-stack", "/api/tts-server"):
+    _seg = py[py.index("NO_CFG_LOCK = frozenset"):py.index("NO_CFG_LOCK = frozenset") + 400]
+    check(_e in _seg, "%s runs outside the config lock" % _e)
+# one pattern for a rendered control token, not one per caller
+check("TTS_TOKEN_RX" in py and py.count('r"<\\|([a-z]+):([a-z_]+)\\|>"') == 1,
+      "there is one pattern for a control token, not a copy per caller")
+# the spoken line and the saved line were each written once per engine arm
+check(py.count("def say_line") == 1 and py.count("self.say_line(") == 2,
+      "the spoken line is built in one place and called from both engines")
+check(py.count("def saved_line") == 1 and py.count("self.saved_line(") == 2,
+      "and so is the saved line")
+# the tree must describe what the code does, not what it used to
+_pt3 = JS[JS.index("const hostItems"):JS.index("let svg")]
+check("fetches audio.cpp and a model from the internet" in _pt3,
+      "the tree names the installer, which reaches the internet")
+check("asks github.com only when pressed" in _pt3, "and the update check")
+check("filenames are stripped" not in _pt3,
+      "and no longer claims filenames are stripped - the Saved line is a bare filename now")
+check("dialogue, reasoning and character names show" in _pt3,
+      "it says plainly that terminal text reaches a remote reader")
+
+
+section("no third-party page loads")
+# the page pulled Plus Jakarta Sans from fonts.googleapis.com on every open, which told
+# Google the IP and referer of a panel documented as LAN-only
+_ext = re.findall(r'(?:href|src)="(https?://[^"]+)"', PAGE)
+check(not _ext, "the page loads nothing from a third party", str(_ext)[:120])
+# the comment explaining the removal names the host, so look for an actual element:
+# every <link> in the head must point at something the panel serves itself
+_links = re.findall(r"<link[^>]*>", PAGE.split("</head>")[0])
+check(not [l for l in _links if "http" in l], "no webfont link", str(_links)[:120])
+check("Plus Jakarta Sans" in PAGE,
+      "the family is still declared, so a local install is still used")
+check("Segoe UI" in PAGE, "and the fallback is a font every Windows install has")
+
+
 section("permission tree claims")
 # Section 8: every claim the tree makes is checked against the code enforcing it.
 # Without this the tree quietly goes stale - it named three terminals for a build that
@@ -415,8 +1179,9 @@ _body = _cur.group(1) if _cur else ""
 check(bool(_cur), "refreshCurTerm exists (single terminal->feed mapping)")
 for _t in _names:
     check(('curTsub === "%s"' % _t) in _body, "terminal '%s' has a live-refresh branch" % _t)
-check(JS.count('refreshCurTerm();') == 2,
-      "refreshCurTerm called from both showTsub and liveRefresh",
+# showTsub, liveRefresh, and termToggle after a display switch
+check(JS.count('refreshCurTerm();') >= 2,
+      "refreshCurTerm called from showTsub and liveRefresh at least",
       "found %d call sites" % JS.count('refreshCurTerm();'))
 check(len(re.findall(r'refreshTail\("tts"\)', JS)) == 1,
       "tts feed named in exactly one place")
@@ -475,6 +1240,30 @@ for sel, body in rules:
         if re.search(r"(^|\s)0(px)?\s+0(px)?\s+0(px)?\s+\d", decl):
             rest_rings.append(s[:60])
 check(not rest_rings, "nothing at rest draws a zero-blur ring", str(rest_rings[:3]))
+
+# an !important declaration overrides an animation, so any highlight aimed at a button
+# must not animate a property that a button rule kills with !important
+_dead = set()
+def _selclean(s):
+    # the capture carries any comment that preceded the rule; the selector is what
+    # follows the last one
+    s = re.sub(r"/\*.*?\*/", " ", s, flags=re.S)
+    return " ".join(s.split())
+for _sel, _body in rules:
+    _s = _selclean(_sel)
+    if re.match(r"^(button|a\.btnlink)\s*(,|$)", _s):
+        for _d in re.findall(r"([a-z-]+)\s*:[^;]*!important", _body):
+            _dead.add(_d)
+check(bool(_dead), "found the !important properties a button rule suppresses", str(sorted(_dead)))
+_btnhl = [b for s, b in rules if "guidehl" in s and ("button" in s or "btnlink" in s)]
+check(bool(_btnhl), "buttons have their own guide-highlight variant")
+_anim = re.search(r"animation:\s*(\w+)", _btnhl[0]) if _btnhl else None
+_kf = re.search(r"@keyframes %s\b(.*?)\n\s*\}" % _anim.group(1), css, re.S) if _anim else None
+_props = set(re.findall(r"([a-z-]+)\s*:", _kf.group(1))) if _kf else set()
+check(bool(_kf), "and it names a real keyframe", _anim.group(1) if _anim else "none")
+check(not (_props & _dead),
+      "the button highlight animates nothing an !important button rule suppresses",
+      "clash: %s" % sorted(_props & _dead))
 
 
 # ------------------------------------------------------- 9. emoji spacing
@@ -688,6 +1477,41 @@ _tw = py[py.index("class TtsWrapper"):py.index("def tts_voice_name")]
 check("def prune" in _tw and "os.remove" in _tw,
       "generated audio is pruned rather than accumulating forever")
 check("rmtree" in _tw, "uploaded reference voices are pruned too")
+
+# SkyrimNet's references come from FFmpeg with extra RIFF chunks. moss-tts-server
+# answered those with 400 and audio.cpp with "failed to read WAV data chunk" - the same
+# fault through two parsers, so it is normalised once at the upload, not per engine.
+_su = _tw[_tw.index("def save_upload"):_tw.index("def submit")]
+check("tts_wav_normalize" in _su,
+      "an uploaded reference is normalised on the way in, for every engine")
+check('b"RIFF"' in _su, "and only when it is actually a WAV")
+_acpp = py[py.index('== "audiocpp"'):py.index("ref_b64, cached")]
+# normalising on the way in is not enough: SkyrimNet HEADs the path first and skips the
+# upload on a 200, so a file cached by an older build is never re-sent
+_rc = py[py.index("def tts_ref_canonical"):py.index("def tts_engine")]
+check('b"data"' in _rc and "36:40" in _rc,
+      "a cached reference is checked cheaply before being trusted")
+check("f.write(clean)" in _rc, "and repaired in place, so it is fixed once and stays fixed")
+check("tts_ref_canonical(ref_path)" in _acpp,
+      "the audio.cpp arm repairs a stale reference rather than failing on it")
+
+# a crashed server closes the socket and says nothing; its own log says why one line up
+_dg = py[py.index("def tts_diagnose"):py.index("def tts_pick_fields")]
+check("no kernel image" in py and "TTS_HINTS" in py,
+      "a crash is translated into something a person can act on")
+check("f.seek(0, 2)" in _dg, "only the tail of the server log is read, not all of it")
+check("tts_diagnose(cfg)" in py[py.index("def _run"):py.index("def _silence")],
+      "and the hint is attached to the failure the user sees")
+
+# Zonos and Chatterbox both speak Gradio but send different argument lists
+_pf = py[py.index("def tts_pick_fields"):py.index("def tts_ref_canonical")]
+check("fields[3]" in _pf and "isinstance" in _pf,
+      "the proven Zonos positions are kept when they hold")
+check('f.get("path")' in _pf,
+      "and the reference is found by shape when they do not - any Gradio engine works")
+check("_TTS_LANG_RX" in _pf, "a language tag is never mistaken for the line to speak")
+check("fields[1] if len(fields)" not in py[py.index("def submit"):py.index("def result")],
+      "submit no longer indexes the array blind")
 check("PROXY_MAX_BODY" in py, "the proxy caps its request body as the TTS listener does")
 _ph = py[py.index("def _mk_handler"):py.index("def _mk_handler") + 4000]
 check("PROXY_MAX_BODY" in _ph and "413" in _ph,
@@ -858,7 +1682,11 @@ const html = fs.readFileSync(%r, 'utf8');
 const errors = [];
 const dom = new JSDOM(html, { runScripts: 'dangerously', pretendToBeVisual: true,
   beforeParse(w) {
-    w.fetch = () => Promise.resolve({ json: () => Promise.resolve({}), text: () => Promise.resolve('') });
+    w.__posts = [];
+    w.fetch = (url, opt) => {
+      if (String(url).indexOf('/api/settings') >= 0 && opt && opt.body) w.__posts.push(opt.body);
+      return Promise.resolve({ json: () => Promise.resolve({}), text: () => Promise.resolve('') });
+    };
     w.EventSource = function () { this.close = () => {}; };
     w.matchMedia = () => ({ matches: false, addEventListener(){}, removeEventListener(){} });
     w.onerror = (m) => errors.push(String(m));
@@ -917,7 +1745,56 @@ console.log(JSON.stringify({
         tDetail = 'pill=' + (pane().match(/shutting down|stopped|ready/) || [''])[0];
         w.eval('ttsBusy = "";');
       } catch (e) { tDetail = String(e); }
-      return { followsState: up && dn, followsState2: 'up=' + up + ' down=' + dn, keepsEdit: kept,
+      let aPost = 'none', aSticks = false, aOff = false, aOn = false, aDet = '';
+      let dArc = false, dHl = false, dDet = '', paintRoles = '';
+      try {
+        const W = String.fromCharCode(12336) + String.fromCharCode(65039);
+        const pre = d.getElementById('tail-tts');
+        w.paintTail('tts', '\u{1F3AD} Aurivoice: ' + W + ' *whispering*Keep quiet. ' + W, pre);
+        const NAME = { '#ff5dc8': 'magenta', '#ffffff': 'white', '#2ef2ff': 'cyan',
+                       '#f2c14e': 'say' };
+        paintRoles = [...pre.querySelectorAll('span')]
+          .map(s => { const m = (s.getAttribute('style') || '').match(/color:([^;]+)/);
+                      return m ? (NAME[m[1]] || '?') : ''; })
+          .filter(x => x)
+          .join('|');
+      } catch (e) { paintRoles = String(e); }
+      try {
+        const mkc = (arc) => JSON.stringify({ settings: Object.assign({ themeName: 'OpenRouter' },
+          arc === undefined ? {} : { launchArc: arc }), gpus: [], slots: [], routing: [], scope: 'host' });
+        w.eval('state = ' + mkc(undefined) + ';'); w.showTab('custom');
+        const bx = () => d.querySelector('#tab-custom [data-act="launchArcToggle"]');
+        const before = w.__posts.length;
+        bx().closest('label').click();
+        const sent = w.__posts.slice(before).map(x => { try { return JSON.parse(x); } catch (e) { return {}; } })
+                              .filter(x => 'launchArc' in x);
+        aPost = sent.length ? String(sent[sent.length - 1].launchArc) : 'none';
+        w.eval('state = ' + mkc(false) + ';'); w.renderCustom();
+        aSticks = bx().checked === false;
+        const lb = d.getElementById('launchBtn');
+        const drew = () => { const s = lb && lb.querySelector('.arcsvg'); return !!(s && s.children.length); };
+        if (lb) { w.arcFire(lb, true, false); aOff = !drew(); }
+        w.eval('state = ' + mkc(true) + ';'); w.renderCustom();
+        if (lb) { w.arcFire(lb, true, false); aOn = drew(); }
+        aDet = 'off=' + aOff + ' on=' + aOn;
+        // the Main Guide's launch step, with the effect on and off
+        if (lb) {
+          lb.scrollIntoView = () => {};
+          w.eval('state = ' + mkc(true) + ';');
+          lb.classList.remove('guidehl', 'lbdemo');
+          w.launchDemo();
+          dArc = lb.classList.contains('lbdemo') && !lb.classList.contains('guidehl');
+          w.eval('state = ' + mkc(false) + ';');
+          lb.classList.remove('guidehl', 'lbdemo');
+          w.launchDemo();
+          dHl = lb.classList.contains('guidehl') && !lb.classList.contains('lbdemo');
+          dDet = 'on=' + dArc + ' off=' + dHl;
+        }
+      } catch (e) { aDet = String(e); }
+      return { paintRoles: paintRoles,
+               arcPost: aPost, arcSticks: aSticks, arcOffNoDraw: aOff, arcOnDraws: aOn, arcDetail: aDet,
+               demoArc: dArc, demoHl: dHl, demoDetail: dDet,
+               followsState: up && dn, followsState2: 'up=' + up + ' down=' + dn, keepsEdit: kept,
                showsStopping: going, bothDisabledMidStop: locked,
                terminateShows: tShows, terminateDetail: tDetail,
                stopDetail: 'shows=' + going + ' start=' + bq('ttsStart') + ' stop=' + bq('ttsStop') };
@@ -943,6 +1820,19 @@ process.exit(0);          // the page's interval loop never lets node exit (sect
               "neither Start nor Stop can be pressed mid-shutdown", out["stopDetail"])
         check(out["terminateShows"],
               "Terminate shows the TTS pane shutting down while it runs", out["terminateDetail"])
+        check(out["arcPost"] == "false", "clicking the arc switch posts launchArc:false",
+              "posted " + str(out["arcPost"]))
+        check(out["arcSticks"], "and it stays off after a re-render")
+        check(out["arcOffNoDraw"] and out["arcOnDraws"],
+              "the effect follows the switch", out["arcDetail"])
+        # exact sequence is brittle (incidental spans for spacing); check the roles
+        _pr = str(out["paintRoles"])
+        check(_pr.startswith("magenta"), "the speaker is magenta", _pr)
+        check("white|cyan|white" in _pr, "a tag is cyan between white stars", _pr)
+        check("say" in _pr, "and the spoken line is highlighted", _pr)
+        check(out["demoHl"], "guide step 8 highlights the button when the arc is off",
+              out["demoDetail"])
+        check(out["demoArc"], "and still demonstrates it when the arc is on", out["demoDetail"])
         check(out["blankControls"] == 0, "no blank buttons",
               "%d blank" % out["blankControls"])
     except Exception as e:

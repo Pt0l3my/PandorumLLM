@@ -26,11 +26,15 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 APP_NAME    = "PandorumLLM"
-APP_VERSION = "v3.72 Beta"
-APP_RELEASE_TAG = "v3.72-beta"   # the tag this build ships under
+APP_VERSION = "v3.73 Beta"
+APP_RELEASE_TAG = "v3.73-beta"            # the tag this build ships under
 APP_PATCH = 0                                 # patch number; 0 = none
 TERM_SCALE_KINDS = ("dashboard", "thinking", "splitd", "splitt", "tts")
 TERM_SCALE_LEGACY = ("split",)                # older configs stored one "split" entry
+_TTS_LANG_RX = re.compile(r"^[a-z]{2}(-[a-z]{2,4})?$", re.I)
+TTS_FRAME_RATE = 12.5          # MOSS audio tokens per second of audio
+TTS_ACPP_FRAME_RATE = 25.0     # Higgs Audio v3: 8 codebooks at 25 fps
+TTS_SERVER_LOG_NAME = "tts-server.log"
 TTS_LOG_NAME = "tts.log"                      # fixed name; the launcher writes it into log_dir()
 APP_VER_UI = APP_VERSION.replace(" ", "-p%d " % APP_PATCH, 1) if APP_PATCH else APP_VERSION
 
@@ -74,6 +78,16 @@ DEF_SETTINGS = {
     "ttsServerExe": "", "ttsModel": "", "ttsServerPort": "1240", "ttsGpuId": "",
     "ttsPython": "", "ttsWrapper": "", "ttsWrapperPort": "7860",
     "ttsWrapMode": "off", "ttsAnswerPing": "on",
+    "ttsEngine": "moss",                          # moss | audiocpp
+    "ttsTags": "off",                             # inline control tags, audio.cpp only
+    "ttsOutDir": "", "ttsVoiceDir": "",
+    "termStamps": "on", "termInsTts": "off",
+    "termStampsOff": "",                          # terminals hiding the time
+    "splitSrcD": "dashboard", "splitSrcT": "thinking",
+    "ttsAcppDir": "", "ttsAcppExe": "", "ttsAcppModelsDir": "", "ttsAcppModel": "", "ttsAcppModelId": "higgs",
+    "ttsAcppFamily": "higgs_audio_tts", "ttsAcppRefSlots": "64",
+    "ttsAcppVersion": "",                         # the release tag installed
+    "launchArc": False,               # the guide step highlights instead
     "autoRefresh": 0,
     "srvEdOpen": False,
     "observerOn": False,
@@ -104,13 +118,60 @@ def load_json(path, fallback):
 # Serializes every config read-modify-write so concurrent POSTs can't clobber
 # each other's changes (a lost update - e.g. a GPU toggle overwriting a just-saved
 # "2 PC" setting). All mutating endpoints run under this lock (see do_POST).
+class _NullLock(object):
+    """Stands in for CFG_LOCK where a request must not block the others."""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+# Endpoints that start or stop a process rather than edit the config. They can run for
+# several seconds, and nothing they do needs the config serialized - anything of theirs
+# that does takes CFG_LOCK itself.
+#
+# They were relying on CFG_LOCK to stop a second request arriving mid-start, though, so
+# each gets its OWN lock: still no double-start, and still no waiting on the other one.
+# Tried without blocking, so a second press is told rather than queued.
+NO_CFG_LOCK = frozenset(("/api/launch-stack", "/api/tts-server", "/api/higgs-install"))
+_FLEET_LOCK = threading.Lock()
+_TTSSRV_LOCK = threading.Lock()
+
+
 CFG_LOCK = threading.RLock()
 
 def save_config(cfg):
+    """Write the config atomically, retrying a Windows lock rather than failing.
+
+    os.replace answers WinError 5 when anything holds a handle on either file, even
+    for an instant - an antivirus scan or the search indexer will do it, and both are
+    busy right after the installer writes several gigabytes into this folder. The lock
+    is transient, so back off briefly and try again; giving up on the first refusal
+    loses the settings the user just changed.
+    """
     tmp = CONFIG + "." + str(os.getpid()) + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
-    os.replace(tmp, CONFIG)
+    last = None
+    for attempt in range(8):                 # ~1.8s in total, then give up honestly
+        try:
+            os.replace(tmp, CONFIG)
+            last = None
+            break
+        except PermissionError as e:         # WinError 5 / 32: someone holds a handle
+            last = e
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as e:
+            last = e
+            break
+    if last is not None:
+        try:
+            os.remove(tmp)                   # do not leave .tmp files behind
+        except OSError:
+            pass
+        raise last
     try:
         sse_notify("state")
     except NameError:
@@ -815,6 +876,9 @@ def api_path_check(body):
             return {"ok": any(f.lower().endswith(".ps1") for f in os.listdir(p))}
         except Exception:
             return {"ok": False}
+    if kind == "ttsAcppDir":
+        exe = find_acpp_exe(p)
+        return {"ok": bool(exe), "exe": exe}
     return {"ok": os.path.isfile(os.path.join(p, "llama-server.exe"))}
 
 def debug_report():
@@ -845,6 +909,9 @@ def debug_report():
     A("  windows            : %s" % ("yes" if os.name == "nt" else "no (%s)" % sys.platform))
     A("  python             : %s" % sys.version.split()[0])
     A("  panel port         : %s" % PORT)
+    # kept for diagnostics only. The panel has not asked for elevation since v3.72
+    # patch15 and does not need it: high ports, its own folder, and it only signals
+    # processes it started itself.
     A("  running elevated   : %s" % is_admin())
     A("")
     A("-- folders -----------------------------------------------------")
@@ -1483,6 +1550,8 @@ def api_state():
             "llamaOk": bool(cfg.get("settings", {}).get("llamacppPath"))
                        and os.path.isfile(os.path.join(cfg.get("settings", {}).get("llamacppPath", ""), "llama-server.exe")),
             "listening": sorted(PROXY._servers.keys()), "ttsWrap": TTSW.state(),
+            "higgsInstall": dict(HIGGS_INSTALL),
+            "higgsFound": higgs_present(cfg),
             "ttsServer": tts_server_status(cfg),
             "launchers": list_launchers(cfg), "history": hist[:50]}
 
@@ -1493,10 +1562,19 @@ def is_admin():
         return False
 
 # ---------------------------------------------------------------- fleet plumbing
+# Windows: a console program spawned from a process that has NO console gets a brand
+# new, VISIBLE one. python.exe started with CREATE_NO_WINDOW still had a console - just
+# hidden - and children inherited it silently. pythonw.exe, preferred since v3.72
+# patch16 so that nothing had to be started hidden, has no console at all, so every
+# pwsh and nvidia-smi call began popping a window on screen. Suppress it explicitly on
+# every child rather than relying on inheriting somebody else's hidden console.
+NOWIN = {"creationflags": 0x08000000} if os.name == "nt" else {}   # CREATE_NO_WINDOW
+
+
 def run_fleet(extra):
     cmd = ["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", FLEET_PS1] + extra
     try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=300, **NOWIN)
         log = (p.stdout or "")
         if (p.stderr or "").strip():
             log += "\n" + p.stderr
@@ -1586,9 +1664,16 @@ def status_watch_loop():
                     return s.get("id"), "%s/%s" % (st.get("state"), st.get("http", ""))
                 for k, v in ex.map(one, cfg.get("slots", [])):
                     sig[k] = v
-            if (cfg.get("settings", {}).get("ttsServerExe") or "").strip():
+            _cfgd = cfg.get("settings", {})
+            if (_cfgd.get("ttsServerExe") or _cfgd.get("ttsAcppDir") or "").strip():
                 _t = slot_status(tts_server_port(cfg))     # only when TTS is configured
                 sig["_tts"] = "%s/%s" % (_t.get("state"), _t.get("http", ""))
+                if _t.get("state") == "serving" and not TTS_PROC.get("said_ready"):
+                    TTS_PROC["said_ready"] = True
+                    TTSW.log("\u2705 %s ready for voice synthesis" % tts_engine_label(cfg))
+                    TTSW.log("")
+                elif _t.get("state") != "serving":
+                    TTS_PROC["said_ready"] = False
             if sig != _status_sig["v"]:
                 _status_sig["v"] = sig
                 sse_notify("state")
@@ -1610,6 +1695,7 @@ def sweep_launcher_shells():
               "ForEach-Object { $n++; Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }; "
               "Write-Output $n")
         p = subprocess.run(["pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps],
+                           **NOWIN,
                            capture_output=True, text=True, timeout=30)
         try:
             return int((p.stdout or "0").strip().splitlines()[-1])
@@ -1745,7 +1831,8 @@ def api_gpu_edit(body):
 def api_detect_gpus(body=None):
     try:
         p = subprocess.run(["nvidia-smi", "--query-gpu=index,name,uuid,memory.total,pci.sub_device_id",
-                            "--format=csv,noheader"], capture_output=True, text=True, timeout=15)
+                            "--format=csv,noheader"], capture_output=True, text=True,
+                           timeout=15, **NOWIN)
         rows = [r.strip() for r in (p.stdout or "").splitlines() if r.strip()]
         if p.returncode != 0 or not rows:
             return {"error": "nvidia-smi returned nothing (%s)" % (p.stderr or "").strip()[:120]}
@@ -2219,6 +2306,15 @@ def _stamp_log(text):
     return "\n".join((ts + ln) if ln.strip() else ln for ln in str(text).split("\n"))
 
 def api_launch_stack(body):
+    if not _FLEET_LOCK.acquire(blocking=False):
+        return {"error": "a launch is already running"}
+    try:
+        return _api_launch_stack(body)
+    finally:
+        _FLEET_LOCK.release()
+
+
+def _api_launch_stack(body):
     lines = [_stamp_log("=== %s %s - launch stack ===" % (APP_NAME, APP_VER_UI))]
     try:
         for _s in load_config().get("slots", []):
@@ -2245,7 +2341,7 @@ def api_show_terminal(body):
           "if ($w) { [W.U]::ShowWindow($w.MainWindowHandle,9) | Out-Null;"
           "[W.U]::SetForegroundWindow($w.MainWindowHandle) | Out-Null; 'restored' } else { 'window not found' }") % stem
     try:
-        p = subprocess.run(["pwsh", "-NoProfile", "-Command", ps],
+        p = subprocess.run(["pwsh", "-NoProfile", "-Command", ps], **NOWIN,
                            capture_output=True, text=True, timeout=20)
         return {"log": (p.stdout or p.stderr or "").strip()}
     except Exception as e:
@@ -2399,7 +2495,7 @@ def api_settings(body):
     for k in DEF_SETTINGS:
         if k not in body or k in _HANDLED_KEYS:
             continue
-        if k == "exitOnClose":
+        if k in ("exitOnClose", "launchArc"):
             st[k] = bool(body[k]) if not isinstance(body[k], str) else body[k].lower() in ("1", "true", "on", "yes")
             continue
         v = str(body[k]).strip()
@@ -3037,6 +3133,7 @@ def api_llama_update(body):
         exe = llama_exe(load_config())
         if os.path.isfile(exe):
             r = subprocess.run([exe, "--version"], capture_output=True, text=True, timeout=20,
+                               **NOWIN,
                                cwd=os.path.dirname(exe) or None)
             out = (r.stdout or "") + (r.stderr or "")
             for pat in (r"version:\s*(\d+)",          # what llama.cpp prints today
@@ -3161,7 +3258,7 @@ def tts_launcher_text(cfg=None):
                 'set CUDA_VISIBLE_DEVICES=' + uuid + '\n')
     else:
         mask = ('REM No GPU pinned in the panel, so every visible card is offered to the server.\n'
-                'REM Pick one under Proxy then TTS [Alpha] to pin it by UUID.\n')
+                'REM Pick one under Proxy then TTS to pin it by UUID.\n')
 
     L = []
     a = L.append
@@ -3376,6 +3473,333 @@ TTS_MAX_NEW_TOKENS = 2048
 TTS_RESULT_WAIT_S = 120.0
 
 
+# Higgs Audio v3 inline control tags.
+#
+# The rules below are not guesses - they come from Boson's model card and from
+# cleanestpoison/higgs3-tts-skyrimnet (Apache-2.0), whose wrapper measured the
+# behaviour against a live engine. Three of them are non-obvious and each one
+# silently ruins the feature if missed:
+#
+#   * SkyrimNet strips < | > from every line, so the native <|family:value|>
+#     shape can never arrive. The dialogue model writes [EMOTION-FEAR] instead.
+#   * emotion, style and the speed/pitch prosody tags are SENTENCE-LEVEL: they
+#     colour a whole sentence and must sit at its start. Written mid-line they
+#     are moved to the front of their sentence.
+#   * sound effects are INLINE and must be followed immediately by onomatopoeia
+#     with no space. A bare <|sfx:laughter|> does nothing at all, so the word is
+#     injected here using the spellings the model was trained on.
+#
+# And one measured failure worth engineering against: <|prosody:long_pause|> at
+# the very start or end of the engine input makes the decoder run to its token
+# cap without ever emitting an end-of-clip, which audio.cpp answers with an
+# error and no audio - repeated hits have been seen to take the engine down. A
+# pause at a line edge means nothing anyway, so it is dropped.
+TTS_TAGS = {
+    "emotion": ("affection", "amusement", "anger", "arousal", "awe", "bitterness",
+                "confusion", "contemplation", "contentment", "determination", "disgust",
+                "elation", "enthusiasm", "fear", "helplessness", "longing", "pride",
+                "relief", "sadness", "shame", "surprise"),
+    "prosody": ("speed_very_slow", "speed_slow", "speed_fast", "speed_very_fast",
+                "pitch_low", "pitch_high", "expressive_high", "expressive_low",
+                "pause", "long_pause"),
+    "style": ("singing", "shouting", "whispering"),
+    "sfx": ("cough", "laughter", "crying", "screaming", "burping", "humming",
+            "sigh", "sniff", "sneeze"),
+}
+# The model card's own spellings. A sound effect without one is inert.
+TTS_ONOMATOPOEIA = {
+    "cough": "Ahem", "laughter": "Hehe", "crying": "Sob", "screaming": "Aaah",
+    "burping": "Burp", "humming": "Hmm", "sigh": "Ahh", "sniff": "Sff",
+    "sneeze": "Achoo",
+}
+TTS_INLINE = {"prosody": {"pause", "long_pause"}, "sfx": set(TTS_TAGS["sfx"])}
+TTS_ORDER = {"emotion": 0, "prosody": 1, "style": 2}
+
+# Uppercase only, and the separator may be anything the mod left behind, so
+# EMOTION-FEAR, EMOTION_FEAR, EMOTION FEAR and EMOTIONFEAR all land the same
+# way. Caps matter: "emotion" and "style" are ordinary English words.
+TTS_CAPS_RX = re.compile(
+    r"\[?\s*(?<![A-Za-z0-9])(EMOTION|PROSODY|STYLE|SFX)((?:[ \t\-_]*[A-Z]+){1,3})(?![A-Za-z])\s*\]?")
+TTS_TAG_ANY_RX = re.compile(r"<\|[^|>]{0,40}\|>")
+
+# SkyrimNet's own tag vocabularies, mapped onto Higgs' where an equivalent exists.
+# Two of them: the fixed list its Chatterbox branch teaches, and the looser set its
+# other branch suggests ([sad], [whispers], [sighs], [pause]...). Accepting both costs
+# nothing - they are lowercase single words, while Higgs' are uppercase FAMILY-VALUE,
+# so nothing is ambiguous - and it means the stock prompt works without editing.
+# Only clear equivalents are mapped. [advertisement], [narration], [shush], [groan]
+# and [gasp] have no Higgs counterpart and are dropped rather than guessed at.
+TTS_ALIAS = {
+    "angry": ("emotion", "anger"), "anger": ("emotion", "anger"),
+    "fear": ("emotion", "fear"), "afraid": ("emotion", "fear"),
+    "surprised": ("emotion", "surprise"), "surprise": ("emotion", "surprise"),
+    "happy": ("emotion", "elation"), "excited": ("emotion", "enthusiasm"),
+    "sad": ("emotion", "sadness"), "disgusted": ("emotion", "disgust"),
+    "proud": ("emotion", "pride"), "confused": ("emotion", "confusion"),
+    "whispering": ("style", "whispering"), "whispers": ("style", "whispering"),
+    "whisper": ("style", "whispering"),
+    "shouting": ("style", "shouting"), "shouts": ("style", "shouting"),
+    "shout": ("style", "shouting"), "singing": ("style", "singing"),
+    "sings": ("style", "singing"),
+    "laugh": ("sfx", "laughter"), "laughs": ("sfx", "laughter"),
+    "laughter": ("sfx", "laughter"), "chuckle": ("sfx", "laughter"),
+    "chuckles": ("sfx", "laughter"),
+    "sigh": ("sfx", "sigh"), "sighs": ("sfx", "sigh"),
+    "cough": ("sfx", "cough"), "coughs": ("sfx", "cough"),
+    "clear throat": ("sfx", "cough"), "clears throat": ("sfx", "cough"),
+    "crying": ("sfx", "crying"), "cries": ("sfx", "crying"),
+    "sob": ("sfx", "crying"), "sobs": ("sfx", "crying"),
+    "sniff": ("sfx", "sniff"), "sniffs": ("sfx", "sniff"),
+    "sneeze": ("sfx", "sneeze"), "sneezes": ("sfx", "sneeze"),
+    "screaming": ("sfx", "screaming"), "screams": ("sfx", "screaming"),
+    "humming": ("sfx", "humming"), "hums": ("sfx", "humming"),
+    "burp": ("sfx", "burping"), "burps": ("sfx", "burping"),
+    "slowly": ("prosody", "speed_slow"), "quickly": ("prosody", "speed_fast"),
+    "pause": ("prosody", "pause"), "long pause": ("prosody", "long_pause"),
+    "dramatic": ("prosody", "expressive_high"),
+    "dramatic tone": ("prosody", "expressive_high"),
+    "monotone": ("prosody", "expressive_low"),
+}
+TTS_ALIAS_RX = re.compile(r"\[\s*([a-z][a-z ]{0,18})\s*\]")
+# SkyrimNet tags with no Higgs counterpart. These are DELETED; anything else in square
+# brackets is left alone, because a line may legitimately contain [something] and eating
+# it loses meaning, while speaking one stray tag aloud does not.
+TTS_ALIAS_DROP = frozenset((
+    "advertisement", "narration", "shush", "groan", "gasp", "sarcastic",
+    "clears throat" if False else "", "grunt", "grunts", "yawn", "yawns",
+))
+TTS_SENT_RX = re.compile(r"(?<=[.!?])\s+")
+TTS_PAUSE_RX = re.compile(r"\[\s*pause\s+([0-9]+(?:\.[0-9]+)?)\s*s\s*\]", re.I)
+TTS_PAUSE_ANY_RX = re.compile(r"\[\s*pause\b[^\]]{0,20}\]", re.I)
+TTS_PAUSE_MAX_S = 10.0
+_TTS_SQUASH = lambda v: re.sub(r"[^a-z0-9]", "", v.lower())
+TTS_LOOKUP = {c: {_TTS_SQUASH(v): v for v in vals} for c, vals in TTS_TAGS.items()}
+TTS_EDGE_PAUSE_RX = re.compile(
+    r"[ \t]*(?:" + "|".join(re.escape("<|prosody:%s|>" % v)
+                            for v in ("pause", "long_pause")) + r")[ \t]*")
+
+
+def _tts_spoken(part):
+    """Is there anything here the model would actually say?"""
+    return any(ch.isalnum() for ch in TTS_TAG_ANY_RX.sub("", part))
+
+
+def _tts_drop_edge_pauses(line):
+    """Remove pause tokens with no speech on one side - see the note above."""
+    def keep(m):
+        if _tts_spoken(line[:m.start()]) and _tts_spoken(line[m.end():]):
+            return m.group(0)
+        return ""
+    return TTS_EDGE_PAUSE_RX.sub(keep, line)
+
+
+def _tts_sentence(sentence):
+    """One sentence -> (text with inline tokens in place, sentence-level tags)."""
+    out, level, pos = [], [], 0
+    while True:
+        m = TTS_CAPS_RX.search(sentence, pos)
+        if m is None:
+            break
+        fam = m.group(1).lower()
+        words = list(re.finditer(r"[A-Z]+", m.group(2)))
+        value, end = None, m.end()
+        for n in range(len(words), 0, -1):      # longest value wins
+            key = _TTS_SQUASH("".join(w.group(0) for w in words[:n]))
+            if key in TTS_LOOKUP[fam]:
+                value, end = TTS_LOOKUP[fam][key], m.start(2) + words[n - 1].end()
+                if sentence[end:end + 1] == "]":
+                    end += 1                     # the bracket leaves with the tag
+                break
+        out.append(sentence[pos:m.start()])
+        if value is None:
+            pass                                 # unknown: dropped, never spoken
+        elif fam == "sfx":
+            word = TTS_ONOMATOPOEIA[value]
+            rest = sentence[end:].lstrip()
+            if rest[:len(word)].lower() == word.lower():
+                out.append("<|sfx:%s|>" % value)         # it wrote its own
+                end += len(sentence[end:]) - len(rest)
+            else:
+                piece = "<|sfx:%s|>%s" % (value, word)
+                if rest and rest[0] not in ".,!?;:":
+                    piece += ","
+                out.append(piece)
+        elif value in TTS_INLINE.get(fam, ()):
+            out.append("<|%s:%s|>" % (fam, value))
+        else:
+            level.append((fam, value))           # colours the whole sentence
+        pos = end
+    out.append(sentence[pos:])
+    return "".join(out), level
+
+
+def _tts_render(tags):
+    """One tag per competing group, in the model card's stacking order."""
+    kept = {}
+    for fam, value in tags:
+        group = (fam, value.split("_")[0] if fam == "prosody" else "")
+        kept.setdefault(group, (fam, value))
+    ordered = sorted(kept.values(), key=lambda x: (TTS_ORDER.get(x[0], 9), x[1]))
+    return "".join("<|%s:%s|>" % (f, v) for f, v in ordered)
+
+
+def tts_apply_tags(text, keep, engine="audiocpp"):
+    """Turn the mod's ALL-CAPS tags into Higgs control tokens, or remove them.
+
+    MOSS understands one marker of its own, [pause 3.2s], and none of Higgs'.
+    """
+    text = str(text or "")
+    higgs = keep and engine == "audiocpp"
+    moss = keep and engine != "audiocpp"
+
+    def pause(m):
+        if not moss:
+            return ""
+        mm = TTS_PAUSE_RX.fullmatch(m.group(0))
+        if not mm:
+            return ""
+        try:
+            return "[pause %gs]" % min(max(float(mm.group(1)), 0.1), TTS_PAUSE_MAX_S)
+        except Exception:
+            return ""
+
+    def alias(m):
+        """SkyrimNet's own [angry] / [sigh] style, where Higgs has an equivalent.
+
+        Unrecognised brackets are RETURNED UNCHANGED: dialogue can legitimately contain
+        [something], and deleting it loses meaning. Only tags known to have no Higgs
+        counterpart are removed.
+        """
+        word = " ".join(m.group(1).split()).lower()
+        hit = TTS_ALIAS.get(word)
+        if hit and higgs:
+            return "[%s-%s]" % (hit[0].upper(), hit[1].upper())
+        if hit or word in TTS_ALIAS_DROP:
+            return ""              # a recognised tag we are not passing on: never spoken
+        return m.group(0)          # anything else is dialogue, not markup
+
+    # BEFORE the MOSS pause handling: that matcher takes [pause + anything, so it would
+    # otherwise swallow a bare [pause] and delete it on the Higgs path. Runs whether or
+    # not tags are on, because an unpassed tag must not be read aloud either.
+    text = TTS_ALIAS_RX.sub(alias, text)
+    text = TTS_PAUSE_ANY_RX.sub(pause, text)
+    if not higgs:
+        text = TTS_CAPS_RX.sub("", text)
+        text = TTS_TAG_ANY_RX.sub("", text)
+        return re.sub(r"\s{2,}", " ", text).strip()
+
+    lines = []
+    for line in text.split("\n"):
+        carried, done = [], []
+        for sentence in TTS_SENT_RX.split(line):
+            body, level = _tts_sentence(sentence)
+            body = body.strip()
+            tags = carried + level
+            if not body:
+                carried = tags          # nothing to colour; hand them onward
+                continue
+            carried = []
+            done.append(_tts_render(tags) + body)
+        if carried and done:
+            done[-1] = _tts_render(carried) + done[-1]
+        lines.append(_tts_drop_edge_pauses(" ".join(done)))
+    text = "\n".join(lines)
+    text = TTS_TAG_ANY_RX.sub(
+        lambda m: m.group(0) if re.fullmatch(
+            r"<\|(emotion|prosody|style|sfx):[a-z_]+\|>", m.group(0)) else "", text)
+    text = re.sub(r"\s+-\s+-\s+", " - ", text)   # a removed tag can leave " - - "
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    # tts_normalize punctuated the line, but a tag can land after that full stop -
+    # an sfx at the end brings its onomatopoeia with it and leaves the SPOKEN text
+    # unpunctuated again, which is how a model is invited to keep talking.
+    spoken = TTS_TAG_ANY_RX.sub("", text).strip()
+    if spoken and spoken[-1] not in ".!?,;\"'":
+        text += "."
+    return text
+
+
+# How each tag reads in the terminal. The point of the line is to answer one question
+# at a glance - did the tag survive SkyrimNet and reach the engine - and *sniffs* says
+# that faster than [SFX-SNIFF] does. Stage directions, not identifiers.
+TTS_TAG_WORDS = {
+    ("emotion", "affection"): "affectionate", ("emotion", "amusement"): "amused",
+    ("emotion", "anger"): "angry", ("emotion", "arousal"): "aroused",
+    ("emotion", "awe"): "awed", ("emotion", "bitterness"): "bitter",
+    ("emotion", "confusion"): "confused", ("emotion", "contemplation"): "thoughtful",
+    ("emotion", "contentment"): "content", ("emotion", "determination"): "determined",
+    ("emotion", "disgust"): "disgusted", ("emotion", "elation"): "elated",
+    ("emotion", "enthusiasm"): "enthusiastic", ("emotion", "fear"): "afraid",
+    ("emotion", "helplessness"): "helpless", ("emotion", "longing"): "longing",
+    ("emotion", "pride"): "proud", ("emotion", "relief"): "relieved",
+    ("emotion", "sadness"): "sad", ("emotion", "shame"): "ashamed",
+    ("emotion", "surprise"): "surprised",
+    ("style", "whispering"): "whispering", ("style", "shouting"): "shouting",
+    ("style", "singing"): "singing",
+    ("prosody", "speed_very_slow"): "very slowly", ("prosody", "speed_slow"): "slowly",
+    ("prosody", "speed_fast"): "quickly", ("prosody", "speed_very_fast"): "very quickly",
+    ("prosody", "pitch_low"): "low", ("prosody", "pitch_high"): "high",
+    ("prosody", "expressive_low"): "flat", ("prosody", "expressive_high"): "animated",
+    ("prosody", "pause"): "pause", ("prosody", "long_pause"): "long pause",
+    ("sfx", "cough"): "coughs", ("sfx", "laughter"): "laughs",
+    ("sfx", "crying"): "cries", ("sfx", "screaming"): "screams",
+    ("sfx", "burping"): "burps", ("sfx", "humming"): "hums",
+    ("sfx", "sigh"): "sighs", ("sfx", "sniff"): "sniffs",
+    ("sfx", "sneeze"): "sneezes",
+}
+
+
+# The line already says how it should be delivered, so show that rather than one mask
+# for everything. Emotion wins over style, style over a sound effect - the emotion
+# colours the whole sentence while a sound is one moment in it.
+TTS_MOOD = {
+    ("emotion", "anger"): "\U0001F620", ("emotion", "fear"): "\U0001F628",
+    ("emotion", "sadness"): "\U0001F622", ("emotion", "elation"): "\U0001F604",
+    ("emotion", "amusement"): "\U0001F60F", ("emotion", "surprise"): "\U0001F632",
+    ("emotion", "disgust"): "\U0001F922", ("emotion", "affection"): "\U0001F60D",
+    ("emotion", "pride"): "\U0001F60C", ("emotion", "contemplation"): "\U0001F914",
+    ("emotion", "confusion"): "\U0001F615", ("emotion", "relief"): "\U0001F605",
+    ("emotion", "shame"): "\U0001F633", ("emotion", "determination"): "\U0001F624",
+    ("emotion", "enthusiasm"): "\U0001F929", ("emotion", "awe"): "\U0001F62E",
+    ("emotion", "bitterness"): "\U0001F612", ("emotion", "helplessness"): "\U0001F629",
+    ("emotion", "longing"): "\U0001F97A", ("emotion", "contentment"): "\U0001F60A",
+    ("emotion", "arousal"): "\U0001F975",
+    ("style", "whispering"): "\U0001F92B", ("style", "shouting"): "\U0001F4E3",
+    ("style", "singing"): "\U0001F3B5",
+    ("sfx", "laughter"): "\U0001F602", ("sfx", "sigh"): "\U0001F614",
+    ("sfx", "cough"): "\U0001F637", ("sfx", "crying"): "\U0001F62D",
+    ("sfx", "screaming"): "\U0001F631", ("sfx", "sniff"): "\U0001F927",
+    ("sfx", "sneeze"): "\U0001F927", ("sfx", "humming"): "\U0001F3B6",
+    ("sfx", "burping"): "\U0001F62C",
+}
+TTS_MOOD_PLAIN = "\U0001F5E3\uFE0F"    # a speaking head - the variation selector
+                                       # forces emoji width, or it renders narrow
+# The one pattern for a rendered control token. Defined here because this block sits
+# above the tag catalogue; tts_tags_display had an identical copy inline.
+TTS_TOKEN_RX = re.compile(r"<\|([a-z]+):([a-z_]+)\|>")
+
+
+def tts_mood_icon(text):
+    """An icon for how the line is meant to sound, from the tags it carries."""
+    found = TTS_TOKEN_RX.findall(str(text or ""))
+    for want in ("emotion", "style", "sfx"):
+        for fam, val in found:
+            if fam.lower() == want:
+                hit = TTS_MOOD.get((fam.lower(), val.lower()))
+                if hit:
+                    return hit
+    return TTS_MOOD_PLAIN
+
+
+def tts_tags_display(text):
+    """Rewrite Higgs control tokens as stage directions: <|sfx:sniff|> -> *sniffs*."""
+    def one(m):
+        fam, val = m.group(1), m.group(2)
+        word = TTS_TAG_WORDS.get((fam, val)) or val.replace("_", " ")
+        return "*%s* " % word          # a space for the reader; the engine got none
+    out = TTS_TOKEN_RX.sub(one, str(text or ""))
+    return re.sub(r" {2,}", " ", out).strip()
+
+
 def tts_normalize(text):
     """Match the reference wrapper: collapse whitespace, end with punctuation.
 
@@ -3579,6 +4003,7 @@ class TtsWrapper:
                     srv = self._srv
                     threading.Thread(target=srv.shutdown, daemon=True).start()
                     panel_log("[tts] closed listener :%d" % (self._port or 0))
+                    self.log("\U0001F50C Proxy TTS listener closed on :%d" % (self._port or 0))
                 except Exception:
                     pass
                 self._srv, self._port = None, None
@@ -3588,6 +4013,11 @@ class TtsWrapper:
                     self._srv, self._port = srv, port
                     threading.Thread(target=srv.serve_forever, daemon=True).start()
                     panel_log("[tts] listening :%d -> %s" % (port, self.upstream(cfg)))
+                    self.log("\u2705 Proxy TTS ready for voice synthesis")
+                    self.log("")
+                    self.log("* Listening on http://0.0.0.0:%d  (point SkyrimNet here)" % port)
+                    self.log("* Forwarding to %s" % self.upstream(cfg))
+                    self.log("")
                 except OSError as e:
                     panel_log("[tts] FAILED to bind :%d (%s)" % (port, e))
                     log_error("tts", "failed to bind :%d (%s) - another wrapper may hold it" % (port, e))
@@ -3599,22 +4029,41 @@ class TtsWrapper:
     # ---- the human log the TTS terminal renders. Written here, so the panel can
     # ---- notify directly instead of waiting for the file watcher.
     def log(self, line):
+        """Stamped, so the proxy terminal can put a spoken line beside the completion
+        that produced it. The Timestamps button hides them again."""
+        line = line.rstrip()
+        if line:
+            now = time.time()
+            line = "[%s.%02d] %s" % (time.strftime("%H:%M:%S", time.localtime(now)),
+                                     int((now % 1) * 100), line)
         try:
             with open(os.path.join(log_dir(), TTS_LOG_NAME), "a", encoding="utf-8") as f:
-                f.write(line.rstrip() + "\n")
+                f.write(line + "\n")
             sse_notify("tail")
         except Exception:
             pass
 
     # ---- protocol steps
     def save_upload(self, filename, data):
+        """Store an uploaded reference voice, normalised.
+
+        SkyrimNet's samples come from FFmpeg, which leaves extra RIFF chunks behind.
+        moss-tts-server answered those with 400, and audio.cpp with
+        "failed to read WAV data chunk" - the same fault seen twice through two
+        different parsers. Normalising HERE fixes it once for every engine, rather
+        than in whichever arm happened to notice: the file on disk is canonical, so
+        both the base64 MOSS wants and the path audio.cpp wants are clean.
+        """
         name = re.split(r"[\\/]", str(filename or "voice.wav"))[-1]
         name = re.sub(r"[^A-Za-z0-9._-]+", "_", name) or "voice.wav"
         sub = os.path.join(self.dir(), hashlib.md5(data).hexdigest())
         os.makedirs(sub, exist_ok=True)
         path = os.path.join(sub, name)
+        clean = tts_wav_normalize(data) if data[:4] == b"RIFF" else data
+        if clean is not data and len(clean) != len(data):
+            panel_log("[tts] normalised %s: %d -> %d bytes" % (name, len(data), len(clean)))
         with open(path, "wb") as f:
-            f.write(data)
+            f.write(clean)
         return path
 
     def submit(self, fields):
@@ -3624,8 +4073,7 @@ class TtsWrapper:
             self._events[eid] = ev
             for k in list(self._events)[:-40]:      # keep the last 40
                 self._events.pop(k, None)
-        text = fields[1] if len(fields) > 1 else ""
-        ref = tts_speaker_path(fields[3]) if len(fields) > 3 else None
+        text, ref = tts_pick_fields(fields)
         threading.Thread(target=self._run, args=(eid, text, ref), daemon=True).start()
         return eid
 
@@ -3681,12 +4129,34 @@ class TtsWrapper:
             d = float(r.headers.get("X-MOSS-Decode-Seconds") or 0)
         return raw, g, d
 
+    def say_line(self, ref_path, processed, display=True):
+        """The spoken line, once. Each engine arm wrote its own copy of this.
+
+        display=False for MOSS: it is handed the text as it stands and has no Higgs
+        tokens to turn back into stage directions.
+        """
+        self.log("%s %s: \u3030\uFE0F %s \u3030\uFE0F"
+                 % (tts_mood_icon(processed), tts_speaker_label(ref_path),
+                    tts_tags_display(processed) if display else processed))
+
+    def saved_line(self, body, ref_path, cfg, out, local):
+        """Keep a named copy and report it. Also written twice before."""
+        kept = tts_save_named(body, tts_speaker_label(ref_path), cfg)
+        self.log("\U0001F4BE Saved: %s (%.1f KB)%s"
+                 % (os.path.basename(kept or out), len(body) / 1024.0,
+                    "  [local clip]" if local else ""))
+
     def _run(self, eid, text, ref_path):
         ev = self._events.get(eid)
         t0 = time.time()
         cfg = load_config()
         st = cfg.get("settings", {})
-        processed = tts_normalize(text)
+        local = tts_local_sample(ref_path, cfg)
+        if local:
+            ref_path = local
+        processed = tts_apply_tags(tts_normalize(text),
+                                   str(st.get("ttsTags", "off")).lower() == "on",
+                                   tts_engine(cfg))
         try:
             # SkyrimNet pings at startup with a silent reference. Answering it here costs
             # nothing; letting it through spends 600-1100ms of GPU saying "ping".
@@ -3696,48 +4166,79 @@ class TtsWrapper:
                 ev["path"] = out
                 self.log("\U0001F50C Ping answered locally (no GPU)")
                 return
+            if tts_engine(cfg) == "audiocpp":
+                self.say_line(ref_path, processed)
+                self.log("")
+                mid = st.get("ttsAcppModelId") or "higgs"
+                base = "http://127.0.0.1:%d" % tts_server_port(cfg)
+                _t_post = time.time()
+                body, hdrs = tts_acpp_speak(base, mid, processed,
+                                            tts_ref_canonical(ref_path) if ref_path else "")
+                srv_s = time.time() - _t_post
+                if not body:
+                    raise RuntimeError("no audio returned by audio.cpp")
+                out = os.path.join(self.dir(), "out-%s.wav" % eid)
+                with open(out, "wb") as f:
+                    f.write(body)
+                self.prune()
+                ev["path"] = out
+                wall = time.time() - t0
+                rate, nframes = 0, 0
+                try:
+                    with _wave.open(io.BytesIO(body), "rb") as w:
+                        rate, nframes = w.getframerate(), w.getnframes()
+                except Exception:
+                    pass
+                secs = (nframes / float(rate)) if rate else 0.0
+                gen_s = _num_or(hdrs, ("x-audiocpp-generate-seconds", "x-generate-seconds",
+                                       "x-inference-seconds", "x-higgs-generate-seconds"))
+                dec_s = _num_or(hdrs, ("x-audiocpp-decode-seconds", "x-decode-seconds",
+                                       "x-codec-seconds"))
+                toks = secs * TTS_ACPP_FRAME_RATE
+                self.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)" % (
+                    (secs / wall) if wall else 0.0, wall, secs))
+                if gen_s or dec_s:      # the server told us; show its own split
+                    self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
+                             % ("generate:", gen_s * 1000.0, toks, (toks / gen_s) if gen_s else 0.0))
+                    self.log("   %-9s%6.0f ms   %7d samples     %7.0f tps"
+                             % ("codec:", dec_s * 1000.0, nframes, (toks / dec_s) if dec_s else 0.0))
+                else:                   # it did not, so split what WE can measure
+                    self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
+                             % ("server:", srv_s * 1000.0, toks, (toks / srv_s) if srv_s else 0.0))
+                    self.log("   %-9s%13d samples @ %d Hz" % ("audio:", nframes, rate))
+                self.log("   %-9s%6.0f ms   (http + wav)"
+                         % ("overhead:", max(0.0, (wall - (gen_s + dec_s or srv_s)) * 1000.0)))
+                _unknown = [k for k in hdrs
+                            if k.startswith("x-") and k not in ("x-request-id",)]
+                if _unknown and not (gen_s or dec_s):
+                    panel_log("[tts] audio.cpp response headers seen: %s" % ", ".join(sorted(_unknown)))
+                self.saved_line(body, ref_path, cfg, out, local)
+                self.log("")
+                return
+
             ref_b64, cached = self._ref_b64(ref_path)
             if ref_b64 is None:
                 self.log("\u26A0\uFE0F No reference voice resolved from %s" % (ref_path or "(none sent)"))
             else:
                 self.log("\u267B\uFE0F Reused cached voice" if cached else "\U0001F195 Recomputing voice")
             self.log("")
-            self.log("\U0001F3AD %s: \u3030\uFE0F %s \u3030\uFE0F" % (
-                tts_voice_name(ref_path), processed))
-            self.log("")
-            url = self.upstream(cfg)
-            chunks = tts_chunks(processed)
-            raws = [None] * len(chunks)
-            gen_s = dec_s = 0.0
-            with ThreadPoolExecutor(max_workers=min(len(chunks), TTS_MAX_WORKERS)) as ex:
-                futs = {ex.submit(self._post_chunk, url, c, ref_b64): i
-                        for i, c in enumerate(chunks)}
-                for fut, i in futs.items():
-                    raw, g, d = fut.result()
-                    raws[i] = raw
-                    gen_s += g; dec_s += d
-            body, rate, nframes = tts_wav_join(raws)
-            if not body:
-                raise RuntimeError("no audio returned by the TTS server")
-            out = os.path.join(self.dir(), "out-%s.wav" % eid)
-            with open(out, "wb") as f:
-                f.write(body)
-            self.prune()
-            ev["path"] = out
-            wall = time.time() - t0
-            secs = (nframes / rate) if rate else 0.0
-            over = max(0.0, (wall - gen_s - dec_s) * 1000.0)
-            note = ("  (%d chunks)" % len(chunks)) if len(chunks) > 1 else ""
-            self.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)%s" % (
-                (secs / wall) if wall else 0.0, wall, secs, note))
-            self.log("   %-9s%6.0f ms   %7d samples" % ("generate:", gen_s * 1000.0, nframes))
-            self.log("   %-9s%6.0f ms   %7.0f ms codec" % ("overhead:", over, dec_s * 1000.0))
-            self.log("\U0001F4BE Saved: %s (%.1f KB)" % (out, len(body) / 1024.0))
+            self.say_line(ref_path, processed, display=False)
+            toks = secs * TTS_FRAME_RATE
+            self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
+                     % ("generate:", gen_s * 1000.0, toks, (toks / gen_s) if gen_s else 0.0))
+            self.log("   %-9s%6.0f ms   %7d samples     %7.0f tps"
+                     % ("codec:", dec_s * 1000.0, nframes, (toks / dec_s) if dec_s else 0.0))
+            self.log("   %-9s%6.0f ms   (http + wav)" % ("overhead:", over))
+            self.saved_line(body, ref_path, cfg, out, local)
             self.log("")
         except Exception as e:
-            ev["err"] = str(e)[:200]
-            self.log("\u274C TTS failed: %s" % ev["err"])
-            log_error("tts", "generate failed: %s" % e)
+            # a crashed server just closes the socket; its own log says why
+            hint = tts_diagnose(cfg) if tts_engine(cfg) == "audiocpp" else ""
+            ev["err"] = (str(e) + ((" - " + hint) if hint else ""))[:300]
+            self.log("\u274C TTS failed: %s" % str(e)[:200])
+            if hint:
+                self.log("   \u2192 %s" % hint)
+            log_error("tts", "generate failed: %s%s" % (e, (" - " + hint) if hint else ""))
         finally:
             ev["done"].set()
 
@@ -3750,6 +4251,91 @@ class TtsWrapper:
         return out
 
 
+# ---- learning an NPC's real name -------------------------------------------------
+# The voice sample is named after the VOICETYPE - femaleyoungeager, malenord - not the
+# character. The name is in the dialogue prompt the proxy already forwards, in the first
+# line of the system message:
+#
+#   You are Serana, a Female Nord in Skyrim. You are speaking to Maxxor, ...
+#
+# So the proxy reads it out of a request it is already carrying: no extra model call and
+# nothing leaves the machine. Only the name is kept - never the prompt.
+#
+# It then LEARNS the pairing. A TTS call arriving shortly after a dialogue request is
+# almost certainly that character speaking, so voicetype -> name is remembered and used
+# from then on, including out of order.
+SPEAKER_RX = re.compile(rb"You are ([A-Z][A-Za-z' \-]{1,28}?), a ")
+# The player is named by the PARTY, which is always theirs whoever is speaking:
+#   ## Maxxor's Party's Active Quests
+# NOT by "You are speaking to ...", which names the LISTENER - when one NPC addresses
+# another, that line holds the other NPC and the player's own voice took their name.
+PLAYER_RX = re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)'s Party's")
+# The player's own voice must never learn an NPC's name. Their line is spoken when THEY
+# speak, which is before the next dialogue request, so it would pair with the previous
+# turn's character - which is exactly what happened.
+PLAYER_VOICES = frozenset(("player", "playervoice", "playerdialogue"))
+SPEAKER_SCAN = 4096            # the speaker sits in the first few hundred bytes
+PLAYER_SCAN = 262144           # the party marker is much further in
+SPEAKER_PAIR_S = 15.0          # a TTS call this soon after a request is that character
+_spk_lock = threading.Lock()
+_spk_recent = []               # [(when, name)], newest last
+_spk_voices = {}               # voicetype -> name, learned
+_spk_player = [""]             # the player's own name, from the same line
+
+
+def note_speaker(body):
+    """Remember the character named in a dialogue request. Cheap and best-effort."""
+    if not body:
+        return
+    try:
+        m = SPEAKER_RX.search(body[:SPEAKER_SCAN])
+        if not m:
+            return
+        name = m.group(1).decode("utf-8", "replace").strip()
+        if not name or name.lower() in ("speaking", "a", "an"):
+            return
+        # the party marker sits ~17 KB in, well past the speaker, so it needs a wider
+        # look - but only until it is found once. A regex over 45 KB is microseconds;
+        # it is JSON parsing that would have cost something.
+        pm = None
+        if not _spk_player[0]:
+            pm = PLAYER_RX.search(body[:PLAYER_SCAN])
+        with _spk_lock:
+            _spk_recent.append((time.time(), name))
+            del _spk_recent[:-12]
+            if pm:
+                _spk_player[0] = pm.group(1).decode("utf-8", "replace").strip()
+    except Exception:
+        pass
+
+
+def speaker_for_voice(voicetype):
+    """The character behind a voicetype, learned from what the proxy has carried."""
+    key = str(voicetype or "").strip().lower()
+    if not key:
+        return ""
+    if key in PLAYER_VOICES:
+        # named by the prompt where it says so, otherwise just "Player". Never learned,
+        # and never a name taken from a conversation.
+        return _spk_player[0] or "Player"
+    now = time.time()
+    with _spk_lock:
+        known = _spk_voices.get(key)
+        if known:
+            return known                         # already paired; never re-learn
+        # CONSUME the request it pairs with. Without that, a second voicetype asked
+        # inside the same window inherited the same name - and the pairing is cached,
+        # so one wrong guess would stick.
+        for idx in range(len(_spk_recent) - 1, -1, -1):
+            when, name = _spk_recent[idx]
+            if now - when <= SPEAKER_PAIR_S:
+                _spk_voices[key] = name
+                del _spk_recent[idx]
+                panel_log("[tts] voice %s is %s" % (key, name))
+                return name
+        return ""
+
+
 def tts_voice_name(path):
     if not path:
         return "Default Voice"
@@ -3758,6 +4344,12 @@ def tts_voice_name(path):
         n = n[:-4]
     n = re.sub(r"([a-z])([A-Z])", r"\1 \2", n)
     return n.replace("_", " ").title() or "Default Voice"
+
+
+def tts_speaker_label(path):
+    """The character's name where the proxy has learned it, else the voicetype."""
+    leaf = re.split(r"[\\/]", str(path or ""))[-1]
+    return speaker_for_voice(os.path.splitext(leaf)[0]) or tts_voice_name(path)
 
 
 def tts_parse_multipart(body, ctype):
@@ -3892,6 +4484,820 @@ def _mk_tts_handler(mgr):
 TTSW = TtsWrapper()
 
 
+PANEL_START = time.time()      # a log older than this is a previous session
+_tts_models_cache = {"t": 0.0, "dir": "", "items": []}
+
+
+def list_tts_models(cfg=None):
+    """Every model under the TTS models folder that audio.cpp can actually load.
+
+    Two shapes, because audio.cpp accepts both:
+      * a .gguf FILE - self-contained, its configs are embedded and extracted on load
+      * a FOLDER of safetensors - config.json plus model.safetensors[.index.json]
+
+    A folder holding both is listed only as its .gguf and marked, because audio.cpp
+    resolves the GGUF and ignores the safetensors silently - selecting "safetensors"
+    there would quietly load something else.
+
+    Walks three levels like list_models() and does not read any headers, so this stays
+    cheap even on a large folder.
+    """
+    cfg = cfg or load_config()
+    base = (cfg.get("settings", {}).get("ttsAcppModelsDir") or "").strip()
+    now = time.time()
+    if _tts_models_cache["dir"] == base and now - _tts_models_cache["t"] < 120:
+        return _tts_models_cache["items"]
+    items = []
+    if base and os.path.isdir(base):
+        for root, dirs, files in os.walk(base):
+            if root[len(base):].count(os.sep) > 3:
+                dirs[:] = []
+                continue
+            ggufs = [n for n in files if n.lower().endswith(".gguf")]
+            for n in sorted(ggufs):
+                m = PART_RX.search(n)
+                if m and m.group(1) != "00001":
+                    continue                      # one entry per sharded set
+                full = os.path.join(root, n)
+                items.append({"path": full, "name": os.path.relpath(full, base),
+                              "kind": "gguf", "shadows": len(ggufs) > 1})
+            has_cfg = "config.json" in (x.lower() for x in files)
+            has_st = any(x.lower() in ("model.safetensors", "model.safetensors.index.json")
+                         for x in files)
+            if has_cfg and has_st:
+                rel = os.path.relpath(root, base)
+                items.append({"path": root, "name": ("." if rel == "." else rel) + "  (safetensors)",
+                              "kind": "safetensors", "shadowed": bool(ggufs)})
+    items.sort(key=lambda x: x["name"].lower())
+    _tts_models_cache.update(t=now, dir=base, items=items)
+    return items
+
+
+def api_tts_models(body):
+    """Host-only: absent from REMOTE_POST_OK, and it discloses filesystem paths."""
+    cfg = load_config()
+    items = list_tts_models(cfg)
+    return {"models": items, "dir": cfg.get("settings", {}).get("ttsAcppModelsDir") or "",
+            "selected": cfg.get("settings", {}).get("ttsAcppModel") or ""}
+
+
+TTS_HINTS = (
+    ("no kernel image is available",
+     "the server has no CUDA kernels for the card it is pinned to. The prebuilt "
+     "CUDA package covers RTX 20xx and newer; a self-build needs "
+     "-CudaArchitectures covering this card (a 3090 is 86-real)"),
+    ("missing model package file",
+     "the model path points at the wrong place - select a model folder or .gguf, not the "
+     "folder above it"),
+    ("out of memory",
+     "not enough VRAM - try a shorter reference voice, a smaller model, or another card"),
+    ("failed to read WAV data chunk",
+     "the reference voice is not a plain WAV the server can read"),
+)
+
+
+def _num_or(hdrs, names):
+    """First of these headers that parses as a number, else 0.0.
+
+    Which timing headers audio.cpp sends is not documented, so try the plausible
+    spellings rather than assume one and silently report zero.
+    """
+    for n in names:
+        v = (hdrs or {}).get(n)
+        if v:
+            try:
+                return float(v)
+            except Exception:
+                pass
+    return 0.0
+
+
+ACPP_EXE_NAME = "audiocpp_server.exe"
+ACPP_REPO = "0xShug0/audio.cpp"
+_acpp_find = {"root": "", "t": 0.0, "exe": ""}
+
+
+def find_acpp_exe(root):
+    """Locate audiocpp_server.exe under a root folder.
+
+    Same shape as the llama.cpp folder setting: the user names a FOLDER and the panel
+    finds the binary. Naming the executable directly is not offered - a path field that
+    accepts any .exe is a path field that will eventually be pointed at the wrong .exe.
+
+    A prebuilt release unzips flat; a source build puts it under
+    build/windows-cuda-release/bin. Four levels covers both without walking a whole drive.
+    """
+    root = (root or "").strip()
+    if not root or not os.path.isdir(root):
+        return ""
+    now = time.time()
+    if _acpp_find["root"] == root and now - _acpp_find["t"] < 30 and _acpp_find["exe"]:
+        if os.path.isfile(_acpp_find["exe"]):
+            return _acpp_find["exe"]
+    hit = ""
+    direct = os.path.join(root, ACPP_EXE_NAME)
+    if os.path.isfile(direct):
+        hit = direct
+    else:
+        for cur, dirs, files in os.walk(root):
+            if cur[len(root):].count(os.sep) > 4:
+                dirs[:] = []
+                continue
+            for f in files:
+                if f.lower() == ACPP_EXE_NAME:
+                    hit = os.path.join(cur, f)
+                    break
+            if hit:
+                break
+    _acpp_find.update(root=root, t=now, exe=hit)
+    return hit
+
+
+# ---------------------------------------------------------------- Higgs installer
+# The panel downloading and unpacking executables is the largest thing it does on
+# a user's behalf, so it is deliberately narrow: host only, never automatic, one
+# explicit confirmation naming both sources, everything logged to the terminal as
+# it happens, and cancellable. Nothing is sent anywhere - these are two public
+# GETs and the panel says nothing about the machine it is running on.
+# WORDS an asset must contain, not a filename or even a prefix. The release always
+# fetched is "latest", so the version is never pinned - but the naming is not ours to
+# rely on. Exact names broke the moment a build hash appeared
+# (audiocpp-windows-cuda-balance-27d87ba.zip); a prefix would break on any reordering.
+# Requiring the words survives both, and anything unrecognised is reported with the
+# real asset list so it can be installed by hand.
+#
+# The runtime is OPTIONAL: it is shared across builds today, and a future release that
+# folds it into the profile archive should not be treated as broken.
+# (label, must contain, must NOT contain, preferred in order, required)
+# "win" not "windows", so win64 matches too. The profile is a PREFERENCE, not a
+# requirement: if the profile names ever change, any Windows CUDA build still beats
+# failing outright.
+HIGGS_ENGINE_ASSETS = (
+    ("runtime", ("win", "cuda", "runtime"), (), (), False),
+    ("CUDA build", ("win", "cuda"), ("runtime", "debug", "symbol", "cpu"),
+     ("balance", "portable", "fast"), True),
+)
+HIGGS_GGUF_REPO = "audio-cpp/audio.cpp-gguf"
+HIGGS_GGUF_PATH = "Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf"
+HIGGS_NEED_BYTES = 8 * 1024 * 1024 * 1024        # ~5.1 GB model plus room to unzip
+HIGGS_INSTALL = {"running": False, "cancel": False, "step": "", "pct": 0.0,
+                 "error": "", "done": False, "engine": "", "model": ""}
+
+
+def higgs_paths(cfg=None):
+    root = STACK
+    return {"engine": os.path.join(root, "audio.cpp"),
+            "models": os.path.join(root, "Models", "TTS"),
+            "model_dir": os.path.join(root, "Models", "TTS", "Higgs-v3-4b")}
+
+
+def _hi_log(msg):
+    HIGGS_INSTALL["step"] = msg
+    TTSW.log(msg)
+
+
+def _hi_get(url, headers=None):
+    h = {"User-Agent": "PandorumLLM"}
+    h.update(headers or {})
+    return urlopen(Request(url, headers=h), timeout=30)
+
+
+def _hi_download(url, dest, label):
+    """Stream to disk with progress, resuming a part-file if one is there."""
+    part = dest + ".part"
+    have = os.path.getsize(part) if os.path.isfile(part) else 0
+    headers = {"Range": "bytes=%d-" % have} if have else {}
+    try:
+        r = _hi_get(url, headers)
+    except HTTPError as e:
+        if have and e.code in (416, 200):        # server will not resume; start over
+            have, r = 0, _hi_get(url)
+        else:
+            raise
+    total = int(r.headers.get("Content-Length") or 0) + have
+    mode = "ab" if have and r.status == 206 else "wb"
+    if mode == "wb":
+        have = 0
+    done, last = have, 0.0
+    with r, open(part, mode) as f:
+        while True:
+            if HIGGS_INSTALL["cancel"]:
+                raise RuntimeError("cancelled")
+            chunk = r.read(1024 * 512)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total and time.time() - last > 1.0:
+                last = time.time()
+                HIGGS_INSTALL["pct"] = 100.0 * done / total
+                _hi_log("   %s  %.0f%%  (%.0f of %.0f MB)"
+                        % (label, HIGGS_INSTALL["pct"], done / 1e6, total / 1e6))
+    if total and done < total:
+        raise RuntimeError("%s ended early (%d of %d bytes)" % (label, done, total))
+    os.replace(part, dest)
+    return dest
+
+
+def _hi_unzip(src, dest):
+    """Extract, refusing any entry that would land outside dest.
+
+    A zip may name ..\\..\\windows\\system32 and a naive extractall will write it.
+    """
+    import zipfile
+    dest = os.path.realpath(dest)
+    os.makedirs(dest, exist_ok=True)
+    with zipfile.ZipFile(src) as z:
+        for info in z.infolist():
+            name = info.filename.replace("\\", "/")
+            if name.endswith("/"):
+                continue
+            # do NOT strip ".." and then extract: that quietly flattens a hostile
+            # archive into the folder instead of refusing it. Resolve the name as
+            # written and check where it actually lands.
+            if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+                raise RuntimeError("refusing an absolute path in the archive: %s"
+                                   % info.filename)
+            out = os.path.realpath(os.path.join(dest, name))
+            if not (out == dest or out.startswith(dest + os.sep)):
+                raise RuntimeError("refusing an archive entry outside the folder: %s"
+                                   % info.filename)
+            os.makedirs(os.path.dirname(out), exist_ok=True)
+            with z.open(info) as fh, open(out, "wb") as f:
+                shutil.copyfileobj(fh, f)
+
+
+def _hi_free_bytes(path):
+    try:
+        return shutil.disk_usage(path).free
+    except Exception:
+        return None
+
+
+def higgs_install_worker():
+    cfg = load_config()
+    paths = higgs_paths(cfg)
+    tmp = os.path.join(STACK, "logs", "_higgs-download")
+    try:
+        os.makedirs(tmp, exist_ok=True)
+        free = _hi_free_bytes(STACK)
+        if free is not None and free < HIGGS_NEED_BYTES:
+            raise RuntimeError("not enough disk space: %.1f GB free, about %.0f GB needed"
+                               % (free / 1e9, HIGGS_NEED_BYTES / 1e9))
+        TTSW.log("")
+        _hi_log("\U0001F4E6 Installing Higgs Audio v3 into %s" % STACK)
+
+        # ---- 1. the engine
+        _hi_log("\U0001F50E Asking github.com for the newest audio.cpp release...")
+        rel = json.loads(_hi_get("https://api.github.com/repos/%s/releases/latest"
+                                 % ACPP_REPO).read().decode("utf-8"))
+        tag = str(rel.get("tag_name") or "?")
+        assets = [a for a in (rel.get("assets") or []) if a.get("name")]
+        def pick(need, avoid, prefer):
+            """Best .zip carrying every needed word and none of the avoided ones.
+            Preference order first, then the shortest name."""
+            hits = [a for a in assets
+                    if a["name"].lower().endswith(".zip")
+                    and all(w in a["name"].lower() for w in need)
+                    and not any(w in a["name"].lower() for w in avoid)]
+            def rank(a):
+                low = a["name"].lower()
+                for i, w in enumerate(prefer):
+                    if w in low:
+                        return (i, len(low))
+                return (len(prefer), len(low))
+            return sorted(hits, key=rank)[0] if hits else None
+        chosen, missing = [], []
+        for label, need, avoid, prefer, required in HIGGS_ENGINE_ASSETS:
+            a = pick(need, avoid, prefer)
+            if a:
+                chosen.append(a)
+            elif required:
+                missing.append("%s (needs %s)" % (label, " + ".join(need)))
+            else:
+                _hi_log("   no %s in this release - continuing without it" % label)
+        if missing:
+            raise RuntimeError(
+                "release %s carries no %s. It has: %s" %
+                (tag, "; ".join(missing),
+                 ", ".join(a["name"] for a in assets[:9]) or "no assets at all"))
+        _hi_log("   found %s" % tag)
+        os.makedirs(paths["engine"], exist_ok=True)
+        if find_acpp_exe(paths["engine"]):
+            _hi_log("\u2705 Engine already unpacked - skipping the download")
+            chosen = []
+        for a in chosen:
+            name = a["name"]
+            zp = os.path.join(tmp, name)
+            _hi_log("\u2B07 %s (%.0f MB)" % (name, (a.get("size") or 0) / 1e6))
+            _hi_download(a["browser_download_url"], zp, name)
+            _hi_log("\U0001F4C2 Unpacking %s" % name)
+            _hi_unzip(zp, paths["engine"])
+            try:
+                os.remove(zp)
+            except OSError:
+                pass
+        exe = find_acpp_exe(paths["engine"])
+        if not exe:
+            raise RuntimeError("unpacked, but no %s was found - the release layout may "
+                               "have changed" % ACPP_EXE_NAME)
+        _hi_log("\u2705 Engine ready: %s" % exe)
+
+        # ---- 2. the model
+        os.makedirs(paths["model_dir"], exist_ok=True)
+        gguf = os.path.join(paths["model_dir"], os.path.basename(HIGGS_GGUF_PATH))
+        if os.path.isfile(gguf) and os.path.getsize(gguf) > 4e9:
+            _hi_log("\u2705 Model already here: %s" % os.path.basename(gguf))
+        else:
+            url = ("https://huggingface.co/%s/resolve/main/%s?download=true"
+                   % (HIGGS_GGUF_REPO, HIGGS_GGUF_PATH))
+            _hi_log("\u2B07 %s (about 5.1 GB - this is the long part)"
+                    % os.path.basename(HIGGS_GGUF_PATH))
+            _hi_download(url, gguf, "model")
+            _hi_log("\u2705 Model ready: %s" % os.path.basename(gguf))
+
+        # ---- 3. point the panel at what was just installed
+        #
+        # Everything is on disk by now. If only this last step fails - a locked config
+        # is the usual reason - the download is NOT wasted, so say what was installed
+        # and where rather than reporting a failed install.
+        try:
+            with CFG_LOCK:
+                c = load_config()
+                st = c.setdefault("settings", {})
+                st["ttsEngine"] = "audiocpp"
+                st["ttsAcppDir"] = paths["engine"]
+                st["ttsAcppModelsDir"] = paths["models"]
+                st["ttsAcppModel"] = gguf
+                st["ttsAcppVersion"] = tag        # audiocpp_server has no --version
+                save_config(c)
+        except Exception as e:
+            HIGGS_INSTALL["done"] = True
+            _hi_log("\u2705 Downloaded and unpacked, but the settings could not be saved: %s"
+                    % str(e)[:160])
+            _hi_log("   Nothing is lost. Set these by hand on this page:")
+            _hi_log("      TTS engine          audio.cpp")
+            _hi_log("      audio.cpp Folder    %s" % paths["engine"])
+            _hi_log("      TTS Models Folder   %s" % paths["models"])
+            _hi_log("      Model               %s" % gguf)
+            TTSW.log("")
+            return
+        _tts_models_cache["t"] = 0.0
+        HIGGS_INSTALL.update(done=True, engine=paths["engine"],
+                             model=os.path.basename(gguf))
+        _hi_log("\U0001F389 Higgs Audio v3 is installed and selected. Press Start TTS.")
+        TTSW.log("")
+    except Exception as e:
+        msg = "cancelled" if str(e) == "cancelled" else str(e)[:300]
+        HIGGS_INSTALL["error"] = msg
+        _hi_log("\u274C Install %s" % ("cancelled" if msg == "cancelled"
+                                       else "failed: " + msg))
+        if msg != "cancelled":
+            log_error("tts", "higgs install failed: %s" % msg)
+    finally:
+        HIGGS_INSTALL["running"] = False
+        HIGGS_INSTALL["cancel"] = False
+        sse_notify("state")
+
+
+def higgs_present(cfg=None):
+    """What is already installed where the panel would put it.
+
+    Someone may have installed by hand, or the settings may have been lost while the
+    files survived - a config save failing at the last step did exactly that. Offering
+    to adopt what is there beats making them fill in four paths.
+    """
+    cfg = cfg or load_config()
+    paths = higgs_paths(cfg)
+    st = cfg.get("settings", {})
+    exe = find_acpp_exe(paths["engine"])
+    models = []
+    for root, dirs, files in os.walk(paths["models"]):
+        if root[len(paths["models"]):].count(os.sep) > 3:
+            dirs[:] = []
+            continue
+        for f in sorted(files):
+            if f.lower().endswith(".gguf"):
+                models.append(os.path.join(root, f))
+    wired = bool((st.get("ttsAcppDir") or "").strip()
+                 and (st.get("ttsAcppModel") or "").strip())
+    return {"exe": exe, "models": models[:8],
+            "adoptable": bool(exe and models and not wired)}
+
+
+def api_higgs_adopt(body=None):
+    """Point the settings at an install that is already on disk. Host only."""
+    found = higgs_present()
+    if not (found["exe"] and found["models"]):
+        return {"error": "nothing to adopt - no server and model under %s"
+                         % higgs_paths()["engine"]}
+    paths = higgs_paths()
+    with CFG_LOCK:
+        c = load_config()
+        st = c.setdefault("settings", {})
+        st["ttsEngine"] = "audiocpp"
+        st["ttsAcppDir"] = paths["engine"]
+        st["ttsAcppModelsDir"] = paths["models"]
+        st["ttsAcppModel"] = found["models"][0]
+        ver = acpp_local_version(c)              # from a README if there is one
+        if ver:
+            st["ttsAcppVersion"] = ver
+        save_config(c)
+    _tts_models_cache["t"] = 0.0
+    TTSW.log("\u2705 Adopted the install already in %s" % paths["engine"])
+    return {"ok": True, "model": os.path.basename(found["models"][0])}
+
+
+def api_higgs_install(body):
+    """Host only, and never without the confirmation the page shows first."""
+    if str((body or {}).get("action", "")) == "cancel":
+        if HIGGS_INSTALL["running"]:
+            HIGGS_INSTALL["cancel"] = True
+        return {"ok": True}
+    if HIGGS_INSTALL["running"]:
+        return {"error": "an install is already running"}
+    if not (body or {}).get("confirm"):
+        return {"error": "not confirmed"}
+    if str((body or {}).get("action", "")) == "dismiss":
+        HIGGS_INSTALL.update(done=False, error="", step="")
+        return {"ok": True}
+    HIGGS_INSTALL.update(running=True, cancel=False, step="", pct=0.0, error="",
+                         done=False, engine="", model="")
+    threading.Thread(target=higgs_install_worker, daemon=True).start()
+    return {"ok": True}
+
+
+ACPP_VER_RX = re.compile(r"release-\d+\.\d+(?:\.\d+)?|(?<![\w.])\d+\.\d+\.\d+(?![\w.])")
+
+
+def acpp_local_version(cfg=None):
+    """The installed audio.cpp version, by whatever means there is.
+
+    audiocpp_server answers no --version, so this tries what might: the tag the panel
+    recorded when IT installed, then a running server's own /health or /v1/models, then
+    the file's Windows version resource, then a version in whatever the archive shipped
+    beside it. Any of these may be absent - returning "" and saying so is better than
+    inventing a number.
+    """
+    cfg = cfg or load_config()
+    st = cfg.get("settings", {})
+    tag = (st.get("ttsAcppVersion") or "").strip()
+    if tag:
+        return tag
+    exe = find_acpp_exe(st.get("ttsAcppDir", ""))
+    if not exe:
+        return ""
+
+    # 2. a running server may say. Only when it is actually up, and briefly.
+    try:
+        if slot_status(tts_server_port(cfg)).get("state") == "serving":
+            base = "http://127.0.0.1:%d" % tts_server_port(cfg)
+            for path in ("/health", "/v1/models"):
+                try:
+                    with urlopen(Request(base + path,
+                                         headers={"User-Agent": "PandorumLLM"}),
+                                 timeout=2) as r:
+                        txt = r.read(8192).decode("utf-8", "replace")
+                    for key in ("version", "build", "commit", "revision"):
+                        m = re.search(r'"[^"]*%s[^"]*"\s*:\s*"([^"]{1,40})"' % key, txt, re.I)
+                        if m and re.search(r"\d", m.group(1)):
+                            return m.group(1)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 3. the server's own startup output, which the panel already captures
+    try:
+        with open(os.path.join(log_dir(cfg), TTS_SERVER_LOG_NAME), "rb") as f:
+            head = f.read(65536).decode("utf-8", "replace")
+        for line in head.splitlines()[:120]:
+            if re.search(r"version|build|audio\.cpp", line, re.I):
+                m = ACPP_VER_RX.search(line)
+                if m:
+                    return m.group(0)
+    except Exception:
+        pass
+
+    # 4. the file's own version resource, if the build carries one. PowerShell reads it
+    # in one line; parsing PE resources in Python for a label is not worth it.
+    try:
+        ps = ("$v=(Get-Item -LiteralPath %s).VersionInfo; "
+              "if ($v.FileVersion) { $v.FileVersion } elseif ($v.ProductVersion) "
+              "{ $v.ProductVersion }" % json.dumps(exe))
+        r = subprocess.run(["pwsh", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, timeout=12, **NOWIN)
+        got = (r.stdout or "").strip().splitlines()
+        if got and re.search(r"\d", got[0]) and got[0].strip("0. ") != "":
+            return got[0].strip()
+    except Exception:
+        pass
+
+    # 5. whatever the archive shipped alongside it
+    for name in ("README.md", "README.txt", "VERSION", "version.txt", "CHANGELOG.md"):
+        path = os.path.join(os.path.dirname(exe), name)
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                m = ACPP_VER_RX.search(f.read(8192))
+            if m:
+                return m.group(0)
+        except OSError:
+            continue
+    return ""
+
+
+def api_acpp_update(body=None):
+    """Newest audio.cpp release, and the installed one if the binary will say.
+
+    Same terms as the llama.cpp check: only when the button is pressed, a plain GET of a
+    public release page, nothing about the setup is sent.
+    """
+    out = {"tag": "", "local": "", "url": "https://github.com/%s/releases" % ACPP_REPO}
+    try:
+        rq = Request("https://api.github.com/repos/%s/releases/latest" % ACPP_REPO,
+                     headers={"User-Agent": "PandorumLLM", "Accept": "application/vnd.github+json"})
+        data = json.loads(urlopen(rq, timeout=10).read().decode("utf-8"))
+        out["tag"] = str(data.get("tag_name") or "").strip()
+        out["url"] = str(data.get("html_url") or out["url"])
+        out["published"] = str(data.get("published_at") or "")[:10]
+    except HTTPError as e:
+        return {"error": ("github.com refused the request (rate limit) - try again shortly"
+                          if e.code == 403 else "github.com returned HTTP %s" % e.code)}
+    except Exception as e:
+        return {"error": "could not reach github.com (%s)" % str(e)[:80]}
+    _cfg = load_config()
+    _st = _cfg.get("settings", {})
+    out["local"] = acpp_local_version(_cfg)      # recorded at install, or read on disk
+    exe = find_acpp_exe(_st.get("ttsAcppDir", ""))
+    if exe:
+        out["exe"] = exe
+        for flag in ("--version", "-v"):     # not documented; try, do not insist
+            try:
+                r = subprocess.run([exe, flag], capture_output=True, text=True, timeout=15,
+                                   **NOWIN,
+                                   cwd=os.path.dirname(exe) or None)
+                m = re.search(r"\b\d+\.\d+(\.\d+)?\b", (r.stdout or "") + (r.stderr or ""))
+                if m:
+                    out["local"] = m.group(0)
+                    break
+            except Exception:
+                pass
+    return out
+
+
+def tts_save_named(src_bytes, npc, cfg=None):
+    """Keep a named copy of a generated line in the user's chosen folder.
+
+    The served file has to stay in the wrapper's own temp folder because
+    /gradio_api/file= is jailed to it - so this is a copy alongside, exactly as the
+    reference wrapper did: a temp file to serve and a readable one to keep.
+
+    Names match that wrapper too: <Npc>_<YYYYMMDD_HHMMSS>.wav. Nothing here is pruned;
+    the folder is the user's, and deleting from it uninvited would be worse than growth.
+    """
+    out = (( cfg or load_config()).get("settings", {}).get("ttsOutDir") or "").strip()
+    if not out:
+        return ""
+    try:
+        os.makedirs(out, exist_ok=True)
+        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(npc or "voice")).strip("_") or "voice"
+        path = os.path.join(out, "%s_%s.wav" % (safe, time.strftime("%Y%m%d_%H%M%S")))
+        n = 1
+        while os.path.exists(path):                # same second, same speaker
+            path = os.path.join(out, "%s_%s-%d.wav"
+                                % (safe, time.strftime("%Y%m%d_%H%M%S"), n))
+            n += 1
+        with open(path, "wb") as f:
+            f.write(src_bytes)
+        return path
+    except Exception as e:
+        log_error("tts", "could not save into the output folder %s: %s" % (out, e))
+        return ""
+
+
+def tts_diagnose(cfg=None):
+    """Turn an audio.cpp crash into something a person can act on.
+
+    A dropped connection reads as WinError 10054 on our side and says nothing. The
+    server's own log usually says exactly what happened one line earlier, so read the
+    tail of it and translate. Three separate failures this session were the same
+    single-architecture CUDA build, each time unrecognisable from the panel's side.
+    """
+    try:
+        path = os.path.join(log_dir(cfg or load_config()), TTS_SERVER_LOG_NAME)
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            tail = f.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    for needle, hint in TTS_HINTS:
+        if needle in tail:
+            return hint
+    return ""
+
+
+def tts_pick_fields(fields):
+    """Find the text and the reference voice in a Gradio call.
+
+    SkyrimNet's Zonos and Chatterbox interfaces both speak Gradio but send different
+    argument lists. Indexing by position is right for Zonos and silently wrong for
+    anything else - it lands on a number or a flag and the reference never arrives.
+    Keep the proven positions when they hold, and fall back to shape when they do not:
+    the reference is the only dict carrying a "path", and the text is the longest string
+    that is not a language tag.
+    """
+    text = fields[1] if len(fields) > 1 and isinstance(fields[1], str) else ""
+    ref = None
+    if len(fields) > 3 and isinstance(fields[3], dict) and fields[3].get("path"):
+        ref = tts_speaker_path(fields[3])
+        return text, ref
+    for f in fields:                                  # another engine's argument list
+        if isinstance(f, dict) and f.get("path"):
+            ref = tts_speaker_path(f)
+            break
+    if not text or _TTS_LANG_RX.match(text.strip()):
+        best = ""
+        for f in fields:
+            if isinstance(f, str) and not _TTS_LANG_RX.match(f.strip()) and len(f) > len(best):
+                best = f
+        text = best
+    return text, ref
+
+
+# ---- local reference clips ------------------------------------------------------
+# SkyrimNet resamples every reference to 16 kHz before uploading it - including the
+# 44.1 kHz files in its own voice-samples folder - which throws away everything above
+# 8 kHz. Higgs runs at 24 kHz and has room for far more, so a clip read straight off
+# disk clones noticeably better than the same clip round-tripped through the mod.
+#
+# The key is the upload's filename, which is the voicetype: femalenord.wav,
+# malecommoner.wav, or a character name like serana.wav. Idea and naming scheme from
+# cleanestpoison/higgs3-tts-skyrimnet (Apache-2.0).
+#
+# .wav only here. The reference implementation accepts six formats because it has
+# FFmpeg; this panel is stdlib-only, and MOSS is handed the bytes rather than a path.
+_voice_index = {"dir": "", "mtime": None, "map": {}}
+
+
+def tts_voice_index(cfg=None):
+    d = ((cfg or load_config()).get("settings", {}).get("ttsVoiceDir") or "").strip()
+    if not d or not os.path.isdir(d):
+        _voice_index.update(dir="", mtime=None, map={})
+        return {}
+    try:
+        mt = os.stat(d).st_mtime
+    except OSError:
+        return {}
+    if _voice_index["dir"] == d and _voice_index["mtime"] == mt:
+        return _voice_index["map"]
+    out = {}
+    try:
+        for n in sorted(os.listdir(d)):
+            full = os.path.join(d, n)
+            if os.path.isfile(full) and n.lower().endswith(".wav"):
+                out[os.path.splitext(n)[0].lower()] = full
+    except OSError:
+        return _voice_index["map"]
+    _voice_index.update(dir=d, mtime=mt, map=out)
+    panel_log("[tts] local voices: %d clip(s) in %s" % (len(out), d))
+    return out
+
+
+def tts_local_sample(upload_path, cfg=None):
+    """A local clip matching the upload's filename, or "" if there is none."""
+    if not upload_path:
+        return ""
+    # split on BOTH separators: os.path.basename ignores "\\" off Windows, which is the
+    # same trap api_tts_import hit in v3.71
+    leaf = re.split(r"[\\/]", str(upload_path))[-1]
+    stem = os.path.splitext(leaf)[0].lower()
+    return tts_voice_index(cfg).get(stem, "")
+
+
+def tts_ref_canonical(path):
+    """Make sure a reference on disk is one a strict WAV reader can parse.
+
+    Normalising at save_upload is not enough on its own: SkyrimNet HEADs the path first
+    and skips the upload when it gets a 200, so a file cached by an older build is never
+    re-sent and never re-normalised. Rewrite it in place the first time it is used.
+    After that the check costs 44 bytes.
+    """
+    try:
+        with open(path, "rb") as f:
+            head = f.read(44)
+        if len(head) >= 40 and head[:4] == b"RIFF" and head[36:40] == b"data":
+            return path                      # canonical already
+        with open(path, "rb") as f:
+            data = f.read()
+        clean = tts_wav_normalize(data)
+        if clean and clean != data:
+            with open(path, "wb") as f:
+                f.write(clean)
+            panel_log("[tts] rewrote a stale reference: %s (%d -> %d bytes)"
+                      % (os.path.basename(path), len(data), len(clean)))
+    except Exception as e:
+        log_error("tts", "could not normalise the reference %s: %s" % (path, e))
+    return path
+
+
+def tts_engine_label(cfg=None):
+    cfg = cfg or load_config()
+    if tts_engine(cfg) != "audiocpp":
+        return "MOSS-TTS"
+    sel = (cfg.get("settings", {}).get("ttsAcppModel") or "").strip()
+    return "audio.cpp" + ((" (" + re.split(r"[\\/]", sel)[-1] + ")") if sel else "")
+
+
+def tts_gpu_label(cfg=None):
+    """The card the server was pinned to, by name where we know it."""
+    cfg = cfg or load_config()
+    want = (cfg.get("settings", {}).get("ttsGpuId") or "").strip()
+    for g in cfg.get("gpus", []) or []:
+        if want and str(g.get("uuid", "")) == want:
+            return str(g.get("name") or want)
+    return want or "default device"
+
+
+def tts_engine(cfg=None):
+    return str((cfg or load_config()).get("settings", {}).get("ttsEngine", "moss")).lower()
+
+
+def tts_acpp_config(cfg=None):
+    """The server.json audio.cpp is started with.
+
+    The panel owns this file - a user editing it by hand would be overwritten on the
+    next Start, which is why the GPU is pinned by env instead of the "device" key:
+    CUDA_VISIBLE_DEVICES masks to one card and that card is then index 0 in-process,
+    exactly as --main-gpu 0 works for the llama.cpp fleet.
+
+    lazy_load is left off deliberately. Eager loading means /health answering is a real
+    readiness signal, which is what the Start button waits on; with lazy loading the
+    server would report ok before the model existed.
+    """
+    cfg = cfg or load_config()
+    st = cfg.get("settings", {})
+    fam = (st.get("ttsAcppFamily") or "higgs_audio_tts")
+    try:
+        slots = max(1, min(int(str(st.get("ttsAcppRefSlots", "64")).strip() or 64), 1024))
+    except Exception:
+        slots = 64
+    return json.dumps({
+        "host": "0.0.0.0",
+        "port": tts_server_port(cfg),
+        "backend": "cuda",
+        "device": 0,
+        "threads": 1,
+        "models": [{
+            "id": (st.get("ttsAcppModelId") or "higgs"),
+            "family": fam,
+            "path": (st.get("ttsAcppModel") or "").replace("\\", "/"),
+            "task": "tts",
+            "mode": "offline",
+            # SkyrimNet gives TTS about 15s. The server queues a second request behind
+            # the first, so without a bound a slow line stalls every line after it.
+            "busy_timeout_ms": 20000,
+            # The engine keeps encoded references in a cache whose default size is ONE.
+            # A conversation alternates speakers, so at one slot practically every line
+            # re-encodes its reference. One entry per voice you actually meet.
+            "session_options": {
+                "%s.reference_cache_slots" % fam: slots,
+            },
+        }],
+    }, indent=2)
+
+
+def tts_acpp_speak(url_base, model_id, text, ref_path, ref_text=""):
+    """POST /v1/audio/speech and return WAV bytes.
+
+    voice_ref is a server-local PATH, not base64 - the Gradio front has already written
+    the uploaded sample to disk, so it is passed straight through. That only holds while
+    the panel and audio.cpp are on the same machine, which they are by construction: the
+    panel starts the process.
+    """
+    body = {"model": model_id, "input": text}
+    if ref_path:
+        body["voice_ref"] = ref_path
+        if ref_text:
+            body["reference_text"] = ref_text
+    req = _ureq.Request(url_base.rstrip("/") + "/v1/audio/speech",
+                        data=json.dumps(body).encode("utf-8"),
+                        headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        r = _ureq.urlopen(req, timeout=120)
+    except _uerr.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:400].strip()
+        except Exception:
+            pass
+        raise RuntimeError("HTTP %s from %s%s" % (e.code, url_base,
+                                                  (" - " + detail) if detail else ""))
+    with r:
+        data = r.read()
+    return data, {k.lower(): v for k, v in r.getheaders()}
+
+
 def tts_server_port(cfg=None):
     try:
         return int(str((cfg or load_config()).get("settings", {}).get("ttsServerPort") or "1240"))
@@ -3910,7 +5316,7 @@ def tts_server_status(cfg=None):
     return out
 
 
-TTS_PROC = {"pid": None, "proc": None, "stopping": False}
+TTS_PROC = {"pid": None, "proc": None, "stopping": False, "said_ready": False}
 
 
 def stop_tts_server(reason="", wait=True):
@@ -3930,6 +5336,8 @@ def stop_tts_server(reason="", wait=True):
     if not p and not pid:
         return False
     TTS_PROC["stopping"] = True
+    TTSW.log("")
+    TTSW.log("\U0001F6D1 Stopping the TTS server%s..." % ((" - " + reason) if reason else ""))
     try:
         with _ST_LOCK:
             _ST_CACHE.pop(tts_server_port(), None)
@@ -3948,6 +5356,8 @@ def stop_tts_server(reason="", wait=True):
             log_error("tts", "could not stop the server: %s" % e)
         TTS_PROC["pid"], TTS_PROC["proc"] = None, None
         TTS_PROC["stopping"] = False
+        TTSW.log("\u2705 TTS server stopped")
+        TTSW.log("")
         try:
             with _ST_LOCK:
                 _ST_CACHE.pop(tts_server_port(), None)
@@ -3963,7 +5373,16 @@ def stop_tts_server(reason="", wait=True):
 
 
 def api_tts_server(body):
-    """Start or stop moss-tts-server. Host-only: absent from REMOTE_POST_OK."""
+    """Start or stop the TTS server. Host-only: absent from REMOTE_POST_OK."""
+    if not _TTSSRV_LOCK.acquire(blocking=False):
+        return {"error": "a TTS start or stop is already running"}
+    try:
+        return _api_tts_server(body)
+    finally:
+        _TTSSRV_LOCK.release()
+
+
+def _api_tts_server(body):
     action = str(body.get("action", "")).lower()
     cfg = load_config()
     st = cfg.get("settings", {})
@@ -3984,12 +5403,26 @@ def api_tts_server(body):
     if cur.get("state") in ("serving", "loading"):
         return {"ok": True, "already": True, "status": tts_server_status(cfg)}
 
-    exe = (st.get("ttsServerExe") or "").strip()
-    model = (st.get("ttsModel") or "").strip()
-    if not exe or not os.path.isfile(exe):
-        return {"error": "TTS server binary not found: %s" % (exe or "(not set)")}
-    if not model or not os.path.isfile(model):
-        return {"error": "TTS model not found: %s" % (model or "(not set)")}
+    eng = tts_engine(cfg)
+    if eng == "audiocpp":
+        exe = find_acpp_exe(st.get("ttsAcppDir", "")) or (st.get("ttsAcppExe") or "").strip()
+        model = (st.get("ttsAcppModel") or "").strip()
+        if not exe or not os.path.isfile(exe):
+            return {"error": "no %s found under %s" % (ACPP_EXE_NAME,
+                              st.get("ttsAcppDir") or "(no folder set)")}
+        if not model or not os.path.exists(model):
+            # a .gguf is a FILE, a safetensors layout is a FOLDER - both are valid
+            return {"error": "audio.cpp model not found: %s" % (model or "(not set)")}
+        if os.path.isdir(model) and any(n.lower().endswith(".gguf") for n in os.listdir(model)):
+            return {"error": "that folder holds a .gguf, which audio.cpp loads instead of the "
+                             "safetensors - pick the .gguf itself, or move it out"}
+    else:
+        exe = (st.get("ttsServerExe") or "").strip()
+        model = (st.get("ttsModel") or "").strip()
+        if not exe or not os.path.isfile(exe):
+            return {"error": "TTS server binary not found: %s" % (exe or "(not set)")}
+        if not model or not os.path.isfile(model):
+            return {"error": "TTS model not found: %s" % (model or "(not set)")}
 
     gid = st.get("ttsGpuId") or ""
     gpu = next((g for g in cfg.get("gpus", []) if g.get("id") == gid), None)
@@ -3999,11 +5432,21 @@ def api_tts_server(body):
         # after masking, the chosen card re-indexes to 0 in-process, so --main-gpu
         # stays 0 rather than the physical index. Same trap as the launcher.
         env["CUDA_VISIBLE_DEVICES"] = uuid_
-    args = [exe, "--model", model, "--main-gpu", "0", "--host", "0.0.0.0",
-            "--port", str(port), "--no-webui"]
+    if eng == "audiocpp":
+        # the panel owns server.json; it is rewritten on every start
+        cfgp = os.path.join(log_dir(cfg), "audiocpp-server.json")
+        try:
+            with open(cfgp, "wb") as f:
+                f.write(tts_acpp_config(cfg).encode("utf-8"))
+        except Exception as e:
+            return {"error": "cannot write the audio.cpp config: %s" % e}
+        args = [exe, "--config", cfgp]
+    else:
+        args = [exe, "--model", model, "--main-gpu", "0", "--host", "0.0.0.0",
+                "--port", str(port), "--no-webui"]
 
     try:
-        logf = open(os.path.join(log_dir(cfg), "tts-server.log"), "ab")
+        logf = open(os.path.join(log_dir(cfg), TTS_SERVER_LOG_NAME), "ab")
     except Exception as e:
         return {"error": "cannot open the server log: %s" % e}
     flags = 0
@@ -4024,6 +5467,10 @@ def api_tts_server(body):
     with _ST_LOCK:
         _ST_CACHE.pop(port, None)
     panel_log("[tts] started %s on :%d (pid %d)" % (os.path.basename(exe), port, p.pid))
+    TTSW.log("")
+    TTSW.log("\U0001F680 Loading %s..." % tts_engine_label(cfg))
+    TTSW.log("\U0001F527 Using device: cuda (%s)" % tts_gpu_label(cfg))
+    TTSW.log("\u23F3 Waiting for the model to load - the first line is always the slowest")
     sse_notify("state")
     return {"ok": True, "started": True, "pid": p.pid, "status": tts_server_status(cfg)}
 
@@ -4062,8 +5509,19 @@ def api_tail(body, scope="host"):
     ld = log_dir()
     kind = body.get("kind", "")
     if kind in ("dashboard", "thinking"):
-        files = sorted(glob.glob(os.path.join(ld, "*_%s.log" % kind)), key=os.path.getmtime, reverse=True)
-        path = files[0] if files else None
+        # Only THIS session's file. The fleet names its logs per launch, so before the
+        # first launch the newest one belongs to the previous run - showing it looked
+        # like the terminal had not cleared.
+        files = sorted(glob.glob(os.path.join(ld, "*_%s.log" % kind)),
+                       key=os.path.getmtime, reverse=True)
+        path = None
+        for f in files:
+            if os.path.getmtime(f) >= PANEL_START - 2.0:
+                path = f
+                break
+        if path is None and files:
+            return {"text": "(waiting for this session - the last log is from a previous "
+                            "run of the panel)", "file": ""}
     elif kind == "tts":
         # a fixed feed, NOT kind=file: one known name inside the log folder. It carries
         # no caller-supplied path, so the remote objection to kind=file does not apply,
@@ -4370,6 +5828,7 @@ def _mk_handler(mgr, listen_port):
                 log_error("proxy", "refused a %d byte body on :%d" % (length, listen_port))
                 return
             body = self.rfile.read(length) if length else None
+            note_speaker(body)          # reads a name, keeps nothing else
             is_chat = wants_stream = False
             if self.command == "POST" and self.path.startswith("/v1/chat/completions") and body:
                 is_chat = True
@@ -4809,8 +6268,13 @@ REMOTE_READ_OK = {
     "/api/state", "/api/events", "/api/heartbeat", "/api/bye",
     "/api/client-error", "/icon.ico", "/favicon.ico",
 }
-# /api/tail is allowed for remote ONLY for the fixed dashboard/thinking feeds
-# (never kind=file, which reads an arbitrary path) - checked in the dispatcher.
+# /api/tail is allowed for remote for the FIXED feeds only - dashboard, thinking and
+# tts - and never kind=file, which would read an arbitrary path. Checked in the dispatcher.
+#
+# Those feeds carry content, not only numbers: thinking holds the model's reasoning and
+# tts holds spoken dialogue, including the player's own lines and character names. That is
+# deliberate - a remote session is the operator's own second screen, bound to remoteIp -
+# but it is worth knowing before handing out an address.
 
 def _host_allowlist():
     hosts = {"localhost", "127.0.0.1", "[::1]"}
@@ -5117,7 +6581,10 @@ class Handler(BaseHTTPRequestHandler):
             "/api/add": api_add, "/api/remove": api_remove,
             "/api/settings": api_settings, "/api/tail": api_tail,
             "/api/tts-launcher": api_tts_launcher, "/api/tts-import": api_tts_import,
-            "/api/tts-server": api_tts_server,
+            "/api/tts-server": api_tts_server, "/api/tts-models": api_tts_models,
+            "/api/acpp-update": api_acpp_update,
+            "/api/higgs-install": api_higgs_install,
+            "/api/higgs-adopt": api_higgs_adopt,
             "/api/launch-stack": api_launch_stack, "/api/show-terminal": api_show_terminal,
             "/api/creator-add": api_creator_add, "/api/creator-remove": api_creator_remove,
             "/api/launcher-content": api_launcher_content,
@@ -5163,8 +6630,11 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(403, "application/json", '{"error":"read-only remote session - this action is host-only"}'); return
             if self.path == "/api/tail" and str((body or {}).get("kind", "")) == "file":
                 self._send(403, "application/json", '{"error":"read-only remote session"}'); return
+        # Starting a server takes seconds and touches no config, so holding the lock for
+        # it made the OTHER launch button wait on this one. Those two run unlocked.
+        _lk = _NullLock() if self.path in NO_CFG_LOCK else CFG_LOCK
         try:
-            with CFG_LOCK:            # serialize all mutating endpoints: no lost updates
+            with _lk:                 # serialize all mutating endpoints: no lost updates
                 if self.path == "/api/tail":
                     out = api_tail(body, getattr(self, "_scope", "host"))
                 elif self.path in routes:
@@ -5189,8 +6659,11 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = """<!doctype html>
 <html><head><meta charset="utf-8"><title>PandorumLLM</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- No webfont link. This pulled Plus Jakarta Sans from fonts.googleapis.com on every
+       page load, which told Google the IP and referer of a panel that is documented as
+       running entirely on your LAN - and needed the internet to look right. The family is
+       still declared in the CSS, so it is used if installed locally; otherwise the stack
+       falls through to Segoe UI, which every Windows install has. -->
   <link rel="icon" href="/icon.ico?v=210">
   <style>
   :root { --bg:#0d0e10; --card:#151619; --edge:#26282d; --txt:#ececf1; --dim:#9aa0a8;
@@ -5561,7 +7034,55 @@ PAGE = """<!doctype html>
     100% { filter:drop-shadow(0 0 0 rgba(250,166,26,0)); }
   }
   .guidehl { animation:guideHL 2s ease-in-out 1; border-radius:9px; }
+  .gcode { position:relative; cursor:pointer; font-family:Consolas,monospace;
+           font-size:12.5px; line-height:1.6; white-space:pre-wrap; word-break:break-all;
+           padding:9px 34px 9px 11px; margin:9px 0; border-radius:7px;
+           background:rgba(255,255,255,.045); transition:background .14s; }
+  .gcode:hover { background:rgba(255,255,255,.075); }
+  .gcode .gcopy { position:absolute; top:8px; right:10px; color:var(--dim);
+                  transition:color .14s; pointer-events:none; }
+  .gcode:hover .gcopy { color:var(--acc); }
+  @keyframes gcodePulse {
+    0%   { box-shadow:0 0 0 0 rgba(0,0,0,0); }
+    35%  { box-shadow:0 0 15px 3px var(--acc); }
+    100% { box-shadow:0 0 0 0 rgba(0,0,0,0); }
+  }
+  .gcode.copied-flash { animation:gcodePulse .42s ease-out 1; }
+  /* the TTS page is a long column of settings; without room they read as one blob */
+  #dpane-tts .set > label { display:block; margin:20px 0 7px; font-weight:600; }
+  #dpane-tts .set > label:first-of-type { margin-top:4px; }
+  #dpane-tts .set > .row { margin-bottom:2px; }
+  #dpane-tts .set > .hint { margin:7px 0 4px; line-height:1.7; }
+  #dpane-tts .tgnote { margin:7px 0 4px !important; line-height:1.7; }
+  #dpane-tts .tgroup { margin:24px 0 4px; padding-top:18px;
+                       border-top:1px solid rgba(255,255,255,.07); }
+  /* The branch under a spoken line. Drawn rather than typed: a stretched box glyph
+     overlapped its neighbour and the glow doubled up at the join. An inline-block
+     exactly one row tall meets the next one and no more. */
+  .tail .tbr, .tail .tbrend { display:inline-block; position:relative;
+                              width:2ch; height:1.6em; vertical-align:top; }
+  .tail .tbr::before, .tail .tbrend::before { content:""; position:absolute;
+                              left:.45ch; top:0; border-left:1.6px solid var(--acc);
+                              box-shadow:0 0 4px var(--acc), 0 0 10px var(--acc), 0 0 20px var(--acc); }
+  .tail .tbr::before    { height:100%; }        /* carries on to the next row */
+  .tail .tbrend::before { height:50%; }         /* stops at the elbow */
+  .tail .tbr::after, .tail .tbrend::after { content:""; position:absolute;
+                              left:.45ch; top:50%; width:1.25ch;
+                              border-top:1.6px solid var(--acc);
+                              box-shadow:0 0 4px var(--acc), 0 0 10px var(--acc),
+                                          0 0 20px var(--acc); }
   .hdg.guidehl { animation:guideShape 2s ease-in-out 1; box-shadow:none; }
+  /* Buttons are glowing text, not filled boxes: "button { box-shadow:none !important }"
+     above, and an !important declaration overrides an animation - so the box-shadow
+     highlight is invisible on any button. #launchBtn also carries filter:none !important,
+     which rules out the drop-shadow variant too. Text-shadow is what actually shows,
+     and it is what lbDemo and btnPulse already use on the same element. */
+  @keyframes guideText {
+    0%   { text-shadow:0 0 8px var(--bglow), 0 0 18px var(--bglow); }
+    45%  { text-shadow:0 0 10px #faa61a, 0 0 26px #faa61a, 0 0 52px #faa61a; }
+    100% { text-shadow:0 0 8px var(--bglow), 0 0 18px var(--bglow); }
+  }
+  button.guidehl, a.btnlink.guidehl { animation:guideText 2s ease-in-out 1; }
   .bgwrap, .profwrap, .refwrap { position:relative; display:inline-flex; align-items:center; }
   .bgpop { position:absolute; top:calc(100% + 8px); right:0; z-index:150; display:none;
            flex-direction:column; gap:4px; min-width:150px; padding:8px; border-radius:12px;
@@ -5692,13 +7213,14 @@ PAGE = """<!doctype html>
     0%   { text-shadow:0 0 18px var(--acc), 0 0 38px var(--acc); }
     66%  { text-shadow:0 0 18px var(--acc), 0 0 38px var(--acc); }
     100% { text-shadow:0 0 8px var(--acc), 0 0 18px var(--acc); } }
-  #launchBtn.lbdemo { animation:lbDemo 3s linear forwards; }
+  #launchBtn.lbdemo, #launchTtsBtn.lbdemo { animation:lbDemo 3s linear forwards; }
   .alloclink { cursor:pointer; transition:text-shadow .14s; }
   .alloclink:hover { text-shadow:0 0 9px currentColor; }
   .gs-hlink { color: var(--acc); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; font-weight: 600; }
   .mand { display:inline-block; margin-left:8px; font-size:10px; font-weight:700; letter-spacing:.05em; color:var(--acc); background:rgba(181,243,32,.12);  border-radius:5px; padding:1px 6px; vertical-align:middle; text-transform:uppercase; }
   .gs-copy { color:var(--acc); cursor:pointer; text-decoration:underline; text-underline-offset:2px; font-weight:600; }
-  .copied-flash { outline:2px solid var(--acc); outline-offset:2px; border-radius:6px; }
+  /* the guide blocks pulse instead; an outline on top of that is two effects at once */
+  .copied-flash:not(.gcode) { outline:2px solid var(--acc); outline-offset:2px; border-radius:6px; }
   .hb { filter: blur(3.5px); cursor: pointer; }
   input.hb:focus { filter: none; } .hb.show { filter: none; } .pswrap .pshl .hb { pointer-events: auto; position: relative; z-index: 2; }
   /* VS Code style YAML editor */
@@ -5812,8 +7334,6 @@ PAGE = """<!doctype html>
   .set label { display:block; color:var(--dim); font-size:12px; margin:12px 0 4px; }
   h2 { font-size:15px; margin:20px 0 8px; }
   .hint { color:var(--dim); font-size:12px; }
-  .banner { background:#3a2a12;  color:var(--warn);
-            padding:8px 12px; border-radius:8px; margin:0 22px 8px; font-size:13px; display:none; }
   .logcardgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:10px; margin-top:10px; }
   .logcard { background:#12161d; box-shadow:0 0 14px -2px rgba(0,0,0,.8); border:none; border-radius:10px; padding:11px 13px; }
   a.btnlink { background:#242833; color:var(--txt); border:1px solid var(--edge); border-radius:8px;
@@ -5847,8 +7367,12 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 /* Terminal chrome, both views: a slim always-there bar (source + Adjust + Full window)
    and a floating settings panel the Adjust button toggles OVER the terminal - never
    pushing it. Full Window adds edge-to-edge and the idle hide on top of the same parts. */
-.tbar { display: flex; gap: 8px; align-items: center; margin-bottom: 6px; }
+.tbar { display: flex; gap: 8px; align-items: center; margin-bottom: 6px;
+            flex-wrap: wrap; row-gap: 4px; }
 .tbar .tail-src { margin: 0; flex: 1 1 auto; min-width: 0; }
+/* a narrow split pane has no room for four buttons in a row: let them wrap rather
+   than overlap, and never let one be squeezed to nothing */
+.tbar > button { flex: 0 0 auto; }
 .tchrome { position: relative; }
 .tpanel { display: none; position: absolute; top: 100%; left: auto; right: 0; z-index: 9;
           width: max-content; max-width: 100%; margin-top: 4px;
@@ -5861,6 +7385,10 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 .tmax .tchrome:not(.adjopen) .tbar .tail-src { visibility: hidden; }
 .tmax .splitgrid > div { position: relative; }
 .tmax .splitgrid .tchrome { z-index: 8; }
+/* In full window the RIGHT pane's controls move into the outer bar, which is where its
+   Adjust already went (#adjbtn-splitt is hidden). Both chromes are absolute at top:0, so
+   leaving them in the pane put them underneath the outer ones. */
+.tmax #tchrome-splitt .tbar > button { display: none; }
 .tmaxonly { display: none; }
 .tmax .tmaxonly { display: inline-block; }
 .tmax #adjbtn-splitt { display: none; }
@@ -5969,17 +7497,27 @@ body.tmaxidle #navfly { display: none; }
     color:var(--acc); text-shadow:0 0 10px var(--acc), 0 0 22px var(--acc); }
   nav button:hover, .subtabs button:hover { background:transparent !important; }
   /* ---- Launch: always lit, crackles on hover, throws longer arcs when pressed ---- */
-  #launchBtn { color:var(--acc); text-shadow:0 0 8px var(--acc), 0 0 18px var(--acc); letter-spacing:.4px; }
-  #launchBtn { position:relative; }
-  #launchBtn .alt { position:relative; z-index:1; }
+  /* BOTH launch buttons. Keyed on the id alone, the TTS one had no arc overlay and no
+     lit state - the rules simply never matched it. */
+  #launchBtn, #launchTtsBtn { color:var(--acc);
+                              text-shadow:0 0 8px var(--acc), 0 0 18px var(--acc);
+                              letter-spacing:.4px; position:relative; }
+  #launchBtn .alt, #launchTtsBtn .alt { position:relative; z-index:1; }
+  /* the crackle rides on the arc effect, which is off by default - so the lift on
+     hover is its own rule and always there */
+  #launchBtn:hover, #launchTtsBtn:hover {
+      text-shadow:0 0 6px var(--acc), 0 0 16px var(--acc), 0 0 30px var(--acc); }
+  #launchBtn:hover .alt, #launchTtsBtn:hover .alt { opacity:1; }
   #termBtn { position:relative; z-index:3; }   /* its glow stays whole under the arcs */
   .arcsvg { position:absolute; left:0; top:0; width:100%; height:100%;
             overflow:visible; pointer-events:none; z-index:2; }
   /* Working, not off: dim the letters so it reads as busy, but leave the arcs alight.
      Dimming the button dimmed everything drawn inside it, arcs included. */
-  #launchBtn:disabled { opacity:1; }
-  #launchBtn:disabled .alt { opacity:.4; }
-  #launchBtn.lbload .arcbolt, #launchBtn.lbrun .arcbolt {
+  #launchBtn.lbbusy, #launchTtsBtn.lbbusy { opacity:1; }
+  #launchBtn.lbbusy .alt, #launchTtsBtn.lbbusy .alt { opacity:.4; }
+  #launchBtn.lbbusy, #launchTtsBtn.lbbusy { cursor:default; }
+  #launchBtn.lbload .arcbolt, #launchBtn.lbrun .arcbolt,
+  #launchTtsBtn.lbload .arcbolt, #launchTtsBtn.lbrun .arcbolt {
             animation:none; opacity:1; stroke-width:2.2; filter:drop-shadow(0 0 7px #2ef2ff); }
   .arcbolt { pointer-events:none; fill:none; stroke:#2ef2ff; stroke-width:1.4; stroke-linecap:round;
              stroke-linejoin:round; filter:drop-shadow(0 0 4px #2ef2ff);
@@ -6001,7 +7539,8 @@ body.tmaxidle #navfly { display: none; }
 <header>
   <img src="/icon.ico?v=210" style="width:26px;height:26px;border-radius:6px" alt=""><h1 title="Pure awesomeness">PandorumLLM</h1><span class="ver" id="ver" data-act="verClick" role="button" tabindex="0"></span>
   <span id="fleet-dot" style="font-size:17px" title="fleet status: not running">⚫</span>
-  <button class="go" id="launchBtn" data-hostonly onclick="launchStack(this)"><span class="alt">L</span><span class="alt">a</span><span class="alt">u</span><span class="alt">n</span><span class="alt">c</span><span class="alt">h</span><svg class="arcsvg" xmlns="http://www.w3.org/2000/svg"></svg></button>
+  <button class="go" id="launchBtn" data-hostonly onclick="launchStack(this)"><span class="alt">L</span><span class="alt">a</span><span class="alt">u</span><span class="alt">n</span><span class="alt">c</span><span class="alt">h</span><span class="alt"> </span><span class="alt">L</span><span class="alt">L</span><span class="alt">M</span><svg class="arcsvg" xmlns="http://www.w3.org/2000/svg"></svg></button>
+  <button class="go" id="launchTtsBtn" data-hostonly onclick="launchTts(this)"><span class="alt">L</span><span class="alt">a</span><span class="alt">u</span><span class="alt">n</span><span class="alt">c</span><span class="alt">h</span><span class="alt"> </span><span class="alt">T</span><span class="alt">T</span><span class="alt">S</span><svg class="arcsvg" xmlns="http://www.w3.org/2000/svg"></svg></button>
   <button class="stop" id="stackBtn" data-hostonly data-act="stackToggle" title="Fleet server stack terminal"><svg viewBox="0 0 24 20" width="17" height="15" style="vertical-align:-3px"><rect x="1" y="1" width="22" height="18" rx="2.4" fill="#05070a"/><circle cx="19.4" cy="4.3" r="1.15" class="tlit"/><circle cx="15.8" cy="4.3" r="1.15" class="tlit"/><circle cx="12.2" cy="4.3" r="1.15" class="tlit"/><rect x="3.2" y="6.6" width="17.6" height="1.7" rx="0.85" class="tlit"/><path d="M4.4 10 8.4 12.9 4.4 15.8" fill="none" class="tlitstroke" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"/><text class="tglyph tlit" x="16.4" y="15.9" font-size="8.6" font-family="Consolas,monospace" text-anchor="middle">_</text></svg></button><button class="stop" id="termBtn" data-hostonly onclick="terminateAll(this)"><svg viewBox="0 0 16 16" width="14" height="14" style="vertical-align:-2px;margin-right:6px"><path fill="currentColor" fill-rule="evenodd" d="M3.2 1.3h9.6c1.05 0 1.9.85 1.9 1.9v9.6c0 1.05-.85 1.9-1.9 1.9H3.2c-1.05 0-1.9-.85-1.9-1.9V3.2c0-1.05.85-1.9 1.9-1.9Zm2.6 4.5v4.4h4.4V5.8H5.8Z"/></svg>Terminate</button>
   <button class="stop" data-hostonly onclick="exitPanel(this)">&#9211; Exit</button>
   <span style="margin-left:auto;display:flex;align-items:center;gap:24px">
@@ -6019,7 +7558,6 @@ body.tmaxidle #navfly { display: none; }
     </span>
   </span>
 </header>
-<div class="banner" id="banner">Panel is NOT elevated - launching/stopping elevated servers will fail. Start it via StartPandorumLLM (exe or bat).</div>
 <pre class="log resizable" id="stacklog" style="margin:0 22px 8px;display:none"></pre>
 <div class="wrap">
 <nav>
@@ -6083,7 +7621,7 @@ body.tmaxidle #navfly { display: none; }
       <button id="dsub-term" class="on" onclick="showDsub('term')">Dashboard</button>
       <button id="dsub-setup" onclick="showDsub('setup')">Proxy Setup</button>
       <button id="dsub-yaml" data-hostonly onclick="showDsub('yaml')">SkyrimNet YAML</button>
-      <button id="dsub-tts" data-hostonly onclick="showDsub('tts')">TTS [Alpha]</button>
+      <button id="dsub-tts" data-hostonly onclick="showDsub('tts')">TTS</button>
     </div>
     <div id="dpane-term">
       <div class="row" style="gap:8px;margin-bottom:10px">
@@ -6095,22 +7633,22 @@ body.tmaxidle #navfly { display: none; }
         <span class="bgwrap" id="bgwrap"><button class="stop" data-act="bgToggle" title="choose the terminal background">Terminal background color</button><span class="bgpop"><button class="stop bgopt" data-act="bgPick" data-v="0">Midnight</button><button class="stop bgopt" data-act="bgPick" data-v="1">Black</button></span></span>
       </div>
       <div id="tpane-proxy">
-      <div id="twrap-dashboard"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="dash-src"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="dashboard" id="tmaxbtn-dashboard">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="auto" id="termscale-auto-dashboard">Auto</button><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="manual" id="termscale-manual-dashboard">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="dashboard" id="tscalebtn-dashboard">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-dashboard" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-dashboard" data-fskind="dashboard" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-dashboard" data-fontkind="dashboard" class="tsel tfont"></select><span class="hint" id="termscale-msg-dashboard" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-dashboard"></pre></div></div>
+      <div id="twrap-dashboard"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="dash-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="dashboard" title="show or hide the time on every line">Timestamps</button><button class="stop" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="dashboard" id="tmaxbtn-dashboard">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="auto" id="termscale-auto-dashboard">Auto</button><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="manual" id="termscale-manual-dashboard">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="dashboard" id="tscalebtn-dashboard">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-dashboard" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-dashboard" data-fskind="dashboard" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-dashboard" data-fontkind="dashboard" class="tsel tfont"></select><span class="hint" id="termscale-msg-dashboard" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-dashboard"></pre></div></div>
       </div>
       <div id="tpane-think" style="display:none">
-    <div id="twrap-thinking"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="think-src"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="thinking" id="tmaxbtn-thinking">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="auto" id="termscale-auto-thinking">Auto</button><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="manual" id="termscale-manual-thinking">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="thinking" id="tscalebtn-thinking">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-thinking" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-thinking" data-fskind="thinking" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-thinking" data-fontkind="thinking" class="tsel tfont"></select><span class="hint" id="termscale-msg-thinking" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-thinking"></pre></div></div>
+    <div id="twrap-thinking"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="think-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="thinking" title="show or hide the time on every line">Timestamps</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="thinking" id="tmaxbtn-thinking">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="auto" id="termscale-auto-thinking">Auto</button><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="manual" id="termscale-manual-thinking">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="thinking" id="tscalebtn-thinking">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-thinking" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-thinking" data-fskind="thinking" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-thinking" data-fontkind="thinking" class="tsel tfont"></select><span class="hint" id="termscale-msg-thinking" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-thinking"></pre></div></div>
       </div>
       <div id="tpane-split" style="display:none">
     <div id="twrap-split">
-      <div class="tchrome"><div class="tbar" style="justify-content:flex-end"><button class="stop adjbtn tmaxonly" data-act="tmaxAdjust" data-tc="tchrome-splitt" title="font and size controls for the right terminal">Adjust</button><button class="stop" data-act="tailMax" data-kind="split" id="tmaxbtn-split">⛶ Full window</button></div></div>
+      <div class="tchrome"><div class="tbar" style="justify-content:flex-end"><button class="stop tmaxonly" data-act="termStamps" data-kind="splitt" title="show or hide the time on every line in the right terminal">Timestamps</button><button class="stop tmaxonly" id="splitins-t-max" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn tmaxonly" data-act="tmaxAdjust" data-tc="tchrome-splitt" title="font and size controls for the right terminal">Adjust</button><button class="stop" data-act="tailMax" data-kind="split" id="tmaxbtn-split">⛶ Full window</button></div></div>
       <div class="splitgrid" style="display:flex;gap:10px;align-items:stretch">
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="split-src-d"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="auto" id="termscale-auto-splitd">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="manual" id="termscale-manual-splitd">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitd" id="tscalebtn-splitd">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitd" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitd" data-fskind="splitd" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitd" data-fontkind="splitd" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitd" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitd"></pre></div></div>
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome" id="tchrome-splitt"><div class="tbar"><div class="hint tail-src" id="split-src-t"></div><span style="margin-left:auto"></span><button class="stop adjbtn" id="adjbtn-splitt" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="auto" id="termscale-auto-splitt">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="manual" id="termscale-manual-splitt">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitt" id="tscalebtn-splitt">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitt" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitt" data-fskind="splitt" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitt" data-fontkind="splitt" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitt" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitt"></pre></div></div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome"><div class="tbar"><select class="tsel" id="splitsel-d" data-act="splitFeed" data-side="d" title="which log this pane shows"></select><div class="hint tail-src" id="split-src-d"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="splitd" title="show or hide the time on every line">Timestamps</button><button class="stop" id="splitins-d" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="auto" id="termscale-auto-splitd">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="manual" id="termscale-manual-splitd">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitd" id="tscalebtn-splitd">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitd" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitd" data-fskind="splitd" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitd" data-fontkind="splitd" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitd" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitd"></pre></div></div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome" id="tchrome-splitt"><div class="tbar"><select class="tsel" id="splitsel-t" data-act="splitFeed" data-side="t" title="which log this pane shows"></select><div class="hint tail-src" id="split-src-t"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="splitt" title="show or hide the time on every line">Timestamps</button><button class="stop" id="splitins-t" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn" id="adjbtn-splitt" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="auto" id="termscale-auto-splitt">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="manual" id="termscale-manual-splitt">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitt" id="tscalebtn-splitt">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitt" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitt" data-fskind="splitt" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitt" data-fontkind="splitt" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitt" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitt"></pre></div></div>
       </div>
     </div>
       </div>
       <div id="tpane-tts" style="display:none">
-    <div id="twrap-tts"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="tts-src"></div><span style="margin-left:auto"></span><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="tts" id="tmaxbtn-tts">&#9210; Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="auto" id="termscale-auto-tts">Auto</button><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="manual" id="termscale-manual-tts">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="tts" id="tscalebtn-tts">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-tts" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-tts" data-fskind="tts" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-tts" data-fontkind="tts" class="tsel tfont"></select><span class="hint" id="termscale-msg-tts" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-tts"></pre></div></div>
+    <div id="twrap-tts"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="tts-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="tts" title="show or hide the time on every line">Timestamps</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="tts" id="tmaxbtn-tts">&#9210; Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="auto" id="termscale-auto-tts">Auto</button><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="manual" id="termscale-manual-tts">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="tts" id="tscalebtn-tts">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-tts" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-tts" data-fskind="tts" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-tts" data-fontkind="tts" class="tsel tfont"></select><span class="hint" id="termscale-msg-tts" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-tts"></pre></div></div>
       </div>
     </div>
     <div id="dpane-setup" style="display:none"></div>
@@ -6151,6 +7689,7 @@ function reportable(m) {
 window.addEventListener("error", function(e) { if (!reportable(e.message)) return; try { fetch("/api/client-error", { method: "POST", body: JSON.stringify({ msg: String(e.message || e.type), src: String(e.filename || ""), line: e.lineno || 0 }) }); } catch (x) {} });
 window.addEventListener("unhandledrejection", function(e) { if (!reportable(e.reason)) return; try { fetch("/api/client-error", { method: "POST", body: JSON.stringify({ msg: "unhandledrejection: " + String(e.reason) }) }); } catch (x) {} });
 const ICO = {
+  copy: '<svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" style="vertical-align:-1px"><rect x="5.6" y="5.6" width="8.2" height="8.8" rx="1.6"/><path d="M10.4 5.6V3.6A1.6 1.6 0 0 0 8.8 2H3.8A1.6 1.6 0 0 0 2.2 3.6v7A1.6 1.6 0 0 0 3.8 12h1.8"/></svg>',
   drive: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" style="vertical-align:-2px;flex:none"><rect x="3" y="5" width="18" height="14" rx="2" stroke="currentColor" stroke-width="1.7"/><circle cx="17" cy="12" r="1.3" fill="currentColor"/><path d="M6 9h6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"/></svg>',
   folder: '<svg width="15" height="15" viewBox="0 0 24 24" fill="currentColor" style="vertical-align:-2px;flex:none"><path d="M10 4H4a2 2 0 0 0-2 2v12a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-8l-2-2z"/></svg>',
   file: '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" style="vertical-align:-2px;flex:none"><path d="M6 2h8l4 4v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2z" stroke="currentColor" stroke-width="1.6"/><path d="M14 2v5h5" stroke="currentColor" stroke-width="1.6"/></svg>',
@@ -6225,17 +7764,21 @@ function permTreeHtml() {
                      "Save, load and delete profiles (files in profiles\\)",
                      "Provider Statistics, and turning monitoring on or off",
                      "TTS setup, writing its launcher, starting and stopping its server",
+                     "One-click Higgs install: fetches audio.cpp and a model from the internet",
+                     "Checking for a newer audio.cpp (asks github.com only when pressed)",
                      "Main Guide setup flow"];
   const remoteItems = ["View all terminals (Proxy / Thinking / Split / TTS)",
                        "Full-window, wrap, background colour",
                        "Live Network graph & fleet status",
                        "Providers and their allocation, read-only",
                        "Read-only - changes nothing on the host",
-                       "Proxy Setup, SkyrimNet YAML, TTS [Alpha] and Provider Statistics are not offered",
+                       "Proxy Setup, SkyrimNet YAML, TTS and Provider Statistics are not offered",
                        "IP / GPU / yaml panels are hidden entirely",
-                       "Any IPs, paths, GPU IDs & filenames are stripped",
+                       "Any IPs and file paths are masked before being sent",
+                       "Terminal TEXT is not: dialogue, reasoning and character names show",
                        "The statistics endpoint is not answered at all"];
-  let svg = '<svg viewBox="0 0 1180 620" width="100%" style="max-width:1180px;background:#0d0e10;border:none;border-radius:12px">';
+  // 650 tall: the host column is the longest and its last line sits at y=612
+  let svg = '<svg viewBox="0 0 1180 650" width="100%" style="max-width:1180px;background:#0d0e10;border:none;border-radius:12px">';
   // root
   svg += node(470, 20, 240, 56, "#6b7280", "Incoming request", "which machine is it from?");
   // connectors
@@ -6361,7 +7904,7 @@ function showSub(s) {
 // ITEM 12: User Guide holds the step-by-step guide and the sampler reference
 function showUgSub(s) {
   curUgSub = s;
-  ["main", "params", "tts"].forEach(x => {          // one list, so a fourth guide is one entry
+  ["main", "params", "tts"].forEach(x => {          // one list, so another guide is one entry
     const p = $("ugpane-" + x), b = $("ugsub-" + x);
     if (p) p.style.display = x === s ? "" : "none";
     if (b) b.classList.toggle("on", x === s);
@@ -6373,7 +7916,15 @@ function showUgSub(s) {
 // generic click-to-copy for a code span, so a URL can be copied without the app
 // ever making an outbound request of its own
 function copyCode(el) {
-  const t = (el && el.textContent) || "";
+  // textContent would include the icon's own node; take only the text that is the point
+  let t = "";
+  if (el) {
+    el.childNodes.forEach(n => {
+      if (n.nodeType === 3) t += n.nodeValue;
+      else if (!(n.classList && n.classList.contains("gcopy"))) t += n.textContent || "";
+    });
+    t = t.trim() || el.textContent || "";
+  }
   const flash = () => { el.classList.add("copied-flash"); setTimeout(() => el.classList.remove("copied-flash"), 1000); };
   if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(t).then(flash, flash);
   else flash();
@@ -6721,7 +8272,6 @@ function paintChrome() {
   const bi = state.build || {};
   $("ver").title = bi.path ? (bi.path + String.fromCharCode(10) + "build " + bi.sha
       + "  -  " + bi.kb + " KB  -  modified " + bi.mtime) : "";
-  $("banner").style.display = state.elevated ? "none" : "block";
   const hp = $("hdr-prof");
   if (hp && !window.__profOpen) { const nh = profRow(); if (hp.innerHTML !== nh) hp.innerHTML = nh; }
 }
@@ -7320,11 +8870,291 @@ function syncTextScalingButtons() {
 let __termResizeT;
 window.addEventListener("resize", function() { clearTimeout(__termResizeT); __termResizeT = setTimeout(applyTermScale, 150); });
 window.addEventListener("resize", function() { if (curTab === "network") setTimeout(drawNetLines, 120); });
-function paintTail(which, text, elOv) {
+/* ---------- terminal display toggles ---------- */
+// which pane may splice. splitd/splitt are panes, not feeds - each can be set to
+// the proxy, and syncSplitUI hides the button when it is not.
+const TERM_INS_KINDS = ["dashboard", "splitd", "splitt"];
+let lastTtsTail = "";
+// per terminal: one pane hiding the time should not silence the other
+function stampsOffList() {
+  return String(((state && state.settings) || {}).termStampsOff || "")
+         .split(",").map(s => s.trim()).filter(Boolean);
+}
+function termStampsOn(which) {
+  if (!which) return true;
+  return stampsOffList().indexOf(which) < 0;
+}
+function termInsTtsOn() {
+  return String(((state && state.settings) || {}).termInsTts || "off").toLowerCase() === "on";
+}
+async function termToggle(key, onValue, offValue) {
+  const st = (state && state.settings) || {};
+  const now = String(st[key] || offValue).toLowerCase() === onValue ? offValue : onValue;
+  if (state && state.settings) state.settings[key] = now;
+  const body = {}; body[key] = now;
+  await post("/api/settings", body);
+  await load();
+  syncTermToggleUI();
+  refreshCurTerm();
+}
+async function termStampsToggle(which) {
+  const off = stampsOffList();
+  const at = off.indexOf(which);
+  if (at >= 0) off.splice(at, 1); else off.push(which);
+  const now = off.join(",");
+  if (state && state.settings) state.settings.termStampsOff = now;
+  await post("/api/settings", { termStampsOff: now });
+  await load();
+  syncTermToggleUI();
+  refreshCurTerm();
+}
+// the buttons are shared markup, so the lit state is applied rather than rendered
+function syncTermToggleUI() {
+  document.querySelectorAll('[data-act="termStamps"]').forEach(b =>
+    b.classList.toggle("on", termStampsOn(b.dataset.kind || "")));
+  document.querySelectorAll('[data-act="termInsTts"]').forEach(b =>
+    b.classList.toggle("on", termInsTtsOn()));
+}
+// [20:45:12.86] at the start of a line, and nowhere else
+const TSTAMP_RX = /^\\[\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?\\]\\s?/;
+function stripStamps(text) {
+  const NL = String.fromCharCode(10);
+  return String(text).split(NL).map(l => l.replace(TSTAMP_RX, "")).join(NL);
+}
+// A spoken line is identified by the WAVE markers around what was said, not by the
+// leading icon - that now varies with the mood the line asks for.
+const SAID = String.fromCharCode(12336) + String.fromCharCode(65039);
+const BOLT = String.fromCodePoint(9889);
+// a channel tree hanging off the completion above, as Discord draws one
+const TREE_MID = String.fromCodePoint(9500) + String.fromCodePoint(9472);   // |-
+const TREE_END = String.fromCodePoint(9492) + String.fromCodePoint(9472);   // L-
+const TREE_PAD = "   ";                          // sits in from the parent row
+// a player line is the user speaking, not something a reply produced, so it hangs
+// off nothing and gets a plain marker instead of a branch
+// the same indent as a branch, so a player line starts where an NPC line does
+const LONE_MARK = TREE_PAD + String.fromCodePoint(10148);
+// [23:26:34.67] -> seconds past midnight, so two logs can be lined up
+function stampSecs(line) {
+  const m = String(line).match(/^\\[(\\d{2}):(\\d{2}):(\\d{2})(?:\\.(\\d+))?\\]/);
+  if (!m) return null;
+  return (+m[1]) * 3600 + (+m[2]) * 60 + (+m[3]) + (m[4] ? ("0." + m[4]) * 1 : 0);
+}
+// Every spoken line in the TTS log, with when it was said and how fast it came out.
+function ttsSpokenLines() {
+  const NL = String.fromCharCode(10);
+  const lines = String(lastTtsTail || "").split(NL);
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].indexOf(SAID) < 0) continue;
+    const at = stampSecs(lines[i]);
+    let rt = "";
+    for (let j = i + 1; j < lines.length && j < i + 12; j++) {
+      if (lines[j].indexOf(SAID) >= 0) break;         // the next request started
+      const m = lines[j].match(/([0-9.]+)x realtime/);
+      if (m) { rt = m[1]; break; }
+    }
+    const raw = lines[i].trim();
+    const sm = raw.match(TSTAMP_RX);
+    out.push({ at: at,
+               stamp: sm ? sm[0].trim() : "",
+               who: ((raw.match(/[^ ]+:/g) || []).slice(-1)[0] || "").replace(":", ""),
+               body: (sm ? raw.slice(sm[0].length) : raw).replace(/^\\s+/, "")
+                     + (rt ? ("  (" + BOLT + " " + rt + "x)") : "") });
+  }
+  return out;
+}
+// A completion line: it carries token and rate columns and ends in seconds.
+function isCompletion(l) {
+  return l.indexOf(" tok ") > 0 && l.indexOf(" tps ") > 0 && l.indexOf("sec") > 0;
+}
+// Place each spoken line beside the completion it belongs to.
+//
+// Two things measured from real logs. A spoken line lands 0.2-0.5s BEFORE its dialogue
+// completion, because SkyrimNet fires TTS on the final token and llama.cpp writes its
+// timing line a moment later. And a streamed reply produces SEVERAL spoken lines a
+// second or so apart - matching each one on its own time scattered them among the Meta
+// and Vision calls that landed in between. So group them into bursts first and attach
+// the whole burst where its first line belongs.
+// A turn's chunks share a SPEAKER as well as being close together. Grouping on the gap
+// alone merged the player's own line with the reply that followed it 3.7s later, which
+// is a different event entirely - so require both.
+const TTS_BURST_GAP = 6.0;
+const TTS_NEAR_DLG = 3.0;       // and a burst starts within this of its completion
+
+function ttsBursts() {
+  const said = ttsSpokenLines().filter(s => s.at !== null).sort((a, b) => a.at - b.at);
+  const out = [];
+  said.forEach(s => {
+    const last = out.length ? out[out.length - 1] : null;
+    const near = last && s.at - last.at[last.at.length - 1] <= TTS_BURST_GAP;
+    if (near && last.who === s.who) {
+      last.said.push(s);
+      last.at.push(s.at);
+    } else {
+      out.push({ said: [s], at: [s.at], who: s.who });
+    }
+  });
+  return out;
+}
+
+function spliceTts(text) {
+  const NL = String.fromCharCode(10);
+  const bursts = ttsBursts();
+  if (!bursts.length) return text;
+  const lines = String(text).split(NL);
+  const spots = [];
+  for (let i = 0; i < lines.length; i++) {
+    const at = stampSecs(lines[i]);
+    if (at !== null) spots.push({ i: i, at: at, dlg: /dialogue/i.test(lines[i]) });
+  }
+  if (!spots.length) return text;
+  const groups = new Map();
+  bursts.forEach(b => {
+    const first = b.at[0];
+    let target = null, bestGap = TTS_NEAR_DLG, anchored = false;
+    for (const sp of spots) {              // the dialogue completion nearest its start
+      if (!sp.dlg) continue;
+      const gap = Math.abs(sp.at - first);
+      if (gap <= bestGap) { bestGap = gap; target = sp.i; anchored = true; }
+    }
+    if (target === null) {                 // no reply nearby: place it in time order
+      for (const sp of spots) {
+        if (sp.at <= first) target = sp.i; else break;
+      }
+    }
+    if (target === null) return;           // it predates the visible window
+    if (!groups.has(target)) groups.set(target, []);
+    // a branch when it hangs off a reply; a plain arrow when it hangs off nothing
+    const drawn = b.said.map((s, k) => {
+      const mark = anchored
+        ? TREE_PAD + ((k === b.said.length - 1) ? TREE_END : TREE_MID)
+        : LONE_MARK;
+      return (s.stamp ? s.stamp + " " : "") + mark + " " + s.body;
+    });
+    groups.get(target).push(...drawn);
+  });
+  [...groups.keys()].sort((a, b) => b - a).forEach(at =>
+    lines.splice(at + 1, 0, ...groups.get(at)));
+  return lines.join(NL);
+}
+
+/* One spoken line, painted: magenta speaker, gold dialogue, cyan tags between white
+   stars. Shared, so a line spliced into the proxy terminal looks the same as it does
+   in the TTS terminal - it used to arrive there unpainted. */
+// Columns a string occupies in the terminal: an astral character (every emoji here) is
+// two cells wide, so counting JS characters would under-measure the indent.
+// A spoken line is rendered as a block so it can hang-indent when it wraps, and a block
+// ends its own line - adding a newline after it too would leave a blank row.
+function joinLines(lines, fn) {
+  const NL = String.fromCharCode(10);
+  const out = [];
+  lines.forEach(function(line, i) {
+    const html = fn(line);
+    out.push(html);
+    const isBlock = html.slice(0, 20).indexOf("display:block") >= 0;
+    if (!isBlock && i < lines.length - 1) out.push(NL);
+  });
+  return out.join("");
+}
+
+function termCols(s) {
+  let n = 0;
+  for (const ch of String(s)) n += (ch.codePointAt(0) > 0xFFFF ? 2 : 1);
+  return n;
+}
+function paintSpoken(line) {
+  const WAVE = String.fromCharCode(12336) + String.fromCharCode(65039);
+  // everything before what was said: stamp, branch, icon, speaker. A wrapped line hangs
+  // under that rather than starting back at the tree column and cutting through it.
+  const upto = line.indexOf(WAVE);
+  const indent = upto > 0 ? termCols(line.slice(0, upto)) : 0;
+  // LITERALS, not new RegExp("..."): the PAGE string and the JS string literal each
+  // eat a backslash, so a quoted "\\*" would arrive as a bare quantifier
+  const tagRx = /\\*([^*]{1,24})\\*|\\[pause [0-9.]+s\\]/g;
+  const MK = String.fromCodePoint(127917);           // the mask starts a spoken line
+  const CY = "#2ef2ff", WH = "#ffffff", MAG = "#ff5dc8", SAY = "#f2c14e";   // gold
+  const tint = (c, s, b) => '<span style="color:' + c + (b ? ";font-weight:600" : "") + '">'
+                          + esc(s) + '</span>';
+  const marked = (s, base) => {
+    const plain = (x) => (base ? tint(base, x, false) : esc(x));
+    let out = "", last = 0, m;
+    tagRx.lastIndex = 0;
+    while ((m = tagRx.exec(s)) !== null) {
+      out += plain(s.slice(last, m.index));
+      out += (m[1] === undefined)
+           ? tint(CY, m[0], true)                          // [pause 2.5s], MOSS's own
+           : tint(WH, "*", true) + tint(CY, m[1], true) + tint(WH, "*", true);
+      last = m.index + m[0].length;
+    }
+    return out + plain(s.slice(last));
+  };
+  // an inserted line carries a tree glyph; paint it accent with a glow and keep the
+  // rest of the line as it is
+  const G_MID = String.fromCodePoint(9500), G_END = String.fromCodePoint(9492);
+  const G_LONE = String.fromCodePoint(10148);
+  const GLOW = "color:var(--acc);font-weight:700;text-shadow:0 0 4px var(--acc),0 0 10px var(--acc),0 0 20px var(--acc)";
+  let pre = "";
+  const gi = line.search(new RegExp("[" + G_MID + G_END + G_LONE + "]"));
+  if (gi >= 0) {
+    const ch = line.charAt(gi);
+    if (ch === G_LONE) {                                   // hangs off nothing
+      // 2ch wide, matching the drawn branch, so both start in the same column
+      pre = esc(line.slice(0, gi))
+          + '<span style="' + GLOW + ';display:inline-block;width:2ch">'
+          + esc(ch) + '</span>';
+      line = line.slice(gi + 1);
+    } else {
+      // DRAWN, not typed: a stretched glyph overlapped the row below and the glow
+      // doubled up where they met
+      pre = esc(line.slice(0, gi))
+          + '<span class="' + (ch === G_END ? "tbrend" : "tbr") + '"></span>';
+      line = line.slice(gi + 2);
+    }
+  }
+  const a = line.indexOf(WAVE), b = line.lastIndexOf(WAVE);
+  if (a < 0 || b <= a) return pre + marked(line, null);    // not a spoken line
+  const head = line.slice(0, a), said = line.slice(a + WAVE.length, b);
+  // the speaker is between the mask and the FIRST colon after it. Matching on the last
+  // colon instead swallowed the timestamp, which is full of them.
+  // The icon now varies with the mood, so the speaker is read structurally instead:
+  // the head is "<icon> Name: ", so it is the first token, then the name to the colon.
+  let lead = esc(head);
+  const bare = head.replace(/^\\s+/, "");
+  const off = head.length - bare.length;
+  const sp = bare.indexOf(" "), c = bare.indexOf(":");
+  if (sp > 0 && c > sp) {
+    // a fixed cell for the icon: emoji widths differ between faces, so without this the
+    // names below each other do not line up
+    lead = esc(head.slice(0, off))
+         + '<span style="display:inline-block;width:2ch;text-align:center">'
+         + esc(bare.slice(0, sp)) + '</span>' + esc(" ")
+         + tint(MAG, bare.slice(sp + 1, c).trim(), true)
+         + esc(": ");
+  }
+  const body = pre + lead + esc(WAVE) + marked(said, SAY) + esc(WAVE)
+             + esc(line.slice(b + WAVE.length));
+  return '<span style="display:block;padding-left:' + indent + 'ch;text-indent:-'
+       + indent + 'ch">' + body + '</span>';
+}
+
+// `which` is the FEED being shown; `pane` is the terminal it is shown IN. In split view
+// they differ - the left pane may be showing the proxy feed - and a per-terminal setting
+// has to follow the pane, not the feed, or the button toggles something else.
+function paintTail(which, text, elOv, pane) {
   const el = elOv || $("tail-" + which);
   if (!el) return;
+  const who = pane || which;
+  // splice FIRST: it places lines by timestamp, so stripping them first left it
+  // nothing to match on and the insertions silently vanished
+  if (termInsTtsOn() && TERM_INS_KINDS.indexOf(which) >= 0) text = spliceTts(text);
+  if (!termStampsOn(who)) text = stripStamps(text);
   sizeTailEl(el, text);
   if (which === "thinking") { paintThink(el, text); return; }
+  if (which === "tts") {
+    const NLT = String.fromCharCode(10);
+    el.innerHTML = joinLines(String(text).split(NLT), paintSpoken);
+    return;
+  }
   if (which !== "dashboard") { el.textContent = text; return; }
   const NL = String.fromCharCode(10);
   const numRx = new RegExp("^[0-9][0-9.,]*(ms)?$");
@@ -7335,7 +9165,8 @@ function paintTail(which, text, elOv) {
   const names = new Set((state && state.routing || []).flatMap(s => (s.providers || []).map(p => p.title)).filter(Boolean));
   const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
   const keep = el.scrollTop;
-  el.innerHTML = String(text).split(NL).map(line => {
+  el.innerHTML = joinLines(String(text).split(NL), line => {
+    if (line.indexOf(SAID) >= 0) return paintSpoken(line);   // an inserted spoken line
     if (errRx.test(line)) return '<span style="color:var(--err)">' + esc(line) + '</span>';
     return line.split(new RegExp("( +)")).map(tk => {
       if (!tk || tk.indexOf(" ") >= 0) return esc(tk);
@@ -7354,7 +9185,7 @@ function paintTail(which, text, elOv) {
       if (names.has(tk)) return '<span style="color:' + dashColor(tk) + '">' + esc(tk) + '</span>';
       return '<span style="color:#e8ecf2">' + esc(tk) + '</span>';
     }).join("");
-  }).join(NL);
+  });
   el.classList.toggle("blackbg", !!window.__termBlack);
   el.scrollTop = stick ? el.scrollHeight : keep;
 }
@@ -7448,6 +9279,13 @@ function helperGo(page, sel) {
 function launchDemo() {
   const lb = $("launchBtn");
   if (!lb) return;
+  // With the lightning switched off the step had nothing to point at: helperGo is
+  // called without a selector here because the arc was meant to do the pointing. Fall
+  // back to the guide's own highlight, the same one every other step uses.
+  if (state && state.settings && state.settings.launchArc === false) {
+    flashTargets("#launchBtn");
+    return;
+  }
   lb.classList.remove("lbdemo");
   void lb.getBoundingClientRect();
   lb.classList.add("lbdemo");
@@ -7749,6 +9587,7 @@ function renderCustom() {
   const cur = (state && state.settings && state.settings.themeName) || "OpenRouter";
   const VAR_LABELS = { bg: "background", card: "cards", edge: "borders", txt: "text", dim: "secondary text", acc: "accent (Launch)", ok: "success / stats", warn: "warnings", err: "errors", selglow: "dropdown menu glow" };
   const mine = (state && state.settings && state.settings.customThemes) || {};
+  const arcOn = !(state && state.settings && state.settings.launchArc === false);
   const card = function(name, v, own) {
     return '<div class="card themecard' + (name === cur ? " on" : "") + '" data-act="themePick" data-name="' + esc(name) + '" style="width:150px;cursor:pointer;padding:8px;position:relative">'
       + '<div style="background:' + v.bg + ';border:1px solid ' + v.edge + ';border-radius:8px;height:46px;padding:7px">'
@@ -7769,7 +9608,14 @@ function renderCustom() {
     + '<div class="row" style="flex-wrap:wrap;gap:12px;margin-top:12px">' + cards + '</div></div>'
     + '<div class="card" style="margin-top:14px"><div class="row"><b>Custom Colors</b>'
     + '<button class="stop" data-act="themeSave" title="store the colours below as a preset of your own">Save as preset</button></div>'
-    + pickers + '</div>';
+    + pickers + '</div>'
+    + '<div class="card" style="margin-top:14px"><div class="row"><b>Effects</b></div>'
+    + '<div class="row" style="gap:10px;align-items:center;margin-top:8px">'
+    + swToggle(arcOn, 'data-act="launchArcToggle" title="the lightning that plays across the Launch button"',
+               "Lightning on the Launch button")
+    + '</div>'
+    + '<div class="hint" style="margin-top:6px;line-height:1.6">With this off the Launch button still '
+    + 'changes colour and still shows the running count - only the animation stops.</div></div>';
 }
 // each folder that has something checkable, and where to say so
 const PATH_CHECKS = [["llamacppPath", "llchk"], ["modelsDir", "mdlchk"], ["launcherDir", "lnchk"]];
@@ -7866,6 +9712,7 @@ function fleetWatch() {
       }
     }
   }
+  syncTtsButton();
   const lb = $("launchBtn");
   if (lb) {
     let lbs;
@@ -7890,11 +9737,12 @@ function fleetWatch() {
       if (window.__lbState !== lbs) { clearInterval(window.__runArc); window.__runArc = null; }
       const wasState = window.__lbState;
       window.__lbState = lbs;
-      if (lbs === "term") { lb.disabled = true; lb.innerHTML = arcLabel("Shutting down..."); }
-      else if (lbs === "run") { lb.disabled = true; lb.innerHTML = arcLabel("Running..." + tally); }
-      else if (lbs === "launching") { lb.disabled = true; lb.innerHTML = arcLabel("Launching..." + tally); }
-      else { lb.disabled = false; lb.innerHTML = arcLabel("Launch"); }
-      lb.classList.remove("lbload", "lbrun");
+      if (lbs === "term") { lb.innerHTML = arcLabel("Shutting down..."); }
+      else if (lbs === "run") { lb.innerHTML = arcLabel("Running..." + tally); }
+      else if (lbs === "launching") { lb.innerHTML = arcLabel("Launching..." + tally); }
+      else { lb.innerHTML = arcLabel("Launch LLM"); }
+      lb.classList.remove("lbload", "lbrun", "lbbusy");
+    if (lbs !== "idle") lb.classList.add("lbbusy");    // not disabled: that kills hover
       if (wasState === lbs && window.__runArc) { /* only the count moved: leave the arcs */ }
       else if (lbs === "launching" || lbs === "term") {
         lb.classList.add("lbload");               // coming up: full strength while it works
@@ -8055,6 +9903,12 @@ async function profSel(sel) {
 }
 async function refreshTail(which) {
   const r = await post("/api/tail", { kind: which });
+  if (termInsTtsOn() && TERM_INS_KINDS.indexOf(which) >= 0) {
+    try {                                   // the spoken line lives in the other log
+      const tr = await post("/api/tail", { kind: "tts" });
+      lastTtsTail = (tr && tr.text) || "";
+    } catch (e) { /* leave the previous one */ }
+  }
   const pre = $("tail-" + which), src = $(which === "dashboard" ? "dash-src" : which === "tts" ? "tts-src" : "think-src");
   if (!pre) return;
   const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
@@ -8065,28 +9919,180 @@ async function refreshTail(which) {
   if (stick) pre.scrollTop = pre.scrollHeight;
 }
 
-/* ---------- TTS [Alpha] ---------- */
+/* ---------- TTS ---------- */
 let ttsBusy = "";        // "" | "start" | "stop"
-const TTS_FIELDS = [
-  ["ttsServerExe", "TTS Server Binary (moss-tts-server.exe)", [".exe"]],
-  ["ttsModel", "TTS Model (.gguf)", [".gguf"]],
-  ["ttsServerPort", "TTS Server Port", null],
-  ["ttsPython", "Python Executable (the venv that runs the wrapper)", [".exe"]],
-  ["ttsWrapper", "Wrapper Script (.py)", [".py"]],
-  ["ttsWrapperPort", "Wrapper Port (point the SkyrimNet TTS endpoint here)", null]
-];
+const TTS_FIELDSETS = {
+  moss: [
+    ["ttsServerExe", "TTS Server Binary (moss-tts-server.exe)", [".exe"]],
+    ["ttsModel", "TTS Model (.gguf)", [".gguf"]],
+    ["ttsServerPort", "TTS Server Port", null],
+    ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
+    ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
+    ["ttsPython", "Python Executable (the venv that runs the wrapper)", [".exe"]],
+    ["ttsWrapper", "Wrapper Script (.py)", [".py"]],
+    ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null]
+  ],
+  audiocpp: [
+    ["ttsAcppDir", "audio.cpp Folder (the panel finds audiocpp_server.exe inside)", "folder"],
+    ["ttsAcppModelsDir", "TTS Models Folder (scanned for .gguf and safetensors)", "folder"],
+    ["ttsAcppModelId", "Model Id (the name used in requests)", null],
+    ["ttsAcppRefSlots", "Cached Voices (how many speakers stay encoded; raise it if you use many)", null],
+    ["ttsServerPort", "Server Port", null],
+    ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
+    ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
+    ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null]
+  ]
+};
+function ttsFields() {
+  return TTS_FIELDSETS[String((state && state.settings && state.settings.ttsEngine) || "moss")]
+      || TTS_FIELDSETS.moss;
+}
 const TTS_STEPS = [
   ["Get the pieces", "You need <b>moss-tts-server.exe</b> and a MOSS GGUF model. The panel supplies neither - it starts them and talks to them, but it does not ship or download them."],
   ["Set the log folder", "<b>Folder Settings</b> - only the log folder matters here. Everything else on that page belongs to the LLM fleet."],
-  ["Point at the binary and the model", "<b>Proxy</b> then <b>TTS [Alpha]</b>. Fill in <b>TTS Server Binary</b> and <b>TTS Model</b>. Paste the paths, use <b>Choose file</b>, or - if you already run a working TTS launcher - press <b>Import from a launcher</b> and it reads them straight out of it."],
+  ["Point at the binary and the model", "<b>Proxy</b> then <b>TTS</b>. Fill in <b>TTS Server Binary</b> and <b>TTS Model</b>. Paste the paths, use <b>Choose file</b>, or - if you already run a working TTS launcher - press <b>Import from a launcher</b> and it reads them straight out of it."],
   ["Pick the GPU", "Leave it blank and every visible card is offered to the server. Pick one and it is pinned by its UUID, so a reboot or a reseated card cannot move it onto a different GPU."],
   ["Choose who translates", "Set <b>Who translates for SkyrimNet</b> to <b>The panel</b>. It takes the wrapper port straight away and the line underneath says whether that succeeded. If it did not, something else is already on that port - usually a wrapper of your own still running."],
   ["Start the server", "Press <b>Start TTS</b> and wait for <b>ready</b>. The model takes a few seconds to load and the server does not answer until it has, so the button reads <b>Launching</b> in the meantime."],
   ["Point SkyrimNet at the panel", "In SkyrimNet: <b>Voice</b> then <b>Text-to-Speech</b>, engine <b>Zonos</b>, and set the endpoint to this machine on the wrapper port."],
   ["Test it", "Press SkyrimNet's own <b>Test</b> button. The line appears in <b>Proxy</b> then <b>TTS Terminal</b> within a second or two, with its timings."]
 ];
+let curTtsGuide = "higgs";
+function showTtsGuide(k) {
+  curTtsGuide = k;
+  ["higgs", "moss"].forEach(x => {
+    const p = $("tgpane-" + x), b = $("tgsub-" + x);
+    if (p) p.style.display = x === k ? "" : "none";
+    if (b) b.classList.toggle("on", x === k);
+  });
+}
 function renderTtsGuide() {
   const pane = $("ugpane-tts");
+  if (!pane) return;
+  pane.innerHTML =
+      '<div class="subtabs" style="margin-bottom:14px">'
+    + '<button id="tgsub-higgs" onclick="showTtsGuide(' + String.fromCharCode(39) + 'higgs'
+    + String.fromCharCode(39) + ')">Higgs v3</button>'
+    + '<button id="tgsub-moss" onclick="showTtsGuide(' + String.fromCharCode(39) + 'moss'
+    + String.fromCharCode(39) + ')">MOSS-TTS</button></div>'
+    + '<div id="tgpane-higgs"></div><div id="tgpane-moss" style="display:none"></div>';
+  renderHiggsGuide();
+  renderMossGuide();
+  showTtsGuide(curTtsGuide);
+}
+
+function hgStep(n, title, body) {
+  return '<div class="card" style="margin-bottom:12px"><div class="row" style="gap:10px;align-items:baseline">'
+       + '<b style="font-size:1.15em">' + n + '</b><b>' + title + '</b></div>'
+       + '<div class="hint" style="margin-top:8px;line-height:1.75">' + body + '</div></div>';
+}
+function hgCode(s) {
+  return '<div class="gcode" onclick="copyCode(this)" title="click to copy">'
+       + '<span class="gcopy">' + ICO.copy + '</span>' + esc(s) + '</div>';
+}
+function renderHiggsGuide() {
+  const pane = $("tgpane-higgs");
+  if (!pane) return;
+  const BS = String.fromCharCode(92);            // a backslash, built rather than escaped
+  const mroot = "C:" + BS + "PandorumLLM" + BS + "Models" + BS + "TTS";
+  const root = mroot + BS + "Higgs-v3-4b";
+  pane.innerHTML =
+      '<div class="card"><div class="row"><b style="font-size:1.25em">Higgs Audio v3 TTS (4B)</b></div>'
+    + '<div class="hint" style="margin-top:8px;line-height:1.75">'
+    + 'Expressive speech with zero-shot voice cloning, run by <b>audio.cpp</b> - one binary, no '
+    + 'python and no virtual environment. The panel starts it, pins it to a card and translates '
+    + 'for SkyrimNet, so nothing changes on the SkyrimNet side beyond the endpoint.<br><br>'
+    + '<b>Licence:</b> the Higgs weights are research / non-commercial, with a Creator Use Grant '
+    + 'for monetised creator content if you credit Boson AI. Cloning a voice without the '
+    + 'speaker&#39;s consent is not permitted. audio.cpp itself is Apache-2.0.</div></div>'
+
+    + hgStep("1", "Get audio.cpp - no compiler needed",
+        'Download the Windows prebuilt binaries. Take <b>two</b> archives and unzip them into '
+        + '<b>the same folder</b>:<br><br>'
+        + '&bull; <b>audiocpp-windows-cuda-runtime.zip</b> - the shared CUDA libraries<br>'
+        + '&bull; <b>audiocpp-windows-cuda-balance.zip</b> - the AVX2 build, right for almost every PC'
+        + hgCode("https://github.com/0xShug0/audio.cpp/releases")
+        + 'Needs an NVIDIA card of <b>compute capability 7.5 or newer</b> - that is RTX 20 series '
+        + 'and up - and <b>driver 580 or newer</b>. No CUDA Toolkit, no Visual Studio.<br><br>'
+        + 'GTX 10 series and older are not covered by these packages; they need a CPU package or a '
+        + 'build against an older CUDA Toolkit. Use the <b>portable</b> CPU archive if your processor '
+        + 'is old or you are unsure, and <b>fast</b> only on a recent high-end one.')
+
+    + hgStep("2", "Download a model",
+        'Two builds are published. Both are a single file - put them in one folder so the panel '
+        + 'can list them together.'
+        + hgCode('New-Item -ItemType Directory -Force "' + root + '"')
+        + '<b>Q8_0 - 5.1 GB - start here.</b> Close to full precision by ear, and the build audio.cpp '
+        + 'validated Higgs against.'
+        + hgCode('hf download audio-cpp/audio.cpp-gguf '
+                 + '--include "Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf" '
+                 + '--local-dir "' + root + '"')
+        + '<b>BF16 - 8.5 GB - cleaner, heavier.</b> Worth it only if you have VRAM to spare.'
+        + hgCode('hf download audio-cpp/audio.cpp-gguf '
+                 + '--include "Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-bf16.gguf" '
+                 + '--local-dir "' + root + '"')
+        + 'Those are the only two published - there is no smaller quantisation. If <code>hf</code> is '
+        + 'not installed, the files can be downloaded from the page directly:'
+        + hgCode("https://huggingface.co/audio-cpp/audio.cpp-gguf/tree/main/Higgs-Audio-v3-TTS-4B-GGUF"))
+
+    + hgStep("3", "Point the panel at both",
+        'On <b>Proxy &rarr; TTS</b>, set <b>TTS</b> to <b>Higgs Audio v3</b>, then:<br><br>'
+        + '&bull; <b>audio.cpp Folder</b> - the folder you unzipped into. The panel finds '
+        + '<code>audiocpp_server.exe</code> itself, in that folder or below it.<br>'
+        + '&bull; <b>TTS Models Folder</b> - <code>' + esc(mroot) + '</code> '
+        + 'or wherever you put the files, then press <b>Rescan</b> and pick a model.<br>'
+        + '&bull; <b>GPU</b> - the card to use. Pick one your language models are not on.<br>'
+        + '&bull; <b>Proxy TTS Port</b> - what SkyrimNet will talk to; 7860 by default.<br><br>'
+        + 'Press <b>Start TTS</b>. The terminal should show one CUDA device, then the model loading, '
+        + 'then a line saying it is listening.')
+
+    + hgStep("4", "Point SkyrimNet at the panel",
+        'In SkyrimNet, <b>Voice &rarr; Text-to-Speech</b>, endpoint '
+        + '<code>http://&lt;this-pc&gt;:7860</code>. Then pick the backend, and there is a real '
+        + 'trade-off:<br><br>'
+        + '&bull; <b>Zonos</b> - SkyrimNet sends the reference voice at 22050 Hz, so the clone is '
+        + 'closer. No audio tags.<br>'
+        + '&bull; <b>Chatterbox</b> - 16000 Hz, so a slightly coarser clone, but it is the <b>only</b> '
+        + 'backend with audio tags. Pick this if you want emotion and pauses.<br><br>'
+        + 'XTTS will not work either way: it speaks its own protocol, not the one the panel serves.')
+
+    + hgStep("5", "Audio tags, if you want them",
+        'Higgs acts on tags written into a line - fear, whispering, a pause, a laugh. Getting them '
+        + 'there needs <b>three</b> things, and it does nothing with any one missing.<br><br>'
+        + '<b>1. Chatterbox as the TTS system,</b> as above. It is the only backend with an audio-tag '
+        + 'feature and an allowed list.<br><br>'
+        + '<b>2. Turn audio tags on</b> in the Chatterbox settings, and paste the allowed tags into '
+        + 'Advanced settings, one per line. Anything not on that list is dropped by SkyrimNet before '
+        + 'it reaches the panel.<br><br>'
+        + '<b>3. Tell your dialogue model to write them,</b> via a final-instructions prompt.<br><br>'
+        + 'Then set <b>Audio Tags</b> on the TTS page to <i>Pass them to the engine</i>. SkyrimNet '
+        + 'removes angle brackets and pipes from every line, so the model writes '
+        + '<code>[EMOTION-FEAR]</code> and the panel turns that back into what Higgs expects. '
+        + 'The panel invents nothing - if your prompt writes no tags, this setting changes nothing.'
+        + '<br><br>A worked set of the allowed list and the prompt is published here:'
+        + hgCode("https://github.com/cleanestpoison/higgs3-tts-skyrimnet"))
+
+    + hgStep("6", "Getting a good voice",
+        '<b>Keep the reference short.</b> Six to ten seconds clones as well as a minute and uses far '
+        + 'less memory - a 57 second sample needed 17 GB and failed on a 24 GB card. Longer is not '
+        + 'better.<br><br>'
+        + '<b>Expect roughly 2-4x faster than real time</b> for a line of dialogue, quicker once the '
+        + 'model has warmed up. The first line after starting is always the slowest.<br><br>'
+        + '<b>Saved Audio Folder</b> keeps a copy of every line, named after the speaker and the time. '
+        + 'The panel never deletes anything from it.')
+
+    + hgStep("?", "When something goes wrong",
+        '<b>Nothing happens and the terminal mentions the GPU.</b> The binary has no support for that '
+        + 'card. The prebuilt CUDA package covers RTX 20 series and newer.<br><br>'
+        + '<b>&quot;missing model file&quot;.</b> Choose the model from the dropdown rather than typing a '
+        + 'folder - the panel stores the exact file.<br><br>'
+        + '<b>Out of memory.</b> Shorten the reference voice, or use Q8 instead of BF16.<br><br>'
+        + '<b>It worked and then stopped.</b> Open the <b>TTS Terminal</b>; the panel reads the '
+        + 'server&#39;s own log and says what happened in plain words.');
+}
+
+function renderMossGuide() {
+  const pane = $("tgpane-moss");
   if (!pane) return;
   const st = (state && state.settings) || {};
   const wp = esc(st.ttsWrapperPort || "7860");
@@ -8138,38 +10144,182 @@ function renderTtsGuide() {
     + 'Check the endpoint address and that it names this machine on port ' + wp + '.</div></div>';
 }
 
+let ttsModels = null;                  // {models,dir,selected} once loaded
+let ttsAcppMsg = "";
+async function ttsLoadModels(force) {
+  if (ttsModels && !force) return ttsModels;
+  ttsModels = await post("/api/tts-models", {});
+  return ttsModels;
+}
+// The audio.cpp folder gets what the llama.cpp folder has: a warning when the binary is
+// not there, the releases address to copy, and a version check.
+// The panel downloading and unpacking executables is the biggest thing it ever
+// does for you, so it asks plainly, once, and says exactly what it will fetch.
+function higgsInstallRow() {
+  const g = (state && state.higgsInstall) || {};
+  if (g.running) {
+    return '<div class="tgroup"><div class="row" style="gap:10px;align-items:center">'
+         + '<b>Installing Higgs v3</b>'
+         + '<button class="stop" data-act="higgsCancel">Stop</button></div>'
+         + '<div class="hint" style="margin-top:7px;line-height:1.7">' + esc(g.step || "starting...")
+         + '</div><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.07);'
+         + 'margin-top:8px;overflow:hidden"><div style="height:100%;width:'
+         + (g.pct || 0).toFixed(1) + '%;background:var(--acc);transition:width .3s"></div></div>'
+         + '<div class="hint" style="margin-top:6px">Watch the TTS Terminal for the detail. '
+         + 'Stopping keeps what has downloaded, so starting again resumes.</div></div>';
+  }
+  if (g.error) {
+    return '<div class="tgroup"><div class="hint" style="color:#ff5d5d;line-height:1.7">'
+         + 'Install ' + esc(g.error) + '</div>'
+         + '<div class="hint" style="margin-top:6px;line-height:1.7">Anything already '
+         + 'downloaded is kept, so trying again resumes rather than starting over.</div>'
+         + '<button class="stop" data-act="higgsInstall" style="margin-top:8px">Try again</button>'
+         + '<button class="stop" data-act="higgsDismiss" style="margin-top:8px">Dismiss</button></div>';
+  }
+  if (g.done) {
+    // without this the row falls back to the install button and a finished install
+    // looks exactly like one that never ran
+    return '<div class="tgroup"><div class="hint" style="color:var(--ok);line-height:1.7">'
+         + '\u2705 Higgs Audio v3 installed' + (g.model ? (' - ' + esc(g.model)) : '') + '.</div>'
+         + '<div class="hint" style="margin-top:6px;line-height:1.7">'
+         + (g.engine ? ('Engine in <code>' + esc(g.engine) + '</code>. ') : '')
+         + 'The fields below are set for you - press <b>Start TTS</b>.</div>'
+         + '<button class="stop" data-act="higgsDismiss" style="margin-top:8px">Dismiss</button></div>';
+  }
+  const f = (state && state.higgsFound) || {};
+  if (f.adoptable) {
+    // the files are there but the settings are not - a config save failing at the last
+    // step of an install did exactly this, and so does installing by hand
+    return '<div class="tgroup"><div class="hint" style="color:var(--ok);line-height:1.7">'
+         + '\u2705 Higgs is already installed here, but not selected.</div>'
+         + '<div class="hint" style="margin-top:6px;line-height:1.7">Found '
+         + '<code>' + esc(f.exe || "") + '</code> and ' + (f.models || []).length
+         + ' model file(s).</div>'
+         + '<button class="stop" data-act="higgsAdopt" style="margin-top:8px">Use it</button>'
+         + '<button class="stop" data-act="higgsInstall" style="margin-top:8px">Reinstall</button></div>';
+  }
+  return '<div class="tgroup"><div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">'
+       + '<button class="stop" data-act="higgsInstall">Install Higgs v3 for me</button>'
+       + '<span class="hint" style="width:auto">1 click install into the PandorumLLM '
+       + 'directory</span></div></div>';
+}
+
+async function higgsInstall() {
+  const ok = await uiConfirm(
+      "Install Higgs Audio v3 TTS into PandorumLLM?" + String.fromCharCode(10) + String.fromCharCode(10)
+    + "The panel will download, into its own folder:" + String.fromCharCode(10)
+    + "  \u2022 the audio.cpp engine (about 60 MB) from github.com/0xShug0/audio.cpp" + String.fromCharCode(10)
+    + "  \u2022 the Higgs v3 4B model, Q8 (about 5.1 GB) from huggingface.co/audio-cpp" + String.fromCharCode(10) + String.fromCharCode(10)
+    + "It will unpack them, then select them on this page. Nothing about your setup "
+    + "is sent anywhere - these are two ordinary downloads." + String.fromCharCode(10) + String.fromCharCode(10)
+    + "You need an NVIDIA card of compute capability 7.5 or newer (RTX 20 series and "
+    + "up) on driver 580 or newer, and about 8 GB free. No CUDA toolkit needed." + String.fromCharCode(10) + String.fromCharCode(10)
+    + "Progress appears in the TTS Terminal. Continue?");
+  if (!ok) return;
+  await post("/api/higgs-install", { confirm: true });
+  showTsub("tts");                        // the install narrates itself there
+  await load(); renderTts();
+}
+async function higgsCancel() {
+  if (!await uiConfirm("Stop the download? A part-finished file is kept, so starting "
+                       + "again resumes rather than restarting.")) return;
+  await post("/api/higgs-install", { action: "cancel" });
+}
+
+function ttsFieldExtra(k) {
+  if (k !== "ttsAcppDir") return "";
+  return '<div class="hint chkmsg" id="acppchk" style="color:var(--err);display:none">'
+       + 'audiocpp_server.exe not found in this folder or below it</div>'
+       + '<div class="hint" style="margin-top:8px;line-height:1.6">'
+       + 'Prebuilt binaries and newer releases are here (click to copy):'
+       + '<div style="margin-top:5px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">'
+       + '<code class="gcode" style="margin:0;padding:5px 30px 5px 10px" onclick="copyCode(this)" '
+       + 'title="click to copy"><span class="gcopy">' + ICO.copy + '</span>'
+       + 'https://github.com/0xShug0/audio.cpp/releases</code>'
+       + '<button class="stop" data-act="acppCheck" title="asks github.com for the newest '
+       + 'audio.cpp release - only when you press it, and nothing about your setup is sent">'
+       + 'Check for update</button></div>'
+       + '<div class="hint" id="tts-acpp" style="margin-top:6px;min-height:1.2em">'
+       + ttsAcppMsg + '</div></div>';
+}
+async function recheckAcpp() {
+  const inp = $("tts-ttsAcppDir"), msg = $("acppchk");
+  if (!inp || !msg) return;
+  const v = inp.value.trim();
+  if (!v) { msg.style.display = "none"; return; }
+  const r = await post("/api/path-check", { path: v, kind: "ttsAcppDir" });
+  msg.style.display = (r && r.ok) ? "none" : "block";
+  if (r && r.ok && r.exe) { msg.style.display = "none"; }
+}
+
+function ttsModelOptions() {
+  const st = (state && state.settings) || {};
+  const sel = st.ttsAcppModel || "";
+  const list = (ttsModels && ttsModels.models) || [];
+  if (!list.length) return '<option value="">(set a models folder above, then Rescan)</option>';
+  return '<option value="">(none selected)</option>' + list.map(m =>
+      '<option value="' + esc(m.path) + '"' + (m.path === sel ? " selected" : "")
+      + (m.shadowed ? " disabled" : "") + '>' + esc(m.name)
+      + (m.shadowed ? "  - unavailable, a .gguf here loads instead" : "") + '</option>').join("");
+}
+function ttsModelHint() {
+  const list = (ttsModels && ttsModels.models) || [];
+  if (!ttsModels) return "not scanned yet - press Rescan";
+  if (!list.length) return "nothing loadable found. audio.cpp takes a .gguf file, or a folder holding config.json and model.safetensors";
+  const sh = list.filter(m => m.shadowed).length;
+  return list.length + " found" + (sh ? ("  -  " + sh + " safetensors folder(s) hidden because a .gguf sits alongside and wins") : "");
+}
+
 function renderTts() {
   const pane = $("dpane-tts");
   if (!pane || !state) return;
   const st = state.settings || {};
   const mode = String(st.ttsWrapMode || "off").toLowerCase();
   const ping = String(st.ttsAnswerPing || "on").toLowerCase();
+  const tags = String(st.ttsTags || "off").toLowerCase();
   const w = state.ttsWrap || {};
+  const eng = String(st.ttsEngine || "moss").toLowerCase();
+  if (eng === "audiocpp" && ttsModels === null) ttsLoadModels(false).then(() => renderTts());
+  if (eng === "audiocpp") setTimeout(recheckAcpp, 0);       // after the pane exists
   const sv = state.ttsServer || {};
   const svUp = sv.state === "serving", svLoad = sv.state === "loading";
   const svGoing = !!sv.stopping || sv.state === "wedged";   // reported, or port held and silent
   const busy = ttsBusy;
   const ready = svUp && !busy && (mode === "on" ? w.on : true);
   const keep = {};                       // never wipe a path mid-paste (same rule as Folder Settings)
-  TTS_FIELDS.forEach(f => { const el = $("tts-" + f[0]); if (el) keep[f[0]] = el.value; });
+  ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el) keep[f[0]] = el.value; });
   const gsel = (state.gpus || []).map(g =>
       '<option value="' + esc(g.id) + '"' + (st.ttsGpuId === g.id ? " selected" : "") + '>'
       + esc((g.name || g.id) + "   " + (g.uuid || "")) + '</option>').join("");
   pane.innerHTML = '<div class="card set" style="max-width:860px">'
-    + '<div class="hint" style="margin-bottom:12px;line-height:1.6">'
-    + 'Alpha. The panel writes the launcher; the wrapper stays yours. No TTS traffic passes '
-    + 'through the panel, so SkyrimNet talks to the wrapper directly and voices keep working '
-    + 'whether or not this panel is running.</div>'
-    + '<div class="row" style="gap:8px;margin-bottom:14px;align-items:center">'
-    + '<button class="stop" data-act="ttsImport" title="read the paths straight out of a launcher you already use - nothing else is read from the file">'
+    // Choose the TTS, not the engine: the engine follows from it. Kept keyed on the
+    // engine value so no existing config needs migrating - a second TTS on the same
+    // engine would add an option here rather than a new setting.
+    + '<label>TTS</label><div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsEngine" data-act="ttsEngineSel">'
+    + '<option value="audiocpp"' + (eng === "audiocpp" ? " selected" : "") + '>Higgs Audio v3 (4B) - runs on audio.cpp</option>'
+    + '<option value="moss"' + (eng === "moss" ? " selected" : "") + '>MOSS-TTS Local - runs on the MOSS server</option>'
+    + '</select></div>'
+    + '<div class="hint" style="margin:-4px 0 14px;line-height:1.6">'
+    + (eng === "audiocpp"
+        ? ''
+        : '')
+    + '</div>'
+    + (eng === "audiocpp" ? higgsInstallRow() : '')
+    + (eng === "moss"
+        ? ('<div class="row" style="gap:8px;margin-bottom:14px;align-items:center">'
+           + '<button class="stop" data-act="ttsImport" title="read the paths straight out of a launcher you already use - nothing else is read from the file">'
     + ICO.file + ' Import from a launcher</button>'
-    + '<span class="hint" id="tts-imp" style="width:auto">points at your existing .bat and fills these in</span></div>'
-    + TTS_FIELDS.map(f =>
+    + '<span class="hint" id="tts-imp" style="width:auto">points at your existing .bat and fills these in</span></div>')
+        : '')
+    + ttsFields().map(f =>
         '<label>' + esc(f[1]) + '</label><div class="row" style="flex-wrap:nowrap">'
         + '<input class="txt" id="tts-' + f[0] + '" onchange="saveTts()" value="'
         + esc(st[f[0]] || "").replace(/"/g, "&quot;") + '">'
-        + (f[2] ? '<button class="stop" data-act="ttsPick" data-k="' + f[0] + '">Choose file</button>' : '')
-        + '</div>').join("")
+        + (f[2] === "folder"
+             ? '<button class="stop" data-act="ttsPickDir" data-k="' + f[0] + '">Choose folder</button>'
+             : (f[2] ? '<button class="stop" data-act="ttsPick" data-k="' + f[0] + '">Choose file</button>' : ''))
+        + '</div>' + ttsFieldExtra(f[0])).join("")
     + '<label>Who translates for SkyrimNet</label><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsWrapMode" onchange="saveTtsMode()">'
     + '<option value="off"' + (mode === "on" ? "" : " selected") + '>Your own wrapper (the panel only writes the launcher)</option>'
@@ -8177,17 +10327,28 @@ function renderTts() {
     + '</select></div>'
     + '<div class="hint" style="margin:-4px 0 12px;line-height:1.6">'
     + (mode === "on"
-        ? ('The panel answers SkyrimNet on port ' + esc(st.ttsWrapperPort || "7860") + ' itself. '
-           + 'Stop your own wrapper first or the port is taken, and remember voices stop when the panel does. '
-           + (w.on ? '<span style="color:var(--ok)">Listening on ' + esc(String(w.port)) + '.</span>'
-                   : '<span style="color:var(--err)">Not listening - the port may be in use.</span>'))
-        : 'The panel writes a launcher for your wrapper and reads its log. Nothing passes through the panel.')
+        ? (w.on ? '<span style="color:var(--ok)">Listening on ' + esc(String(w.port)) + '.</span>'
+                : '<span style="color:var(--err)">Not listening - the port may be in use.</span>')
+        : '')
     + '</div>'
     + '<label>Answer SkyrimNet startup ping locally</label><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsAnswerPing" onchange="saveTts()">'
     + '<option value="on"' + (ping === "off" ? "" : " selected") + '>Yes - return silence, never touch the GPU</option>'
     + '<option value="off"' + (ping === "off" ? " selected" : "") + '>No - generate it like any other line</option>'
     + '</select></div>'
+    + '<label>Audio Tags</label><div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsTags" onchange="saveTts()">'
+    + '<option value="off"' + (tags === "on" ? "" : " selected") + '>Strip them - speak the words only</option>'
+    + '<option value="on"' + (tags === "on" ? " selected" : "") + '>Pass them to the engine</option>'
+    + '</select></div>'
+    + (eng === "audiocpp"
+        ? ('<label>Model</label><div class="row" style="flex-wrap:nowrap">'
+           + '<select class="txt" id="tts-ttsAcppModel" data-act="ttsModelSel">'
+           + ttsModelOptions() + '</select>'
+           + '<button class="stop" data-act="ttsModelRescan" title="rescan the models folder">Rescan</button></div>'
+           + '<div class="hint" id="tts-mdl" style="margin:-4px 0 12px;line-height:1.6">'
+           + ttsModelHint() + '</div>')
+        : '')
     + '<label>GPU (pinned by UUID, so a reboot cannot move it)</label>'
     + '<div class="row" style="flex-wrap:nowrap"><select class="txt" id="tts-ttsGpuId" onchange="saveTts()">'
     + '<option value="">(no pin - every visible card is offered)</option>' + gsel + '</select></div>'
@@ -8212,21 +10373,24 @@ function renderTts() {
                   + ' \u00B7 panel ' + (w.on ? "answering on " + esc(String(w.port)) : "not listening")))
            + '</span></div></div>')
         : '')
-    + '<div class="row" style="gap:8px;margin-top:16px;align-items:center">'
-    + '<button class="stop" data-act="ttsGen" title="build the launcher from these settings without writing it">Preview launcher</button>'
+    + (eng === "moss"
+        ? ('<div class="row" style="gap:8px;margin-top:16px;align-items:center">'
+           + '<button class="stop" data-act="ttsGen" title="build the launcher from these settings without writing it">Preview launcher</button>'
     + '<button class="stop" data-act="ttsSave" title="write start-tts.bat into the launcher folder">Write start-tts.bat</button>'
     + '<button class="stop" data-act="ttsOpenDir" title="show the launcher folder this is written to">'
     + ICO.folder + ' Open launcher folder</button>'
     + '<span class="hint" id="tts-msg" style="width:auto"></span></div>'
-    + '<textarea id="tts-view" class="edit" spellcheck="false" readonly style="width:100%;height:42vh;'
-    + 'margin-top:10px;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5;white-space:pre;overflow:auto"></textarea>'
+           + '<textarea id="tts-view" class="edit" spellcheck="false" readonly style="width:100%;height:42vh;'
+           + 'margin-top:10px;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5;white-space:pre;overflow:auto"></textarea>')
+        : '')
     + '</div>';
-  TTS_FIELDS.forEach(f => { const el = $("tts-" + f[0]); if (el && keep[f[0]] !== undefined) el.value = keep[f[0]]; });
+  ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el && keep[f[0]] !== undefined) el.value = keep[f[0]]; });
 }
 async function saveTtsMode() { saveTts(); await load(); renderTts(); }
 function saveTts() {
   const body = {};
-  TTS_FIELDS.forEach(f => { const el = $("tts-" + f[0]); if (el) body[f[0]] = el.value; });
+  ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el) body[f[0]] = el.value; });
+  const tg = $("tts-ttsTags"); if (tg) body.ttsTags = tg.value;   // not a path field
   const g = $("tts-ttsGpuId");
   if (g) body.ttsGpuId = g.value;
   ["ttsWrapMode", "ttsAnswerPing"].forEach(k => { const e = $("tts-" + k); if (e) body[k] = e.value; });
@@ -8301,16 +10465,59 @@ function showTsub(v) {
 // The ONE mapping from the open terminal to its feed. showTsub (on open) and
 // liveRefresh (every tick) both call this - do not spell it out anywhere else.
 function refreshCurTerm() {
+  syncTermToggleUI();          // shared markup: the lit state is applied, not rendered
   if (curTsub === "proxy") refreshTail("dashboard");
   else if (curTsub === "think") refreshTail("thinking");
   else if (curTsub === "split") refreshSplit();
   else if (curTsub === "tts") refreshTail("tts");
 }
+const SPLIT_FEEDS = [["dashboard", "Proxy"], ["thinking", "Thinking Content"],
+                     ["tts", "TTS"]];
+function splitFeed(side) {
+  const st = (state && state.settings) || {};
+  const want = String(st[side === "d" ? "splitSrcD" : "splitSrcT"]
+                      || (side === "d" ? "dashboard" : "thinking")).toLowerCase();
+  return SPLIT_FEEDS.some(f => f[0] === want) ? want
+                                              : (side === "d" ? "dashboard" : "thinking");
+}
+function splitFeedOptions(side) {
+  const cur = splitFeed(side);
+  return SPLIT_FEEDS.map(f => '<option value="' + f[0] + '"'
+      + (f[0] === cur ? " selected" : "") + '>' + esc(f[1]) + '</option>').join("");
+}
+// Insert TTS only belongs on a pane showing the proxy - it had been put on both
+function syncSplitUI() {
+  ["d", "t"].forEach(side => {
+    const sel = $("splitsel-" + side);
+    if (sel) sel.innerHTML = splitFeedOptions(side);
+    // the right pane has a second copy in the outer bar for full window
+    [$("splitins-" + side), side === "t" ? $("splitins-t-max") : null].forEach(btn => {
+      if (btn) btn.style.display = (splitFeed(side) === "dashboard") ? "" : "none";
+    });
+  });
+}
+async function setSplitFeed(side, kind) {
+  const key = side === "d" ? "splitSrcD" : "splitSrcT";
+  if (state && state.settings) state.settings[key] = kind;
+  const body = {}; body[key] = kind;
+  await post("/api/settings", body);
+  await load();
+  syncSplitUI();
+  refreshSplit();
+}
 async function refreshSplit() {
-  const d = await post("/api/tail", { kind: "dashboard" });
-  const th = await post("/api/tail", { kind: "thinking" });
-  paintTail("dashboard", d.text || d.error || "", $("tail-splitd"));
-  paintTail("thinking", th.text || th.error || "", $("tail-splitt"));
+  syncSplitUI();
+  const kd = splitFeed("d"), kt = splitFeed("t");
+  const d = await post("/api/tail", { kind: kd });
+  const th = await post("/api/tail", { kind: kt });
+  if (termInsTtsOn() && (kd === "dashboard" || kt === "dashboard")) {
+    try {
+      const tr = await post("/api/tail", { kind: "tts" });
+      lastTtsTail = (tr && tr.text) || "";
+    } catch (e) { /* keep the previous one */ }
+  }
+  paintTail(kd, d.text || d.error || "", $("tail-splitd"), "splitd");
+  paintTail(kt, th.text || th.error || "", $("tail-splitt"), "splitt");
   const sd = $("split-src-d"), st = $("split-src-t");
   if (sd) { const x = d.file ? "source: " + d.file : ""; sd.textContent = x; sd.title = x; }
   if (st) { const x = th.file ? "source: " + th.file : ""; st.textContent = x; st.title = x; }
@@ -9696,6 +11903,8 @@ function fxQuiet() {
   return "";
 }
 function arcFire(btn, strong, side) {
+  // guarded here rather than at each call site: both launch buttons use it
+  if (state && state.settings && state.settings.launchArc === false) return;
   const held = fxQuiet();
   if (held) { trace("effect", "arc held back", held); return; }
   trace("effect", "arc drawn");
@@ -9727,7 +11936,7 @@ function arcFire(btn, strong, side) {
 }
 let arcTimer = null;
 document.addEventListener("pointerover", function(e) {
-  const b = e.target.closest && e.target.closest("#launchBtn");
+  const b = e.target.closest && e.target.closest("#launchBtn, #launchTtsBtn");
   if (!b || arcTimer) return;
   arcTimer = setInterval(function() {
     if (!b.isConnected) { clearInterval(arcTimer); arcTimer = null; return; }
@@ -9735,7 +11944,7 @@ document.addEventListener("pointerover", function(e) {
   }, 105);
 });
 document.addEventListener("pointerout", function(e) {
-  const b = e.target.closest && e.target.closest("#launchBtn");
+  const b = e.target.closest && e.target.closest("#launchBtn, #launchTtsBtn");
   if (!b || (e.relatedTarget && b.contains(e.relatedTarget))) return;
   clearInterval(arcTimer); arcTimer = null;
 });
@@ -10063,6 +12272,28 @@ document.addEventListener("change", ev => {
     });
     return;
   }
+  if (d.act === "splitFeed") {          // a select: change, not click
+    setSplitFeed(ev.target.dataset.side, ev.target.value);
+    return;
+  }
+  if (d.act === "ttsModelSel") {
+    const v = ev.target.value;
+    if (state && state.settings) state.settings.ttsAcppModel = v;
+    post("/api/settings", { ttsAcppModel: v });
+    return;
+  }
+  if (d.act === "ttsEngineSel") {
+    const v = ev.target.value;
+    if (state && state.settings) state.settings.ttsEngine = v;   // redraw with the new field set
+    post("/api/settings", { ttsEngine: v }).then(async () => { await load(); renderTts(); });
+    return;
+  }
+  if (d.act === "launchArcToggle") {
+    const on = !!ev.target.checked;
+    if (state && state.settings) state.settings.launchArc = on;   // apply before the round trip
+    post("/api/settings", { launchArc: on });
+    return;
+  }
   if (d.act === "provField") {
     const patch = {};
     patch[d.field] = ev.target.type === "checkbox" ? ev.target.checked : ev.target.value;
@@ -10323,8 +12554,53 @@ document.addEventListener("click", ev => {
     return;
   }
   if (d.act === "ttsPick") {
-    const f = TTS_FIELDS.find(x => x[0] === d.k);
-    if (f && f[2]) pickTtsFile(f[0], f[2]);
+    const f = ttsFields().find(x => x[0] === d.k);
+    if (f && f[2] && f[2] !== "folder") pickTtsFile(f[0], f[2]);
+    return;
+  }
+  if (d.act === "ttsPickDir") { pickTtsFolder(d.k); return; }
+  if (d.act === "higgsInstall") { higgsInstall(); return; }
+  if (d.act === "termStamps") {
+    termStampsToggle(ev.target.dataset.kind || "dashboard");
+    return;
+  }
+  if (d.act === "termInsTts") { termToggle("termInsTts", "on", "off"); return; }
+  if (d.act === "higgsCancel") { higgsCancel(); return; }
+  if (d.act === "higgsAdopt") {
+    post("/api/higgs-adopt", {}).then(async r => {
+      if (r && r.error) { uiAlert(r.error); return; }
+      ttsModels = null;
+      await load(); renderTts();
+    });
+    return;
+  }
+  if (d.act === "higgsDismiss") {
+    post("/api/higgs-install", { action: "dismiss" }).then(async () => {
+      await load(); renderTts();
+    });
+    return;
+  }
+  if (d.act === "acppCheck") {
+    const ACPP_MSG = "#f2c14e";        // one yellow for the whole report
+    const tint = (c, s) => '<span style="color:' + c + '">' + esc(s) + '</span>';
+    ttsAcppMsg = tint(ACPP_MSG, "checking github.com..."); renderTts();
+    post("/api/acpp-update", {}).then(r => {
+      if (!r || r.error) ttsAcppMsg = tint("#ff5d5d", (r && r.error) || "no answer");
+      else if (!r.exe) ttsAcppMsg = tint(ACPP_MSG,
+               "newest release is " + r.tag + " - no server found in the folder above");
+      else if (r.local && r.tag.indexOf(r.local) >= 0)
+        ttsAcppMsg = tint(ACPP_MSG, "up to date (yours: " + r.local + ", newest: " + r.tag + ")");
+      else if (r.local) ttsAcppMsg = tint(ACPP_MSG,
+               "a newer build is out: " + r.tag + " (yours: " + r.local + ")");
+      else ttsAcppMsg = tint(ACPP_MSG, "newest release is " + r.tag
+               + (r.published ? (" (" + r.published + ")") : ""));
+      renderTts();
+    });
+    return;
+  }
+  if (d.act === "ttsModelRescan") {
+    const h = $("tts-mdl"); if (h) h.textContent = "scanning\u2026";
+    ttsLoadModels(true).then(() => renderTts());
     return;
   }
   if (d.act === "ttsImport") { _pickField = "__ttsimport"; _pickPrefix = "tts-"; _pickExts = [".bat", ".cmd", ".ps1"]; browseTo(""); return; }
@@ -10561,6 +12837,11 @@ function pickPath(k) {
   const start = ($("set-"+k) && $("set-"+k).value) || "";
   browseTo(start);
 }
+function pickTtsFolder(k) {
+  _pickField = k; _pickPrefix = "tts-"; _pickExts = null;   // null exts = folders only
+  const cur = ($("tts-"+k) && $("tts-"+k).value) || "";
+  browseTo(cur);
+}
 // file mode: same browser, plus files of the given types. Clicking one picks it.
 function pickTtsFile(k, exts) {
   _pickField = k; _pickPrefix = "tts-"; _pickExts = exts;
@@ -10568,7 +12849,10 @@ function pickTtsFile(k, exts) {
   browseTo(cur ? cur.replace(/[\\/][^\\/]*$/, "") : "");
 }
 async function browseTo(path) {
-  const r = await post("/api/browse-dirs", { path: path || "", exts: _pickExts || [] });
+  let r = await post("/api/browse-dirs", { path: path || "", exts: _pickExts || [] });
+  if (r && r.error && path) {          // a stale or half-typed path: fall back to the drives
+    r = await post("/api/browse-dirs", { path: "", exts: _pickExts || [] });
+  }
   if (r && r.error) { uiAlert(r.error); return; }
   _pickCur = r.path || "";
   let rows = "";
@@ -10640,6 +12924,15 @@ async function pickFileChoose(full) {
 }
 async function pickChoose() {
   if (_pickField && _pickCur) {
+    if (_pickPrefix === "tts-") {                 // TTS page: folder fields live there too
+      const t = $("tts-" + _pickField); if (t) t.value = _pickCur;
+      closeModal();
+      const p = {}; p[_pickField] = _pickCur;
+      const rr = await post("/api/settings", p);
+      if (rr && rr.error) { uiAlert(rr.error); return; }
+      await load(); renderTts();
+      return;
+    }
     const el = $("set-"+_pickField); if (el) el.value = _pickCur;
     // save straight away so folder validation (e.g. llama.cpp exe check) runs immediately
     const body = {}; body[_pickField] = _pickCur;
@@ -11605,7 +13898,13 @@ async function load() {
       if (sb) { sb.textContent = "⚠ this browser tab is showing a cached old UI (" + UI_VERSION + ") - press Ctrl+F5 to load " + state.version; sb.style.color = "var(--warn)"; }
     }
   }
-  catch (e) { $("sub").textContent = "panel unreachable - retrying..."; }
+  catch (e) {
+    // guarded: "sub" is rendered by JS and may not exist yet. Unguarded, the handler
+    // threw and replaced the real failure with a TypeError, losing the cause.
+    const sb = $("sub");
+    if (sb) sb.textContent = "panel unreachable - retrying...";
+    trace("load", "failed", String(e));
+  }
 }
 let writesInFlight = 0;
 async function post(u, b) {
@@ -11723,7 +14022,70 @@ async function exitPanel(btn) {
   await post("/api/exit", {}).catch(()=>{});
   goodbye();
 }
+/* The TTS server's own launch button. Same shape as the fleet one - label, arcs, the
+   loading and running glows - driven by whether the server is answering rather than by
+   how many are. Stopping stays on the TTS page; this only starts. */
+async function launchTts(btn) {
+  if (btn && btn.classList.contains("lbbusy")) return;
+  const eng = String(((state && state.settings) || {}).ttsEngine || "moss").toLowerCase();
+  const st = (state && state.settings) || {};
+  const need = (eng === "audiocpp")
+    ? [["ttsAcppDir", "the audio.cpp folder"], ["ttsAcppModel", "a model"]]
+    : [["ttsServerExe", "the MOSS server"], ["ttsModel", "a model"]];
+  const miss = need.filter(k => !String(st[k[0]] || "").trim()).map(k => k[1]);
+  const NL = String.fromCharCode(10);
+  if (miss.length) {
+    uiAlert("Set these on the TTS page first:" + NL + NL + "- " + miss.join(NL + "- "));
+    showTab("dashboard"); showDsub("tts");
+    return;
+  }
+  window.__ttsLaunching = true;
+  const r = await post("/api/tts-server", { action: "start" });
+  if (r && r.error) { window.__ttsLaunching = false; uiAlert(r.error); }
+  await load();
+}
+function syncTtsButton() {
+  const tb = $("launchTtsBtn");
+  if (!tb || !state) return;
+  const srv = state.ttsServer || {};
+  let s;
+  // Terminate stops the TTS server too, but unloading a model is not instant - without a
+  // state for it the button kept reading "TTS running..." and looked ignored.
+  if (srv.stopping) s = "term";
+  else if (String(srv.state || "") === "serving") s = "run";
+  else if (window.__ttsLaunching && srv.pid) s = "launching";
+  else s = "idle";
+  // The panel tells us whether it still has a process. Without that, terminating before
+  // the server ever answered left this stuck on "Starting TTS..." with nothing to clear
+  // the flag - there was no state that said "it is gone".
+  if (s !== "launching") window.__ttsLaunching = false;
+  if (window.__tbState === s) return;
+  const was = window.__tbState;
+  window.__tbState = s;
+  clearInterval(window.__ttsArc); window.__ttsArc = null;
+  if (s === "term") { tb.innerHTML = arcLabel("Stopping TTS..."); }
+  else if (s === "run") { tb.innerHTML = arcLabel("TTS running..."); }
+  else if (s === "launching") { tb.innerHTML = arcLabel("Starting TTS..."); }
+  else { tb.innerHTML = arcLabel("Launch TTS"); }
+  tb.classList.remove("lbload", "lbrun", "lbbusy");
+  if (s !== "idle") tb.classList.add("lbbusy");
+  if (s === "launching" || s === "term") {
+    tb.classList.add("lbload");
+    window.__ttsArc = setInterval(function() {
+      if (!tb.isConnected) { clearInterval(window.__ttsArc); window.__ttsArc = null; return; }
+      arcFire(tb, true);
+    }, 130);
+  } else if (s === "run") {
+    tb.classList.add("lbrun");
+    window.__ttsArc = setInterval(function() {
+      if (!tb.isConnected) { clearInterval(window.__ttsArc); window.__ttsArc = null; return; }
+      arcFire(tb, false);
+    }, 150);
+  }
+}
+
 async function launchStack(btn) {
+  if (btn && btn.classList.contains("lbbusy")) return;   // busy, not disabled
   const miss = helperMissing();
   const NL = String.fromCharCode(10);
   if (miss.length && !await uiConfirm("Not everything is set up yet:" + NL + NL + "- " + miss.join(NL + "- ") + NL + NL + "Launch anyway?")) return;
@@ -12017,7 +14379,7 @@ def _kill_port_owner(port):
         subprocess.run(["pwsh", "-NoProfile", "-Command",
             "$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; "
             "if ($c) { Stop-Process -Id $c.OwningProcess -Force }" % port],
-            capture_output=True, timeout=15)
+            capture_output=True, timeout=15, **NOWIN)
     except Exception:
         pass
 
@@ -12108,6 +14470,15 @@ def main():
             except Exception:
                 pass
             return
+        # 7. the TTS log is one fixed file, so it would otherwise carry every past
+        # session forward. The fleet logs already start fresh per run.
+        try:
+            _tl = os.path.join(log_dir(), TTS_LOG_NAME)
+            if os.path.isfile(_tl):
+                with open(_tl, "w", encoding="utf-8"):
+                    pass
+        except Exception:
+            pass
         globals()["PORT"] = chosen
         try:
             with open(os.path.join(STACK, "panel-port.txt"), "w", encoding="utf-8") as f:
@@ -12140,9 +14511,6 @@ def main():
                     pass
                 _th.Thread(target=watchdog_loop, daemon=True).start()
                 _th.Thread(target=status_watch_loop, daemon=True).start()
-                if not is_admin():
-                    print("WARNING: not elevated. Viewing works, but launching/stopping the")
-                    print("         elevated fleet will fail. Start via StartPandorumLLM instead.")
             except Exception:
                 log_error("panel", "background init failed: %s" % traceback.format_exc(limit=3))
 

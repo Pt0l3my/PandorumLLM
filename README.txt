@@ -1,4 +1,4 @@
-PandorumLLM v3.72 Beta - local LLM stack for SkyrimNet, all in one folder
+PandorumLLM v3.73 Beta - local LLM stack for SkyrimNet, all in one folder
 ============================================================
 
 
@@ -3577,3 +3577,265 @@ refuses anything absurd instead. Reference voice samples were also being kept in
 in a temporary folder and are now trimmed to the most recent few dozen, which costs nothing
 since they are sent again if they are needed. Everything from v3.71 and its patches is
 included.
+
+v3.72 patch1: the lightning that plays across the Launch button can now be switched off,
+under Customization in a new Effects section. It stays on unless you turn it off. The button
+itself is unchanged either way - it still changes colour as servers come up and still shows
+how many are running; only the animation stops.
+
+With the lightning switched off, the Main Guide's launch step now lights the button up so
+you can still see where to look - it relied on the lightning to do that before. This also
+fixes the guide highlight on buttons generally: it was drawn as a glow around a box, and
+buttons here are glowing text with no box at all, so it never showed on any of them.
+
+v3.72 patch2: there is now a choice of TTS engine. Alongside the existing MOSS setup you
+can pick audio.cpp, which needs only a server program and a model folder - no python
+installation, no separate wrapper script, and nothing to start by hand. The panel writes
+the server's configuration itself, starts it on whichever card you pinned, and hands it the
+reference voice as a file on disk rather than re-sending the audio with every line. Which
+engine you use changes nothing about how SkyrimNet talks to the panel.
+
+v3.72 patch3: choosing a TTS model now works the same way as choosing a language model.
+Point the panel at a folder of TTS models and pick one from a list, rather than typing a
+path. Both kinds are found - single model files and the folders that hold a model split
+across several files. If a folder contains both, the panel says so and will not let you
+pick the one that would be quietly ignored, which is what happens otherwise.
+
+v3.72 patch4: fixes text-to-speech failing on every line when using the audio.cpp engine.
+The voice sample SkyrimNet sends carries some extra information inside the audio file that
+not every program will read past, so it is now tidied as soon as it arrives rather than
+only for one of the engines. Nothing needs reconfiguring.
+
+v3.72 patch5: the previous fix only applied to voice samples sent after updating. SkyrimNet
+checks whether it has already sent a sample and skips it if so, which meant anyone who had
+used the panel before kept hitting the same error. Existing samples are now repaired the
+first time they are used, so nothing has to be cleared out by hand.
+
+v3.72 patch6: the Chatterbox voice option now works through the panel. It uses the same
+connection style as Zonos but arranges its request differently, and the panel was reading
+the wrong parts of it, so the voice sample never arrived. Separately, when the speech
+server stops unexpectedly the panel now reads that server's own log and tells you what went
+wrong, instead of only reporting that the connection closed.
+
+v3.72 patch7: when the panel briefly could not be reached, the message shown was about the
+wrong thing entirely - the code that displays the warning could itself fail and hide what
+had actually gone wrong. Fixed, and the real reason is now recorded.
+
+v3.72 patch8: you can now choose where spoken lines are saved, and they are named after the
+speaker and the time rather than a long string of random characters. Leave the setting blank
+and nothing changes. The panel never deletes anything from a folder you choose. The terminal
+also shows the fuller timing breakdown again - how long generation took, how long the audio
+encoding took, and what was left over.
+
+v3.72 patch9: the TTS terminal now shows how long the speech server took and how much time
+was spent around it, together with the speed figures, rather than a single total. Where a
+server reports its own internal timings those are used instead.
+
+v3.72 patch10: setting up audio.cpp is simpler. You point the panel at the folder you
+unzipped it into and it finds the program itself, the same way it already handles llama.cpp.
+There is a button to check whether a newer audio.cpp has been released. The TTS section of
+the User Guide now has a page for Higgs, with the download links and commands, and the port
+setting is called Proxy TTS Port since a wrapper is no longer always involved.
+
+v3.72 patch11: the TTS part of the User Guide now has a page for each engine inside it,
+rather than spreading across the top of the screen. Anything you can copy shows a small copy
+symbol and flashes when you click it, so it is clear the text went to the clipboard.
+
+v3.72 patch12: the TTS terminal now tells you what is happening - which engine and model are
+loading, which graphics card they are on, when they are ready, where to point SkyrimNet, and
+when the server stops. The audio.cpp folder setting also warns if the program is not in it,
+shows the download address for newer versions, and can check for one. Copying from a guide
+now shows a single glow rather than a glow and an outline together.
+
+v3.72 patch13: the terminal now shows just the file name when a line is saved, since you
+chose the folder yourself. There is also a new setting for the Higgs engine: it can act on
+emotion, style, pause and sound-effect markers written into a line of dialogue, if your
+language model is set up to write them. It is off by default and the panel never adds any
+of its own.
+
+v3.72 patch14: the tag setting is now called Audio Tags and works for both engines - MOSS
+understands a pause marker of its own, so each engine is given only the markers it knows.
+The audio.cpp version check is colour coded like the llama.cpp one, and the TTS settings are
+spaced out so the different groups are easier to tell apart at a glance.
+
+v3.72 patch15: some people saw Windows Defender report a threat in the launcher. It was a
+false alarm, but an understandable one: the program used to restart itself with
+administrator rights and no window, which is a pattern unwanted software uses. It never
+needed those rights, so it no longer asks for them - which also means one less permission
+prompt each time you start it. StartPandorumLLM.bat is also back in the folder. It starts
+the panel exactly as the program does, is plain text you can read, and gives you a way in
+if security software ever blocks the program itself.
+
+If your antivirus still objects, please report it to Microsoft as a false positive at
+microsoft.com/en-us/wdsi/filesubmission - it is checked by a person and usually corrected
+within a few days, for everyone rather than just you.
+
+v3.72 patch16: more work on the false alarm some antivirus software reported. The launcher
+no longer opens any network connections - it used to check several ports to find the panel,
+and now simply reads the small file the panel writes with the port it chose. It also starts
+Python in a way that needs no hidden window, and carries fuller version details. All told
+the program now uses exactly two notable Windows functions: one to start the panel and one
+to open your browser.
+
+v3.72 patch17: the audio tag feature now works. It was looking for markers in a form
+SkyrimNet removes from every line before sending it, so nothing would ever have come
+through. The dialogue model writes them in a form that survives, and the panel converts.
+The guide explains the three things SkyrimNet needs set up for tags to arrive, and is
+honest that the backend which supports them clones voices slightly less well than the one
+that does not.
+
+v3.72 patch18: audio tags now follow the rules the model actually needs. Sound effects only
+work when a written-out sound follows them immediately, so that is added. Emotion and style
+colour a whole sentence and have to sit at its start, so they are moved there. And a pause
+written at the very beginning or end of a line is removed - left in, it can make the speech
+engine run on until it gives up, returning nothing and sometimes stopping altogether. The
+list of available sound effects was also wrong and has been corrected.
+
+v3.72 patch19: a line that ended with a sound effect could be sent to the speech engine
+without a full stop, which can make it run on past the end of the line. Fixed.
+
+v3.72 patch20: there is now a one-click install for the Higgs speech engine. It asks first,
+telling you exactly what it will download, from where, how large it is and what your
+graphics card needs to be, and it only proceeds if you say yes. Everything lands inside the
+PandorumLLM folder and the settings are filled in for you. You can stop it part way and
+start again later without losing what was already downloaded. Installing by hand still
+works exactly as before and the guide still describes it.
+
+v3.72 patch21: the speech engine keeps recently used voices prepared so it does not have to
+work them out again. It only kept one, which meant nearly every line of a conversation
+redid that work. It now keeps 64, and you can change the number on the TTS page if you use
+a lot of custom voices.
+
+v3.72 patch22: SkyrimNet's own performance markers now work with Higgs as well. Its normal
+setup writes things like [angry] or [sigh] into a line, and those are converted to what
+Higgs understands - so you can use SkyrimNet exactly as it comes, with no prompt to edit.
+Markers Higgs has no equivalent for are removed rather than spoken. Ordinary square
+brackets in dialogue are left untouched.
+
+v3.72 patch23: the TTS terminal now highlights performance tags in cyan, written the way
+your dialogue model wrote them. If you see them there, they made it through; if the line is
+plain, they were never written or were removed before reaching the panel.
+
+v3.72 patch24: spoken lines in the TTS terminal now read like a script - the speaker in
+magenta, the line itself picked out, and performance directions shown as *sighs* or
+*whispering* rather than as codes.
+
+v3.72 patch25: you can now give the panel a folder of voice clips of your own. Name a .wav
+after the voice type - femalenord.wav, or a character name - and it is used in place of the
+one SkyrimNet sends. This matters because SkyrimNet reduces the quality of every voice
+sample before sending it, and the Higgs engine can make use of far more detail than
+survives that. The terminal says when a line used one of your clips.
+
+v3.72 patch26: removes the orange warning saying the panel is not running as administrator.
+It no longer needs to be - that changed when the launcher stopped asking for administrator
+rights - so the warning was telling everybody about a problem that no longer exists.
+
+v3.72 patch27: fixes the one-click Higgs install failing to find the speech engine. The
+files it downloads have a code in their names that changes with each build, and the
+installer was looking for fixed names. It now recognises them whatever the code is.
+
+v3.72 patch28: the one-click Higgs install is more tolerant of how the speech engine names
+its downloads. It always takes the newest release, and now recognises the right file by the
+words in its name rather than an exact match, so a change of naming will not stop it
+working. If it ever cannot find one, it lists what the release does contain.
+
+v3.72 patch29: fixes an "Access is denied" error when saving settings. Windows briefly locks
+files while antivirus or search indexing looks at them, which is most likely just after a
+large download, and the panel gave up at the first refusal. It now waits and tries again.
+If it still cannot save after the Higgs install, it tells you what was installed and which
+four settings to fill in - the download itself is finished and nothing is lost.
+
+v3.72 patch30: installing Higgs now tells you when it has finished, naming what was
+installed and where, instead of quietly returning the page to how it looked before.
+Pressing Install again after a problem no longer re-downloads anything already in place.
+
+v3.72 patch31: fixes black console windows appearing when servers start and when you quit.
+The dialogue in the TTS terminal is now gold. Every terminal has a Timestamps button to
+hide the time at the start of each line, and the Proxy and Split View terminals have an
+Insert TTS button that shows the spoken line, and how fast it was produced, directly under
+the reply that produced it.
+
+v3.72 patch32: the lightning on the Launch button is now off unless you turn it on. In the
+terminals, performance directions like *laughs* no longer run into the next word, spoken
+lines inserted into the Proxy terminal are coloured the same as in the TTS terminal, and
+each one now sits directly beneath the reply that produced it rather than at the bottom of
+the list.
+
+v3.72 patch33: spoken lines shown in the Proxy terminal now sit in the right place. They
+were being grouped under one old reply and listed backwards. The speaker name is coloured
+correctly, and the note about a local voice clip has moved to the line that reports the
+saved file. The speech log also starts fresh each time you start the panel.
+
+v3.72 patch34: when a reply is spoken in several pieces, they now appear together beneath
+the reply that produced them rather than scattered between the other work the panel was
+doing. The terminals also no longer show the previous session's log while waiting for a new
+one to start.
+
+v3.72 patch35: hiding timestamps no longer hides the spoken lines along with them, and each
+spoken line now starts with a purple arrow so it stands out from the rest of the log. In
+Split View each half can be set to show the Proxy, the Thinking Content or the TTS log,
+and the Insert TTS button only appears on a half that is showing the Proxy.
+
+v3.72 patch36: spoken lines in the Proxy terminal now hang off the reply that produced them
+as a small branching tree, in the accent colour, with the last piece closing the branch. The
+panel also remembers which version of the speech engine it installed, so it can tell you
+when a newer one is out, and it notices an installation that is already present on disk -
+offering to use it rather than asking you to fill in the paths.
+
+v3.72 patch37: your own spoken lines now show a glowing arrow rather than a branch, since
+they are not produced by a reply. Each speaker gets its own branch, and the branch lines
+join up without gaps.
+
+v3.72 patch38: spoken lines now show who is actually speaking - Serana rather than
+Femaleyoungeager - and saved audio files are named after the character too. The panel works
+this out from the request it is already passing to your language model, which states who the
+character is; it keeps only the name, never the conversation, and nothing is sent anywhere.
+Where it has not learned a name yet it shows the voice type as before.
+
+v3.72 patch39: your own spoken lines were being labelled with a companion's name, and
+companions were being marked as yours. Both are fixed - your name is read from the same
+place, so your lines now show it. The branch lines in the terminal no longer overlap where
+they meet. The speech engine version is also found for installations the panel did not
+perform itself.
+
+v3.72 patch40: your own spoken lines now line up with the others, and the branch lines glow
+a little more. The speech engine version is looked for in more places, including asking the
+running server directly - though if it genuinely does not report one, the panel says so
+rather than making a number up.
+
+v3.72 patch41: your own spoken lines were sometimes labelled with a companion's name. The
+panel was reading the name of whoever was being spoken TO, which is not always you. It now
+reads it from the party, which is always yours. Spoken lines also show a small face or
+symbol for how they are meant to sound rather than the same mask every time.
+
+v3.72 patch42: the Launch button is now Launch LLM, and a Launch TTS button sits next to it
+which starts the speech server in the same way. The setting for choosing speech now names
+the voice rather than the software behind it. Faces in the terminal line up properly, the
+branch lines glow a little more, and the version check no longer points out when it cannot
+tell which version you have.
+
+v3.72 patch43: the TTS section is no longer marked Alpha. The Launch TTS button now lights
+up and glows like the Launch LLM one, both keep their glow when you hover over them even
+while busy, and you can start one while the other is still starting. The TTS page has been
+tidied of explanatory text.
+
+v3.72 patch44: a long spoken line now continues underneath itself rather than wrapping back
+across the branch beside it. In Split View the buttons no longer overlap in a narrow pane,
+and the Timestamps button affects only the terminal it sits in.
+
+v3.72 patch45: both launch buttons brighten when you point at them again. Terminate now
+visibly shows the speech server stopping rather than appearing to ignore it. And in Split
+View the Timestamps button really does affect only its own half.
+
+v3.72 patch46: in Split View at full window, the buttons on the right no longer sit on top
+of each other.
+
+v3.72 patch47: stopping the speech server while it was still starting no longer leaves the
+button stuck. In Split View at full window the right terminal's buttons now sit together in
+the top bar rather than on a row of their own.
+
+v3.73: everything from the v3.72 patches, gathered up. The headline is Higgs Audio v3
+speech: a one-click install, voices named after the characters speaking them, performance
+tags the dialogue model can write, and spoken lines shown in the terminal beside the reply
+that produced them. There are separate Launch LLM and Launch TTS buttons, and the panel no
+longer loads anything from the internet just to draw its own interface.

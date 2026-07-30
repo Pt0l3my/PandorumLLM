@@ -524,6 +524,13 @@ validation and is injected into the page as `__TSKINDS__`; `termScales`, `tsForI
 about but the Python tuple did not was **dropped on save with no error** - the fifth
 terminal is why it finally got collapsed.
 
+**An `!important` declaration overrides an animation.** `button { box-shadow:none
+!important }` silently killed the guide highlight on every button - the class was applied,
+the keyframes ran, nothing appeared. Buttons here are glowing text, so effects aimed at them
+must animate `text-shadow`; `#launchBtn` also carries `filter:none !important`, ruling out
+the drop-shadow variant. **Check what the target's own rules suppress before choosing a
+property to animate.**
+
 **Redraw from `renderCurrent`, not `liveRefresh`.** `liveRefresh` runs first and only
 *queues* the state fetch; `load()` then fetches and calls `renderCurrent`. A pane redrawn
 from `liveRefresh` renders with the state it already had - it looks correct in the source
@@ -553,6 +560,204 @@ hand-run launcher into a second server.
 targets one specific MOSS-TTS build. The engine is hardcoded even though every path is not:
 the `/tts` upstream route, the `max_new_tokens` / `reference_wav_b64` request fields, the
 `X-MOSS-*` response headers and the `--no-webui` server flag all follow that build.
+
+### Engines
+
+`ttsEngine` selects **moss** (default) or **audiocpp**. The **Gradio front is shared and
+engine-neutral** - upload, HEAD caching, event ids, both SSE shapes, the path jail, the
+allowlist, the body cap. Only the upstream call branches.
+
+| | moss | audiocpp |
+|---|---|---|
+| route | `POST /tts` | `POST /v1/audio/speech` |
+| body | `text`, `max_new_tokens`, `reference_wav_b64` | `model`, `input`, `voice_ref`, `reference_text` |
+| reference | base64, per chunk | **a local file path** |
+| chunking | `tts_chunks`, 4-way concurrent | the server's own `text_chunk_size` |
+| joining | `tts_wav_join` | one request, one file |
+
+The path passthrough works because the panel **starts** audio.cpp, so they are always on
+one machine. audio.cpp also serializes requests per model, so client-side concurrency
+would have bought nothing - hence `busy_timeout_ms`, or a slow line stalls every line after
+it. `lazy_load` is deliberately off: the Start button waits on `/health`, and with lazy
+loading that would answer before the model existed.
+
+`tts_acpp_config()` writes `server.json` on every start - the panel owns that file. The GPU
+is pinned with `CUDA_VISIBLE_DEVICES` and `"device": 0` rather than an index, because after
+masking the chosen card **is** index 0, the same trap as `--main-gpu 0`.
+
+**An error handler that throws destroys the evidence.** `load()`'s catch assigned through
+an unguarded `$("sub")`; when that element did not exist yet the handler threw and the real
+failure was replaced by `can't access property "textContent"`. Gated: no catch block may
+assign through an unguarded `$()`.
+
+**The served file and the kept file are different files.** `/gradio_api/file=` is jailed to
+the wrapper's temp folder, so a generated line must be served from there; `tts_save_named()`
+writes a second, readable copy into `ttsOutDir`. That folder belongs to the user and is
+never pruned - the temp copy is.
+
+**Do not invent a timing split.** The MOSS server reports generate and decode seconds;
+audio.cpp's headers are undocumented, so `_num_or()` tries the plausible names and the
+breakdown is only printed when one answers. Otherwise the wall time is shown as a single
+honest figure.
+
+**Use a regex LITERAL in the page, never `new RegExp("...")`.** The PAGE string eats one
+backslash and the JS string literal eats another, so `"\\\\["` arrives as a character class
+rather than an escaped bracket - the pattern compiles, matches the wrong thing, and looks
+fine in the source. Caught by printing `rx.source` from inside jsdom. In the Python source
+a literal needs `\\\\[` so the PAGE value is `\\[`; writing `\\[` also raises a
+SyntaxWarning, which the gate now treats as a failure.
+
+**Pairing the spoken line to its reply, measured not assumed.** A spoken line is logged
+0.2-0.5s BEFORE its dialogue completion: SkyrimNet fires TTS on the final token, llama.cpp
+writes its timing line afterwards. And a streamed reply yields SEVERAL spoken lines seconds
+apart, so matching each on its own timestamp scatters them among the Meta and Vision calls
+in between. Group consecutive lines (<=5s apart) into a burst and attach the burst where it
+starts. Both facts came from real uploaded logs, and both were the opposite of my first
+guess.
+
+**Two tag vocabularies, no selector.** SkyrimNet writes `[angry]` / `[sigh]`; the custom
+prompt writes `[EMOTION-ANGER]`. Lowercase words versus uppercase `FAMILY-VALUE` cannot
+collide, so both are accepted at once and neither engine choice needs a setting. Two traps
+found building it: the MOSS `[pause` matcher swallows a bare `[pause]`, so the alias pass
+must run **first**; and deleting every unrecognised bracket eats dialogue like
+`[see the note]` - only tags known to have no counterpart are removed.
+
+**Three tag rules that are invisible until they are wrong** (measured by
+`cleanestpoison/higgs3-tts-skyrimnet`, Apache-2.0): a bare `<|sfx:x|>` is **inert** without
+onomatopoeia abutting it; emotion/style/speed/pitch are **sentence-level** and must sit at a
+sentence start; and `<|prosody:long_pause|>` on a line **edge** runs the decoder to its cap
+with no end-of-clip, which audio.cpp answers with an error and no audio - repeated hits can
+take the engine down. All three now enforced in `tts_apply_tags`.
+
+**Match a third party's release assets on words, not names.** `releases/latest`
+means the version is never pinned, but the filename convention is not ours: exact
+names broke the moment a build hash appeared, and a prefix would break on any
+reordering. Required words, excluded words, preferred words with fallbacks - and the
+profile is a preference, because any Windows CUDA build beats failing. A mismatch
+must print the real asset list.
+
+**The installer is the panel's largest privilege**, so it is fenced: host-only, one
+explicit confirmation naming both sources and sizes, cancellable, resumable, free space
+checked first, and everything narrated into the TTS terminal. `_hi_unzip` **refuses**
+traversal and absolute-path entries rather than sanitising them - stripping `..` and then
+extracting quietly flattens a hostile archive into the folder instead of rejecting it,
+which is the trap the first version fell into.
+
+**"You are speaking to X" names the LISTENER, not the player.** SkyrimNet generates
+NPC-to-NPC dialogue, so when Serana addresses Brelyna that line holds Brelyna - and the
+player's own voice took her name. `## <Name>'s Party's Active Quests` is the reliable
+marker: the party is always the player's. It sits ~17 KB in, so it needs a wider scan than
+the speaker does, but only until found once.
+
+**The character's name is in the dialogue prompt, not the voice sample.** SkyrimNet's
+system message opens `You are Serana, a Female Nord in Skyrim`, and the proxy already
+carries that request - so `note_speaker()` reads the name from the first 4 KB, keeps only
+the name, and never parses the body. `speaker_for_voice()` then learns voicetype -> name
+and **consumes** the request it paired with: without that, a second voicetype asked inside
+the same window inherited the same name, and since pairings are cached one wrong guess
+would have stuck. Heuristic, and honest about it - it assumes one turn at a time.
+
+**The upload filename is the voicetype**, not a temp name: `femalenord.wav`,
+`malecommoner.wav`, `serana.wav`. That makes it a safe key for substituting a better
+reference, which is what `ttsVoiceDir` does - SkyrimNet resamples every reference to
+16 kHz first, including its own 44.1 kHz voice-samples, and Higgs runs at 24 kHz. Split
+the name on **both** separators; `os.path.basename` ignores `\\` off Windows.
+
+**SkyrimNet strips `<`, `|` and `>` from every line.** Higgs' native `<|family:value|>`
+therefore CANNOT reach the panel - watching for it passes through nothing while looking
+correct. The dialogue model is prompted to write `[EMOTION-FEAR]`, SkyrimNet's Chatterbox
+allow-list lets it through, and `tts_apply_tags` translates. Chatterbox specifically:
+it is the only backend with an audio-tag feature, at the cost of a 16000 Hz reference
+against Zonos' 22050 Hz. Prior art: `cleanestpoison/higgs3-tts-skyrimnet`.
+
+**Each engine gets only its own markers.** Higgs uses `<|family:name|>`; MOSS-TTS v1.5 uses
+`[pause 3.2s]` and nothing else. `tts_apply_tags(text, keep, engine)` strips the other
+engine's shapes in both directions, because an unknown marker is read aloud rather than
+ignored. Pause length is clamped - a dialogue model asked for a pause will eventually ask
+for a very long one.
+
+**Higgs inline tags: pass through, never invent.** Higgs acts on `<|emotion:...|>`,
+`<|style:...|>`, `<|prosody:...|>`, `<|sfx:...|>`. Only the dialogue model knows the mood,
+so the panel's whole job is to decide whether those tags survive - `ttsTags`, audio.cpp
+only, off by default. Two rules from Boson: an unrecognised tag is **read aloud**, so
+anything not in the catalogue is stripped either way; and a tag must sit flush against its
+word, so `tts_apply_tags` closes the space a language model will always leave.
+
+**A split pane shows a FEED but IS a pane.** `paintTail` is given the feed name, so a
+per-terminal setting keyed on the pane never matched - the left pane showing the proxy asked
+about "dashboard" while its button toggled "splitd". Pass the pane explicitly.
+
+**The page must load nothing from a third party.** It pulled Plus Jakarta Sans from
+`fonts.googleapis.com` on every open - a request carrying the operator's IP and referer
+to Google, from a panel documented as LAN-only, which also needed the internet to look
+right. Removed; the family stays declared so a local install is honoured and the stack
+falls through to Segoe UI. Gated: every `<link>` in the head must be self-served.
+
+**Exempting an endpoint from CFG_LOCK removes a guarantee it was relying on.** After
+`NO_CFG_LOCK`, two presses of Launch TTS could each pass the checks and start a server.
+Give each process-managing endpoint its OWN non-blocking lock: still no double-start,
+still no waiting on the other one.
+
+**A disabled button emits no pointer events.** The fleet button lost its hover arcs the
+moment it was running, because running disabled it. Mark busy with a class and refuse the
+click in the handler instead. And **an id-keyed CSS rule will not match a second button** -
+every `#launchBtn` rule had to be widened before `#launchTtsBtn` looked like a launch
+button at all, including the `position:relative` its arc overlay depends on.
+
+**One slow request must not hold CFG_LOCK.** The POST dispatch serialized every mutating
+endpoint, so a fleet launch blocked the TTS launch for its whole run. `NO_CFG_LOCK` names
+the process-management endpoints, which take the lock themselves for the moment they need
+it.
+
+**pythonw.exe has no console, and that is not free.** `python.exe` started with
+`CREATE_NO_WINDOW` still had one - hidden - and every console child inherited it. Switching
+to `pythonw` in patch16 removed it entirely, so each `pwsh`/`nvidia-smi` call allocated a
+fresh VISIBLE console. **Every `subprocess` call passes `**NOWIN`**; relying on an
+inherited hidden console is what broke.
+
+**The launcher must not look like a dropper.** v3.72 was flagged
+`Trojan:Win32/Wacatac.B!ml` because the exe relaunched itself with `runas` and `SW_HIDE`
+before starting Python hidden. That is the shape of a dropper, and it bought nothing - the
+panel binds high ports and writes only in its own folder, and `app.manifest` has always
+said `asInvoker`. Removed. **Anything added to launcher.cpp should be weighed against how
+it reads to a classifier**, because the project is unsigned by choice (§9) and has nothing
+else to lean on. `StartPandorumLLM.bat` exists so a block on the exe is never fatal.
+
+**Gradio is a transport, not a contract.** Zonos and Chatterbox both reach the wrapper
+through SkyrimNet's `GradioTTSInterface`, but their argument arrays differ - `fields[1]`
+and `fields[3]` are right for Zonos and land on a flag for Chatterbox. `tts_pick_fields()`
+keeps the proven positions when they hold and otherwise finds the reference as the only
+dict with a `path`, and the text as the longest string that is not a language tag.
+
+**Read the other process's log before reporting its failure.** A crashed audio.cpp closes
+the socket; the panel sees `WinError 10054` and nothing else, while `tts-server.log` names
+the cause one line earlier. `tts_diagnose()` reads the last 8 KB and translates known
+signatures. The single-architecture CUDA build alone caused three unrecognisable failures
+in one session.
+
+**A cache in front of the upload means fixing the upload fixes nobody.** SkyrimNet HEADs
+`/gradio_api/file=<path>` and skips the multipart entirely on a 200, so a reference stored
+by an older build is never re-sent. `tts_ref_canonical()` therefore checks the 44-byte
+header at use time and repairs in place. **When a fix lives at the write path, ask what
+happens to everything already written.**
+
+**Normalise the reference at the upload, not per engine.** SkyrimNet's samples are FFmpeg
+output carrying extra RIFF chunks. moss-tts-server rejected them with 400; audio.cpp with
+`failed to read WAV data chunk`. Same fault, two parsers, so `save_upload` normalises once
+and every engine gets a canonical file. The CLI smoke tests passed only because those
+references were soundfile-written and already clean - **test with a real SkyrimNet upload
+before concluding a reference path works.**
+
+**Model selection.** `ttsAcppModelsDir` is a root; `list_tts_models()` walks it three deep
+and returns both shapes audio.cpp accepts - a `.gguf` **file**, or a **folder** with
+`config.json` plus `model.safetensors[.index.json]`. Confirmed by test: `--model` pointed at
+a `.gguf` gives the same `--inspect` output as its containing folder, so the panel names the
+file and ambiguity disappears.
+
+**A folder holding both loads the GGUF, silently.** `--inspect` on a folder containing bf16
+safetensors *and* a q8 gguf reports `weights=1` pointing at the gguf, with no warning. Such
+folders are marked `shadowed`, disabled in the dropdown, and refused at start. `--weight` is
+a disambiguator *within* one resolved model, not a way to choose between models.
 
 ### Still open
 

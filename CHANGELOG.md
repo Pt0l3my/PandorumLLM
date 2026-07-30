@@ -4,9 +4,510 @@ Every released version, newest first. Compiled from the changelog in `README.txt
 which has had a paragraph appended on every release — so this is the real record,
 not a reconstruction.
 
-**Current version:** v3.72 Beta.
+**Current version:** v3.73 Beta.
 
 ---
+
+## v3.73
+
+Everything from the v3.72 patch series, plus the pre-release sweep below.
+
+**Safety and privacy**
+- Removed the Google Fonts link. The page pulled a webfont from `fonts.googleapis.com` on
+  every load, telling a third party the IP and referer of a panel documented as LAN-only,
+  and needing the internet to look right. The family is still declared, so a local install
+  is used; otherwise it falls through to Segoe UI. The page now loads nothing external.
+- `NO_CFG_LOCK` (patch43) removed the serialization that launching and starting TTS had
+  been relying on, so a second press could have started a second server. Each now has its
+  own lock, tried without blocking, so neither can double-start and neither waits on the
+  other.
+- The remote comment on `/api/tail` claimed dashboard and thinking only; it has always
+  allowed tts as well. Corrected, and it now states plainly that those feeds carry content
+  - reasoning, dialogue, character names - not only numbers.
+
+**Permissions tree**
+- Added the one-click installer and the audio.cpp update check to the host column, both of
+  which reach the internet.
+- Removed the claim that filenames are stripped for remote readers: the Saved line is a
+  bare filename by design since patch13. Full paths are still masked.
+- Added an explicit line saying terminal text reaches a remote reader.
+
+**Duplication**
+- The spoken line and the saved line were each written once per engine arm. Now one
+  `say_line` and one `saved_line`, called from both.
+- Two identical patterns for a rendered control token, one of them inline. Now one
+  `TTS_TOKEN_RX`.
+
+## v3.72 patch47
+- Fix: pressing Terminate while TTS was starting left the button reading "Starting TTS..."
+  for good. Nothing said the process had gone, so the flag was never cleared. The panel
+  already reports whether it holds a TTS process; the button uses that.
+- Fix: patch46 pushed the right pane's bar down a row, which left its Timestamps orphaned
+  below the Adjust that belongs with it. In full window the right pane's controls now move
+  into the outer bar, which is where its **Adjust already went** - the pattern was there and
+  I had not followed it.
+
+## v3.72 patch46
+- Fix: in full window, Split View's buttons overlapped on the right. There are **two**
+  chromes there - an outer bar carrying Full Window / Normal Size, and one per pane
+  carrying Timestamps and Adjust - and in full window both are absolutely positioned at the
+  top, so the right pane's right-aligned buttons landed underneath the outer ones. The pane
+  bars now sit below it. Making the bar wrap in patch44 could not have helped: they are
+  different elements, not one row.
+
+## v3.72 patch45
+- Fix: neither launch button lifted on hover. The crackle rides on the arc effect, which is
+  off by default since patch32, so hover now has its own rule and is always there.
+- Fix: Terminate did stop the TTS server - it always has - but the button had no state for
+  it, so it kept reading "TTS running..." while the model unloaded. It now says
+  **Stopping TTS...** and glows like the fleet button does.
+- Fix: per-terminal timestamps did not work in Split View. A pane paints the FEED it shows,
+  and the button toggles the PANE, so the two names never matched. `paintTail` is now told
+  which pane it is drawing into.
+
+## v3.72 patch44
+- Fix: a long spoken line wrapped back to column zero and cut through the branch. It now
+  hangs under the dialogue, indented to just past the speaker's name. The indent is measured
+  in terminal columns rather than characters, since an emoji occupies two cells.
+- Fix: in a narrow Split View pane the Timestamps and Normal Size buttons sat on top of each
+  other. The bar wraps now and no button can be squeezed away.
+- Fix: Timestamps toggled every terminal at once. It is remembered per terminal, and each
+  button carries the terminal it belongs to.
+
+## v3.72 patch43
+- Change: the TTS tab is no longer labelled Alpha.
+- Fix: **Launch TTS** had no lit or running glow. Every launch style was keyed on
+  `#launchBtn` alone, so none of them matched the second button - including the one that
+  gives it an arc overlay at all.
+- Fix: **Launch LLM** lost its hover crackle once servers were running. A disabled button
+  emits no pointer events; both buttons are now marked busy instead, with the click
+  refused in the handler.
+- Fix: starting one server blocked the other button. Every mutating request was
+  serialized on the config lock, and a launch holds it for seconds. Launching, TTS and the
+  installer now run unlocked - anything of theirs that needs the config takes the lock
+  itself.
+- Change: the TTS page carries less prose; the install hint reads "1 click install into the
+  PandorumLLM directory"; the version report is yellow throughout.
+
+## v3.72 patch42
+- Change: **Launch** is now **Launch LLM**, and **Launch TTS** sits beside it - same arcs,
+  same loading and running glows, driven by whether the TTS server is answering. Pressing
+  it with nothing configured says what is missing and opens the TTS page. Stopping stays on
+  the TTS page.
+- Change: the setting is now **TTS** rather than TTS engine, and names the voice - "Higgs
+  Audio v3 (4B) - runs on audio.cpp" - so the engine follows from the choice. Still stored
+  against the engine, so no existing config needs migrating.
+- Change: the branch glow is a three-layer shadow.
+- Fix: the mood icons did not line up, since emoji widths differ. Each sits in a fixed cell
+  now, and the plain one carries a variation selector or it renders narrow.
+- Change: the audio.cpp version check no longer mentions that it could not determine the
+  installed version. It states it where it knows, and otherwise just reports the newest
+  release.
+
+## v3.72 patch41
+- Fix: the player's line could carry another character's name. It was taken from
+  `You are speaking to ...`, which names the **listener** - so when one NPC addressed
+  another, the player's own voice took that NPC's name. The player is now named from
+  `## <Name>'s Party's Active Quests`, which is always the player whoever is speaking,
+  and falls back to "Player" rather than borrowing a name.
+- Change: a spoken line is headed by an icon for how it is meant to sound - an angry face,
+  a laugh, a whisper - rather than one mask for everything. Every emotion, style and sound
+  effect has one; a line with no tags gets a speaking head.
+- Change: a spoken line is now recognised by the markers around what was said rather than
+  by its icon, since the icon varies.
+- Change: the version check also reads the server's own startup output, which the panel
+  already captures.
+
+## v3.72 patch40
+- Change: a spoken line that hangs off nothing now starts in the same column as one that
+  hangs off a reply - the arrow is indented like the branch and takes its width.
+- Change: the branch glow is a two-layer shadow rather than one, so it reads more clearly.
+- Change: the version check tries four things in order, since the README turned out to
+  carry no version: the tag recorded at install, a **running server's** `/health` or
+  `/v1/models`, the file's own Windows version resource, then a version in any README or
+  CHANGELOG shipped beside it. If none answer it reports nothing rather than guessing.
+
+## v3.72 patch39
+- Fix: the branch is now **drawn** rather than typed. A stretched box glyph overlapped the
+  row below it and the glow doubled up where they met; an inline-block exactly one row
+  tall touches the next and no more.
+- Fix: the player's spoken lines took an NPC's name, and NPCs got the player's marker.
+  The player speaks BEFORE the next dialogue request, so their voice was pairing with the
+  previous turn's character. The player is now named from the same prompt line - `You are
+  speaking to Maxxor` - and never enters the learned map. The pairing window is also
+  tightened from 45s to 15s.
+- Fix: the version check reported nothing for an install the panel did not perform. It now
+  reads a version out of the README the release archives carry, and records it when an
+  existing install is adopted.
+
+## v3.72 patch38
+- Add: the terminal names the **character** rather than the voicetype - Serana, not
+  Femaleyoungeager - and saved files are named the same way. SkyrimNet's dialogue prompt
+  opens with `You are Serana, a Female Nord in Skyrim`, and the proxy is already carrying
+  that request, so no extra model call is needed and nothing leaves the machine. Only the
+  name is kept, never the prompt, and only the first 4 KB is scanned.
+- The pairing is **learned**: a TTS call arriving shortly after a dialogue request pairs
+  that voicetype with that name, and the request is consumed so a second voice in the same
+  window cannot inherit it. A learned pairing is never relearned. It is a heuristic - it
+  assumes one turn at a time, which is how SkyrimNet works - and falls back to the
+  voicetype when it has learned nothing.
+
+## v3.72 patch37
+- Change: a spoken line that hangs off nothing - the player's own speech, which no reply
+  produced - gets a glowing arrow rather than a branch.
+- Fix: a turn's chunks are grouped by speaker as well as by time. Grouping on the gap
+  alone merged the player's line with the NPC reply 3.7s later, so each speaker now gets
+  its own branch under the reply.
+- Change: the branch glyph is stretched to the row height, so consecutive ones meet
+  instead of leaving a gap - the terminal runs line-height 1.6 and a box character fills
+  only part of the row.
+
+## v3.72 patch36
+- Change: inserted spoken lines are drawn as a channel tree hanging off the completion
+  above - the glyph after the timestamp, indented, in the accent colour with a glow, and
+  the last chunk of a turn closing it with a corner.
+- Add: the audio.cpp release tag is recorded when the panel installs it, so **Check for
+  update** has something to compare. The binary reports no version of its own, which is
+  why the check found nothing.
+- Add: an install already on disk is detected. If the server and a model are in the
+  panel's own folders but the settings are not pointing at them - after installing by
+  hand, or after a config save that failed at the last step - the page offers **Use it**
+  instead of asking for four paths.
+
+## v3.72 patch35
+- Fix: turning timestamps off also removed the TTS insertions. The splice places lines by
+  timestamp, and the stamps were being stripped first, so it had nothing to match on.
+- Add: an inserted line begins with a bold purple arrow, so it is obviously not part of
+  the fleet log. The marker survives hiding the timestamps.
+- Add: each Split View pane chooses its own feed - **Proxy**, **Thinking Content** or
+  **TTS**. The choice is remembered.
+- Fix: Insert TTS appeared on both split panes regardless of what they showed. It is now
+  only on a pane showing the proxy.
+
+## v3.72 patch34
+- Fix: a streamed reply produces several spoken lines a second or so apart, and matching
+  each on its own timestamp scattered them between the Meta and Vision calls that landed
+  in between. Consecutive spoken lines within 5s are now treated as one turn and placed
+  together, under the dialogue completion nearest where the turn STARTS.
+- Fix: the terminals showed the previous run's fleet log until a new launch created a new
+  one. Only a log written during this session of the panel is shown; before the first
+  launch it says so.
+- Fix: the space between the mask and the speaker name was being trimmed away.
+
+## v3.72 patch33
+- Fix: spoken lines in the Proxy terminal piled onto one old completion in **reverse**
+  order. Measured from real logs, a spoken line lands 0.2-0.5s **before** its dialogue
+  completion - SkyrimNet fires TTS on the final token and llama.cpp writes its timing line
+  a moment later - so the match was the wrong way round. Each line is now placed under the
+  completion that follows it, and several on one completion stay in time order.
+- Fix: the speaker was mis-coloured. `(local clip)` in the name broke the parse, and the
+  parse itself matched to the last colon, which swallowed the timestamp. The suffix is
+  gone from the spoken line - it appears on the Saved line as `[local clip]` - and the
+  speaker is now read between the mask and the first colon after it.
+- Change: the TTS log starts empty each session, as the fleet logs already do.
+
+## v3.72 patch32
+- Change: the launch-button arc is **off** by default. The guide step highlights the button
+  instead, so nothing depends on it.
+- Fix: a tag ran into the word after it in the terminal - `*laughs*Hehe`. The display now
+  spaces them; the engine still receives them flush, which Boson require for the tag to
+  take effect.
+- Fix: a line spliced into the Proxy terminal was left unpainted. The spoken-line painter
+  is now shared, so it looks the same in both places.
+- Fix: the spliced line was pinned under the newest completion and stayed at the bottom.
+  TTS log lines are now stamped, and each spoken line is paired to the **dialogue**
+  completion at or before its time - the newest completion is usually a Meta call that
+  landed in between. Several lines can be placed at once, each in flow.
+
+## v3.72 patch31
+- Fix: console windows popped up on launch and twice on exit. patch16 switched the panel
+  to `pythonw.exe` so nothing had to be started hidden - but `python.exe` with
+  `CREATE_NO_WINDOW` still HAD a console, just hidden, and child processes inherited it
+  silently. `pythonw` has none, so every `pwsh` and `nvidia-smi` call allocated a fresh
+  visible one. All nine spawns now suppress it explicitly rather than relying on
+  inheriting somebody else's hidden console.
+- Change: the spoken line in the TTS terminal is gold rather than the theme accent.
+- Add: a **Timestamps** button on every terminal, hiding the leading `[20:45:12.86]`.
+- Add: an **Insert TTS** button on the Proxy and Split View terminals, which places the
+  newest spoken line and its speed under the newest dialogue completion.
+
+## v3.72 patch30
+- Fix: a successful install said nothing. The row had branches for running and failed but
+  not for finished, so it fell back to the same Install button - a completed install looked
+  exactly like one that had never been pressed. It now names the model and engine folder,
+  points at Start TTS, and can be dismissed.
+- Change: pressing Install again skips an engine that is already unpacked, so retrying
+  after a failure costs only the part that did not finish.
+- Change: the failure message says that anything downloaded is kept and trying again
+  resumes.
+
+## v3.72 patch29
+- Fix: saving the config could fail with `[WinError 5] Access is denied` on the atomic
+  rename. Anything holding a handle for an instant causes it - an antivirus scan or the
+  search indexer, both of which are busy right after the installer writes several
+  gigabytes into that folder. The write now retries for about two seconds before giving
+  up, and never leaves a `.tmp` behind.
+- Change: if that last step still fails, the installer reports what **was** installed and
+  the four values to set by hand, rather than reporting a failed install. The download is
+  complete by then and nothing is lost.
+
+## v3.72 patch28
+- Change: engine assets are matched on the **words** a filename contains rather than a
+  prefix. `win` not `windows`, so a `win64` archive matches; the CPU profile is a
+  preference with fallbacks (`balance`, then `portable`, then `fast`, then anything)
+  rather than a requirement; and the shared runtime is optional, since a future release
+  may fold it into the build. The release fetched is always `latest`, so the version was
+  never pinned - only the naming was, and now much less so.
+- A rename that still defeats it fails with the release's real asset list, so it can be
+  installed by hand from the same message.
+
+## v3.72 patch27
+- Fix: the Higgs installer could not find the engine. audio.cpp's profile archives carry
+  the build's commit hash - `audiocpp-windows-cuda-balance-27d87ba.zip` - while the shared
+  runtime does not, and the installer asked for exact filenames. It now matches by prefix,
+  so a new build's hash cannot break it.
+- Change: when an asset really is absent, the error lists what the release does carry
+  rather than only what was wanted.
+
+## v3.72 patch26
+- Fix: the "Panel is NOT elevated" banner showed for everyone. It dated from when the
+  launcher relaunched itself as administrator; patch15 removed that, so the panel is
+  never elevated and does not need to be - it binds high ports, writes only in its own
+  folder, and signals only processes it started. Banner, its styling and the matching
+  console warning all removed. `is_admin()` stays in the diagnostics dump.
+
+## v3.72 patch25
+- Add: **Local Voice Clips** on the TTS page. Drop a `.wav` named after the voicetype -
+  `femalenord.wav`, `malecommoner.wav`, `serana.wav` - and it is used instead of the
+  upload. SkyrimNet resamples every reference to 16 kHz before sending it, including the
+  44.1 kHz files in its own voice-samples folder; Higgs runs at 24 kHz and has room for
+  far more. The terminal marks a line that used one. Idea and naming scheme from
+  `cleanestpoison/higgs3-tts-skyrimnet`.
+- `.wav` only: the reference implementation accepts six formats because it has FFmpeg,
+  and this panel is stdlib-only.
+
+## v3.72 patch24
+- Change: audio tags read as stage directions in the terminal - `*sniffs*`, `*afraid*`,
+  `*whispering*`, `*long pause*` - rather than raw identifiers. All 43 have a word.
+- Change: the spoken line is colour coded. Speaker in magenta, the dialogue itself
+  highlighted, tag words in cyan between white stars.
+
+## v3.72 patch23
+- Change: the TTS terminal shows audio tags inline in `[FAMILY-VALUE]` form, in cyan, so
+  you can see at a glance whether a tag survived SkyrimNet and reached the engine. The
+  line still goes to Higgs in its native `<|family:value|>` form; only the display differs.
+- Add: the TTS terminal is painted rather than dumped as plain text, with every part of a
+  line escaped, since it carries NPC dialogue.
+
+## v3.72 patch22
+- Add: SkyrimNet's own tag vocabularies are translated too - `[angry]`, `[sigh]`,
+  `[whispering]`, `[laugh]`, `[pause]` and the rest - so its **stock** prompt works with
+  Higgs without being edited. No engine selector needed: the two forms cannot collide,
+  since Higgs' are uppercase `FAMILY-VALUE` and SkyrimNet's are lowercase words.
+- Tags with no Higgs counterpart - `[shush]`, `[groan]`, `[gasp]`, `[advertisement]`,
+  `[narration]` - are named and removed rather than guessed at.
+- Anything else in square brackets is **left alone**. A line may legitimately contain
+  `[see the note]`, and deleting it loses meaning where speaking a stray tag does not.
+- A recognised tag is removed even with tags switched off, so it is never read aloud.
+
+## v3.72 patch21
+- Add: **Cached Voices** on the TTS page, written into `server.json` as
+  `reference_cache_slots`. The engine's default is **one**, so with a conversation
+  alternating speakers practically every line re-encoded its reference. Default 64,
+  clamped to 1-1024; raise it if you use many custom-voiced NPCs.
+
+## v3.72 patch20
+- Add: **Install Higgs v3 for me** on the TTS page. Downloads the audio.cpp engine from
+  its GitHub release and the Q8 model from Hugging Face into `PandorumLLM\audio.cpp` and
+  `PandorumLLM\Models\TTS\Higgs-v3-4b`, unpacks them, and selects them on the page.
+  The manual route is unchanged and the guide still documents it.
+- One confirmation before anything is fetched, naming both sources, both sizes, the GPU
+  requirement and the disk needed. Host-only, refused without that confirmation, and
+  stoppable - a part-finished download is kept, so starting again resumes.
+- Archive entries that would land outside the target folder, or name an absolute path,
+  are **refused** rather than flattened into it.
+
+## v3.72 patch19
+- Fix: a line ending in a sound effect lost its full stop. The text is punctuated before
+  tags are rewritten, and a trailing `[SFX-LAUGHTER]` then appends its onomatopoeia after
+  it - leaving the spoken text unpunctuated, which invites the model to keep talking.
+  Punctuation is now checked again after rewriting, ignoring the tags themselves.
+
+## v3.72 patch18
+- Fix: audio tag handling rewritten against rules measured by
+  `cleanestpoison/higgs3-tts-skyrimnet`, each of which silently spoiled the feature:
+  - **Sound effects need onomatopoeia** immediately after the token, in the spelling the
+    model was trained on. A bare `<|sfx:sigh|>` does nothing at all; it now becomes
+    `<|sfx:sigh|>Ahh,`.
+  - **Emotion, style and speed/pitch prosody are sentence-level.** Written mid-line they
+    are moved to the front of their sentence rather than emitted where they were typed.
+  - **A pause with no speech on one side is dropped.** `<|prosody:long_pause|>` at the
+    start or end of a line makes the decoder run to its token cap without ending the
+    clip - audio.cpp then fails the request with no audio, and repeated hits have been
+    seen to take the engine down.
+- Fix: the sound-effect list was wrong. `breath` and `throat_clearing` are not tags;
+  `crying`, `screaming`, `burping`, `humming` and `sneeze` were missing.
+- Add: `EMOTION_FEAR`, `EMOTION FEAR` and `EMOTIONFEAR` are accepted alongside
+  `EMOTION-FEAR`, and competing tags are deduped rather than stacked.
+
+## v3.72 patch17
+- Fix: Audio Tags watched for a shape that can never arrive. SkyrimNet strips angle
+  brackets and pipes from every line, so Higgs' native `<|emotion:fear|>` is destroyed
+  before it leaves the mod. What survives is `[EMOTION-FEAR]`, and the panel now
+  translates that - which is the entire point of the feature.
+- Change: the Higgs guide no longer recommends Zonos outright. Zonos sends a 22050 Hz
+  reference and clones better; Chatterbox sends 16000 Hz but is the only backend with an
+  audio-tag list. The guide states the trade-off and the three SkyrimNet steps tags need.
+
+## v3.72 patch16
+- Change: the launcher no longer opens sockets. It used to probe five candidate ports to
+  find the panel; it now reads `panel-port.txt`, which the panel already writes and the
+  .bat already reads. A small unsigned binary doing port scans reads as reconnaissance.
+- Change: `pythonw.exe` is preferred, so nothing has to be started with
+  `CREATE_NO_WINDOW`. Telling Windows to hide a process is worth avoiding when unsigned.
+- Change: the version resource declares InternalName, OriginalFilename, a real copyright
+  and a Comments field pointing at the source; the manifest declares supported Windows
+  versions and DPI awareness. Thin metadata is itself a heuristic signal.
+- The binary now imports two notable functions in total: `CreateProcessW` to start the
+  panel and `ShellExecuteW` to open the browser.
+
+## v3.72 patch15
+- Fix: Windows Defender reported `Trojan:Win32/Wacatac.B!ml` on the launcher for some
+  users. The exe relaunched **itself, elevated and hidden**, then started Python hidden
+  from there - which is what droppers do, and how the ML classifier read it. The panel has
+  never needed administrator rights: it binds high ports and writes only inside its own
+  folder, and the manifest has always said `asInvoker`. The elevation was a leftover from
+  an older design and is gone. One less UAC prompt as well.
+- Add: **StartPandorumLLM.bat** is back. It does what the exe does, in plain readable text,
+  so an antivirus block on the exe can never leave anyone with no way in.
+
+## v3.72 patch14
+- Change: "Inline control tags" is now **Audio Tags**, and it applies to both engines.
+  MOSS-TTS v1.5 has its own marker - `[pause 3.2s]` - so each engine keeps what it
+  understands and drops the other's. A runaway pause is clamped to 10 seconds.
+- Change: the audio.cpp update result is coloured as the llama.cpp one is - green when
+  current, amber when behind or unknown, red on error.
+- Change: the TTS settings have room between them, with a rule separating groups.
+
+## v3.72 patch13
+- Change: the terminal's Saved line shows the filename only. The folder is a setting, so
+  printing it on every line was noise. Both engines.
+- Add: **Inline control tags** for audio.cpp. Higgs acts on `<|emotion:...|>`,
+  `<|style:...|>`, `<|prosody:...|>` and `<|sfx:...|>` written into the line. Off by
+  default; the panel adds none of its own, only decides whether the ones your dialogue
+  model wrote reach Higgs. Unrecognised tags are always removed - the model reads aloud
+  what it does not know. The space after a tag is closed, which Boson document as
+  necessary for the tag to take effect.
+
+## v3.72 patch12
+- Add: the TTS terminal announces starting, ready, listening and stopping, in the shape the
+  reference wrapper used - naming the engine, the model and the card. The reference wrapper
+  never reported stopping at all; this does.
+- Add: the audio.cpp folder now gets what the llama.cpp folder has - a warning when no
+  `audiocpp_server.exe` is found in it or below it, the releases address as a copyable
+  block, and the update check beside it.
+- Fix: a guide block flashed an outline *and* pulsed. The outline rule no longer applies to
+  the pulsing blocks.
+
+## v3.72 patch11
+- Change: the guide keeps one **TTS Guide** tab, with **Higgs v3** and **MOSS-TTS** as pages
+  inside it rather than two more tabs across the top.
+- Add: copyable blocks carry a copy icon, and pulse in the accent colour when clicked. The
+  icon is an SVG, and it is excluded from what reaches the clipboard.
+
+## v3.72 patch10
+- Change: the audio.cpp server is chosen by **folder**, as llama.cpp already is. The panel
+  finds `audiocpp_server.exe` in it or below it - flat for a prebuilt, nested for a source
+  build. Naming an executable directly is no longer offered.
+- Fix: a path picker opened on a stale or unreachable path answered "not a folder" and gave
+  up. It now falls back to the drive list.
+- Add: **Check audio.cpp version** - the newest release tag, and the installed one where the
+  binary will report it. Same terms as the llama.cpp check: only when pressed.
+- Change: "Wrapper Port" is now **Proxy TTS Port** - the wrapper is optional, the port is not.
+- Add: the User Guide's TTS page splits into **TTS: MOSS** and **TTS: Higgs v3**, the latter
+  with the release link, both model download commands, and a default model folder.
+- Change: the crash hint no longer assumes you built from source - the prebuilt CUDA package
+  covers RTX 20xx and newer.
+
+## v3.72 patch9
+- Change: the audio.cpp terminal now shows the full breakdown. The server sends no timing
+  headers under any name tried, so the request itself is timed: `server:` is the round trip
+  with audio tokens and tokens per second, `overhead:` is what the panel spent around it.
+  If a future build does send timings, its own split is used instead.
+- Add: unrecognised `x-*` response headers are logged once, so audio.cpp's real timing
+  header names can be found rather than guessed at.
+
+## v3.72 patch8
+- Add: **Saved Audio Folder** on the TTS page, for both engines. Generated lines are kept
+  there as `<Speaker>_<YYYYMMDD_HHMMSS>.wav`, the same scheme the reference wrapper used,
+  with a numeric suffix if two land in the same second. Blank keeps the old behaviour.
+  Nothing in that folder is ever deleted by the panel.
+- Change: the terminal shows the reference wrapper's breakdown again - generate, codec and
+  overhead with audio tokens and tokens per second. On audio.cpp the split is shown only
+  when the server reports its own timings; otherwise the total is shown honestly as one
+  figure rather than a guess.
+
+## v3.72 patch7
+- Fix: a failed state load reported the wrong error. `load()`'s catch wrote through an
+  unguarded `$("sub")`, so when that element did not exist the handler threw and replaced
+  the real failure with a TypeError. Guarded, and the original error is now traced.
+- Add: the gate rejects any catch block that assigns through an unguarded `$()` - an error
+  handler that throws destroys the evidence.
+
+## v3.72 patch6
+- Fix: Chatterbox sent its reference voice to the wrong place. The wrapper read the text
+  and the voice from fixed positions in the Gradio call, which is right for Zonos and
+  wrong for every other engine using the same interface. Positions are kept where they
+  hold and the fields are found by shape where they do not.
+- Add: when the audio.cpp server crashes, the panel reads the tail of `tts-server.log`
+  and says what happened. A dropped connection reads as `WinError 10054` and explains
+  nothing; the server's own log names the cause one line earlier.
+
+## v3.72 patch5
+- Fix: patch4 normalised uploads but did not fix anyone who had already used the panel.
+  SkyrimNet HEADs the reference path first and skips the upload on a 200, so a file
+  cached by an earlier build was never re-sent and never normalised - the failure
+  survived the fix. A stale reference is now checked (44 bytes) and repaired in place on
+  first use. No need to clear the temp folder by hand.
+
+## v3.72 patch4
+- Fix: audio.cpp answered every real request with `failed to read WAV data chunk`.
+  SkyrimNet's reference voices come from FFmpeg with extra RIFF chunks; the MOSS path
+  normalised them, the audio.cpp path was given the raw file. Normalisation moved to
+  `save_upload`, so the stored reference is canonical for every engine.
+
+## v3.72 patch3
+- Change: the audio.cpp model is chosen from a scanned list, as LLM models already are.
+  Set a TTS models folder and pick from a dropdown; the scan finds both shapes audio.cpp
+  loads - a `.gguf` file, or a folder holding `config.json` and `model.safetensors`.
+- Fix: a safetensors folder with a `.gguf` beside it is marked unavailable and refused at
+  start. audio.cpp resolves the gguf and ignores the safetensors **silently**, so picking
+  "safetensors" there would have loaded something else with no indication.
+- Change: a selected model may be a file or a folder, since pointing `path` at a `.gguf`
+  works and removes the ambiguity entirely.
+
+## v3.72 patch2
+- Add: a TTS engine selector. **audio.cpp** joins MOSS - one server binary and a model
+  folder, no python, no venv, no wrapper script. The panel writes its `server.json`,
+  starts it with the GPU masked by UUID, and talks to `/v1/audio/speech`.
+- Change: on the audio.cpp path the reference voice is passed as a **file path**, so
+  nothing is base64'd per request. Chunking, concurrency and WAV stitching are also gone -
+  the server does its own chunking and serializes requests, so all three were doing nothing.
+- Change: the Gradio front is untouched. Upload, HEAD caching, event ids, the SSE shapes,
+  the path jail, the client allowlist and the body cap are engine-neutral and shared.
+- Add: a folder picker on the TTS page, since an audio.cpp model is a directory.
+
+## v3.72 patch1
+- Add: Customization > Effects - a switch for the lightning on the Launch button. On by
+  default. Guarded inside `arcFire`, so every path that draws it is covered by one check;
+  the button still changes colour and still shows the running count with it off.
+- Change: with the lightning off, the Main Guide's launch step highlights the button. That
+  step passes no selector to `helperGo` because the arc was meant to do the pointing, so
+  with it off nothing pointed.
+- Fix: the guide highlight was invisible on **every** button, not just this one. `guideHL`
+  animates `box-shadow`, and `button { box-shadow:none !important }` overrides it - an
+  `!important` declaration beats an animation. Buttons now get a text-shadow variant,
+  which is what `lbDemo` and `btnPulse` already use on the same element.
 
 ## v3.72
 - Fix: the proxy read whatever body length a caller claimed. Capped like the TTS listener;
