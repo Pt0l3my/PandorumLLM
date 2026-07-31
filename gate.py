@@ -680,8 +680,10 @@ check("could not be saved" in _hi and "Set these by hand" in _hi,
 _row = JS[JS.index("function higgsInstallRow"):JS.index("async function higgsInstall")]
 check("g.done" in _row, "a finished install says so, rather than falling back to the button")
 check("higgsDismiss" in _row and '"dismiss"' in py, "and can be dismissed")
-check("Engine already unpacked" in _hi,
-      "pressing it again skips what is already there, so it is cheap to retry")
+# the skip is now conditional on the marker - see the install section - so retrying is
+# still cheap, but only for an engine we put there at this release
+check("resuming" in _hi.lower() or "resume" in _hi.lower(),
+      "a retry resumes the model rather than starting it over")
 _sc = py[py.index("def save_config(cfg):"):py.index("DEFAULT_PROVIDER_SEED")]
 check("PermissionError" in _sc and "time.sleep" in _sc,
       "an atomic write retries a transient Windows lock rather than losing the settings")
@@ -780,7 +782,7 @@ for _m in re.finditer(r"subprocess\.(run|Popen|check_output)\(", py):
 check(len(_spawns) >= 8, "every spawn is accounted for", "%d found" % len(_spawns))
 check(not _bare, "none of them can pop a console window", str(_bare))
 
-check('"termStamps": "on"' in py and '"termInsTts": "off"' in py,
+check('"termStamps": "on"' in py and '"termInsTts": "on"' in py,
       "the terminal toggles are settings, so they survive a reload")
 # count BUTTONS: the sync function selects on the same attribute, so counting every
 # mention counts my own querySelectorAll as a sixth terminal
@@ -790,6 +792,15 @@ check(PAGE.count(">Timestamps</button>") == 6, "Timestamps is on all five termin
 check(PAGE.count(">Insert TTS</button>") == 4,
       "Insert TTS only on the three that show a dialogue completion",
       str(PAGE.count(">Insert TTS</button>")))
+check("function onOffLabel" in JS,
+      "a toggle reads its own state, the same way Remote Access and Fullscreen do")
+_ool = JS[JS.index("function onOffLabel"):JS.index("function syncTermToggleUI")]
+check('"blueglow"' in _ool, "with On in blue and Off plain")
+_stu = JS[JS.index("function syncTermToggleUI"):JS.index("function syncTermToggleUI") + 700]
+check(_stu.count("b.innerHTML = onOffLabel") == 2,
+      "both toggles are labelled, not just one", str(_stu.count("b.innerHTML = onOffLabel")))
+check('onOffLabel("Timestamps", on)' in _stu and 'b.dataset.kind' in _stu,
+      "and Timestamps reads the terminal it belongs to, not a global")
 check("syncTermToggleUI" in JS[JS.index("function refreshCurTerm"):
                                JS.index("function refreshCurTerm") + 400],
       "the lit state is applied on every draw, not only after a click")
@@ -1017,7 +1028,7 @@ check(JS.count("syncTtsButton()") >= 2,
       "and it is called on a refresh pass, not only defined")
 check("Set these on the TTS page first" in JS,
       "pressing it with nothing configured says what is missing rather than failing")
-check(">TTS</label>" in JS and "Higgs Audio v3 (4B) - runs on audio.cpp" in JS,
+check('<div class="tsect">TTS</div>' in JS and "Higgs Audio v3 (4B) - runs on audio.cpp" in JS,
       "the setting names the TTS; the engine follows from it")
 check("ttsEngineSel" in JS,
       "and it is still keyed on the engine value, so no config needs migrating")
@@ -1102,6 +1113,174 @@ check("Plus Jakarta Sans" in PAGE,
 check("Segoe UI" in PAGE, "and the fallback is a font every Windows install has")
 
 
+section("TTS as its own tab")
+check('id="nav-tts"' in PAGE and 'id="tab-tts"' in PAGE, "TTS has a nav entry and a tab")
+_nav = re.findall(r'<button id="nav-(\w+)"', PAGE)
+check(_nav.index("tts") == _nav.index("servers") + 1, "sitting under Server", str(_nav))
+check("dsub-tts" not in PAGE, "and is no longer a sub-tab of Proxy")
+check('"tts"' in JS[JS.index('["servers"'):JS.index('["servers"') + 160],
+      "showTab knows about it, or the pane would never be shown")
+check('showDsub("tts")' not in JS, "nothing still navigates to the old place")
+check('data-hostonly' in PAGE[PAGE.index('id="nav-tts"') - 60:PAGE.index('id="nav-tts"') + 60],
+      "host-only, as the sub-tab was")
+check('"termInsTts": "on"' in py, "spoken lines show in the proxy terminal by default")
+check(">Install Higgs v3</button>" in JS, "the install button is not chatty about it")
+
+
+section("tree wrapping and TTS sections")
+# SVG text does not wrap: a long bullet ran straight across into the next column
+_liw = JS[JS.index("function li(x, y, mark"):JS.index("const hostItems")]
+check("LI_CHARS" in _liw and "rows.push" in _liw, "a long bullet wraps inside its column")
+check("h: LI_STEP" in _liw, "and reports its height, so the next one starts below it")
+check("__H__" in JS and "Math.max(650" in JS,
+      "the box is sized to the wrapped content rather than a fixed height")
+# the page reads as groups now
+check('["##", "Folders & Model"]' in JS and '["##", "Voice"]' in JS,
+      "the TTS fields are grouped under headings")
+check('f[0] === "##"' in JS, "and a heading row is rendered as one, not as a field")
+check("#dpane-tts .tsect" in _css and "border-top" in _css,
+      "with a rule separating it from the section before")
+check(JS.count('<div class="tsect">Install</div>') == 5,
+      "the install row is headed in every state it can be in",
+      str(JS.count('<div class="tsect">Install</div>')))
+check(".bigbtn" in _css and "bigbtn" in JS,
+      "and the install button is the size of what it does")
+
+
+section("errors: what counts, and clearing them")
+# a clean run should leave no error log at all
+check('log_error("panel", "session start' not in py,
+      "session start is not an error - it created an error_N.log on every clean run")
+check('panel_log("[panel] session start' in py, "it goes in the ordinary log")
+# every remaining call must be describing a failure
+_bad = []
+for _l in py.split("\n"):
+    if ('log_error("' in _l or "log_error('" in _l) and not _l.strip().startswith("#"):
+        if not re.search(r"fail|error|could not|cannot|refus|reject|unreach|unparse|"
+                         r"crash|invalid|denied|timeout|unable|missing|\be\b|\bln\b|"
+                         r"\bline\b|traceback", _l, re.I):
+            _bad.append(_l.strip()[:70])
+check(not _bad, "every log_error call describes something that failed", str(_bad)[:150])
+
+check("def api_errors_clear" in py, "collected issues can be cleared")
+_ec = py[py.index("def api_errors_clear"):py.index("def log_error")]
+for _n in ("ERR_LOG", "ERR_TOTAL", "ERR_BY_TYPE", "ERR_BY_LEVEL", "ERRTRACK"):
+    check(_n in _ec, "clearing resets %s" % _n)
+check("ERR_FILE[0]" in _ec, "and empties the log file, not just the list")
+check("/api/errors-clear" not in (_ro | _po), "clearing is host-only")
+check('data-act="errClear"' in JS and "data-hostonly" in JS, "the button is host-only too")
+check("confirm(" in JS[JS.index('d.act === "errClear"'):JS.index('d.act === "errClear"') + 260],
+      "and asks first, since it cannot be undone")
+
+
+section("install leaves nothing to chance")
+_hw = py[py.index("def higgs_install_worker"):py.index("def api_higgs_install")]
+# "is there any audiocpp_server.exe here" adopted a CPU build someone unpacked by hand,
+# and then installed nothing at all
+# nothing already in the folder is trusted, ours or not: a marker still vouched for an
+# install antivirus had gutted
+check("ALWAYS replace" in _hw, "the engine folder is cleared on every install")
+check("have == tag" not in _hw, "no condition keeps what is already there")
+check("the engine is always installed fresh" in _hw, "and the log says so plainly")
+check("os.path.getsize(gguf) > 4e9" in _hw,
+      "the 5 GB model is still kept when whole - that is the expensive one")
+check("could not clear" in _hw, "and a folder that will not clear stops the install loudly")
+# an install that does not finish the job is worse than one that fails
+for _k in ('st["ttsWrapMode"] = "on"', 'st["ttsAcppVersion"] = tag',
+           'st["ttsEngine"] = "audiocpp"', 'ttsWrapperPort'):
+    check(_k in _hw, "a finished install sets %s" % _k.split("=")[0].strip())
+check('HIGGS_INSTALL["warn"]' in _hw,
+      "and a settings write that failed is reported, not passed off as success")
+check("g.warn" in JS, "shown under the button in amber")
+_row3 = JS[JS.index("function higgsInstallRow"):JS.index("async function higgsInstall")]
+check("#ff5d5d" in _row3, "with an outright failure in red")
+
+# the only guide step nothing can detect
+check('stepAt("yamlsent") && !res[i]' in JS,
+      "the step that can never satisfy itself says it is manual")
+check(".gmanual" in _css and "gmanualPulse" in _css, "and pulses so it reads as waiting")
+check("prefers-reduced-motion" in _css, "unless the system asks for no motion")
+
+
+section("stale diagnosis, stop, installed")
+# the server log spans every run, so a blind tail reported a failure that had been fixed
+_td = py[py.index("def tts_diagnose"):py.index("def tts_pick_fields")]
+check("since=None" in _td, "the diagnosis can be scoped to one run")
+check("min(max(0, since), end)" in _td, "reading only from where that run began")
+# it must be the DEATH path that uses it - that is the one people see
+_tss = py[py.index("def tts_server_status"):py.index("TTS_PROC = {")]
+check('tts_diagnose(cfg, TTS_PROC.get("log_at"))' in _tss,
+      "the startup-death hint reads this run, not a blind tail")
+check('TTS_PROC.get("log_at")' in py, "and the start position is recorded when it spawns")
+check('TTS_PROC["log_at"] = os.path.getsize' in py, "from the log size at that moment")
+# stopping is most wanted exactly while it is starting
+_stop = JS[JS.index('data-act="ttsStop"'):JS.index('data-act="ttsStop"') + 400]
+check('busy === "start"' in _stop, "Stop works during startup, not only once it is up")
+check('busy === "stop"' in _stop, "and is only dead while a stop is already running")
+# and say plainly when it is already there
+check(">Installed</span>" in JS and "f.adoptable" in JS,
+      "an install that is present and selected says so")
+check('"wired": wired' in py, "which needs the settings state, not just the files")
+
+
+section("a server that dies while loading")
+# it never opens the port, so waiting for the port waits for ever
+_ts = py[py.index("def tts_server_status"):py.index("TTS_PROC = {")]
+check("proc.poll()" in _ts, "the process is polled, not just the port")
+check("tts_diagnose(cfg," in _ts, "and its log is read to say why")
+check('TTS_PROC["pid"], TTS_PROC["proc"] = None, None' in _ts,
+      "the dead process is reaped, so nothing reads a stale pid")
+check('not TTS_PROC.get("stopping")' in _ts, "a deliberate stop is not reported as a death")
+check("sv.died" in JS, "the page shows it instead of waiting for it to answer")
+check("!srv.died" in JS, "and the button stops saying it is starting")
+# the two failures this GGUF actually produced
+_hints = py[py.index("TTS_HINTS = ("):py.index("TTS_HINTS = (") + 1400]
+check("missing model file 'config'" in _hints,
+      "a tensor-only GGUF is named as such, with what it needs beside it")
+check("exact tensor shape metadata is invalid" in _hints,
+      "and a GGUF from another converter is too")
+# an <a href> is a navigation, which armed the leave-page guard
+check('class="btnlink" download href="/api/log-download' in JS,
+      "downloading a log does not prompt to leave the page")
+
+
+section("warnings are not errors")
+# log_error also raises a UI issue, so an observation logged that way told the user
+# something was broken when nothing was
+check("def log_warn" in py, "there is a level for something that did not fail")
+_lw = py[py.index("def log_warn"):py.index("def log_warn") + 700]
+check("_record_issue" not in _lw, "and it raises no UI issue")
+check("panel_log(" in _lw, "writing to panel.log rather than the error log")
+_slow = [l for l in py.split("\n") if "slow /api/state" in l and "log_" in l]
+check(_slow and all("log_warn" in l for l in _slow),
+      "a slow state read is a warning", str(_slow)[:100])
+_scan = [l for l in py.split("\n") if "model folder scan:" in l and "log_" in l]
+check(_scan and all("log_warn" in l for l in _scan), "so is a slow model scan")
+# nothing else timing-shaped should still be an error
+# match a CALL - log_error with its opening quote - not a mention. Prose ABOUT
+# log_error matched the very check meant to police it.
+_timing = [l.strip()[:70] for l in py.split("\n")
+           if ('log_error("' in l or "log_error('" in l)
+           and re.search(r"\bslow\b|\btook\b|elapsed", l, re.I)]
+check(not _timing, "no timing observation is logged as an error", str(_timing)[:120])
+
+
+section("state read probes")
+# 700ms of a 750ms state read was two dead ports timing out one after the other, because
+# priming and reading disagreed about WHICH ports
+_sp = py[py.index("def state_probe_ports"):py.index("def api_state(*a")]
+check("parse_ps1_port" in _sp,
+      "priming resolves the port the same way the read does - from the launcher script")
+check("tts_server_port" in _sp, "and includes the TTS port, which was never primed")
+_pr = py[py.index("def prime_slot_status"):py.index("def slot_status")]
+check("threading.Thread" in _pr, "probes run together, not one after another")
+check("if not todo:" in _pr,
+      "and a single uncached port is primed too - the old guard left it serial")
+for _c in ("prime_slot_status(state_probe_ports())",):
+    check(py.count(_c) == 2, "both the state read and the debug report prime the same way",
+          str(py.count(_c)))
+
+
 section("permission tree claims")
 # Section 8: every claim the tree makes is checked against the code enforcing it.
 # Without this the tree quietly goes stale - it named three terminals for a build that
@@ -1121,7 +1300,7 @@ check(len(_named) == len(_tsubs), "tree names no terminal that does not exist",
 # anything the tree says is "not offered" must actually be marked host-only
 _off = re.search(r'"([^"]*are not offered)"', _tree)
 _PANE = {"Proxy Setup": "dsub-setup", "SkyrimNet YAML": "dsub-yaml",
-         "TTS [Alpha]": "dsub-tts", "Provider Statistics": "pmsub-stats"}
+         "TTS": "nav-tts", "Provider Statistics": "pmsub-stats"}
 check(bool(_off), "the tree states which pages are withheld from remote")
 # withheld can be enforced two ways: the data-hostonly attribute, or a redirect in
 # applyScopeUI / the show* guard. Either satisfies the claim; neither does not.
@@ -1500,7 +1679,7 @@ _dg = py[py.index("def tts_diagnose"):py.index("def tts_pick_fields")]
 check("no kernel image" in py and "TTS_HINTS" in py,
       "a crash is translated into something a person can act on")
 check("f.seek(0, 2)" in _dg, "only the tail of the server log is read, not all of it")
-check("tts_diagnose(cfg)" in py[py.index("def _run"):py.index("def _silence")],
+check("tts_diagnose(" in py[py.index("def _run"):py.index("def _silence")],
       "and the hint is attached to the failure the user sees")
 
 # Zonos and Chatterbox both speak Gradio but send different argument lists
@@ -1584,6 +1763,9 @@ check("unknown action" in fp.api_tts_server({"action": "wibble"}).get("error", "
 _seen = {}
 class _FakeProc:
     pid = 4242
+    returncode = None
+    def poll(self):
+        return None          # a real Popen always has this; alive means None
 def _fake_popen(args, **kw):
     _seen["args"] = list(args); _seen["kw"] = kw
     return _FakeProc()
@@ -1692,7 +1874,7 @@ const dom = new JSDOM(html, { runScripts: 'dangerously', pretendToBeVisual: true
     w.onerror = (m) => errors.push(String(m));
   }});
 const w = dom.window, d = w.document;
-const need = ['tab-dashboard','dsub-tts','dpane-tts','tsub-tts','tpane-tts','tail-tts','tts-src'];
+const need = ['tab-tts','nav-tts','dpane-tts','tsub-tts','tpane-tts','tail-tts','tts-src'];
 const missing = need.filter(id => !d.getElementById(id));
 let threw = '';
 // top-level `let state` is a script-scope binding, NOT a window property: assigning

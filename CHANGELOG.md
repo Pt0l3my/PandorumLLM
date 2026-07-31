@@ -4,9 +4,132 @@ Every released version, newest first. Compiled from the changelog in `README.txt
 which has had a paragraph appended on every release — so this is the real record,
 not a reconstruction.
 
-**Current version:** v3.73 Beta.
+**Current version:** v3.74 Beta.
 
 ---
+
+## v3.74
+
+Everything from the v3.73 patches, with two changes that prompted the release.
+
+**The Higgs installer no longer trusts what it finds**
+- It kept whatever was already in its folder if an `audiocpp_server.exe` was there, which
+  adopted a CPU-only build a user had unpacked by hand - the real engine never arrived and
+  the settings pointed at the wrong one. Marking our own installs was not enough either: a
+  marker still vouched for a folder antivirus had since gutted. **The engine folder is now
+  cleared and reinstalled every time.** It is a couple of hundred MB; the 5 GB model is
+  still kept when whole and resumed when not.
+- A finished install also sets **Who translates for SkyrimNet** to *The panel*, and fills
+  the proxy and server ports if blank. Leaving that pointing at a wrapper the user does not
+  have produces silence with nothing to explain it.
+- A settings write that fails after a good download is reported in amber rather than passed
+  off as success. An outright failure is red, under the button.
+
+**Step 7 says it is manual**
+- It carries `ok: () => false` - nothing can ever satisfy it but the tick - so it sat red
+  indefinitely for anyone who did not realise. It now shows a pulsing
+  **Manual step - click the tick**.
+
+## v3.73 patch11
+- Fix: the installer adopted **any** `audiocpp_server.exe` already sitting in its folder
+  and skipped the download - so a CPU-only build unpacked there by hand meant the real
+  engine never arrived, and the settings pointed at the wrong one. It now records the
+  release it installed in `.pandorum-engine.json` and only skips when that matches;
+  anything else is cleared and replaced. A folder that cannot be cleared stops the install
+  with a reason rather than continuing.
+- Fix: a finished install now also sets **Who translates for SkyrimNet** to *The panel*,
+  and fills the proxy and server ports if they are blank. An install that leaves the
+  wrapper pointing at software the user does not have produces silence.
+- Fix: a settings write that failed after a good download reported plain success. It is now
+  shown in amber under the button; an outright failure is shown in red, as before.
+- Add: step 7 of the Main Guide carries a pulsing **Manual step - click the tick** note.
+  Nothing can ever detect it, so it sat red indefinitely for anyone who did not realise.
+
+## v3.73 patch10
+- Change: the **Timestamps** and **Insert TTS** buttons read `Timestamps: On` /
+  `Insert TTS: Off`, with On in the same blue glow as Remote Access and Fullscreen in the
+  header - so a switch looks the same wherever it appears. Timestamps still reports the
+  terminal it belongs to, including the copy in the outer bar in full-window Split View.
+
+## v3.73 patch9
+- Removed the Model Source selector added in patch8. Loading from safetensors works, but
+  the engine caps `weight_type` at q8_0 for this family, so it could not do the one thing
+  it was wanted for. The TTS page is back to picking a GGUF from the models folder.
+
+## v3.73 patch8
+- Add: **Model Source** on the TTS page - a ready-made GGUF, or the original safetensors
+  folder. GGUF keeps the model picker and Rescan exactly as before.
+- Add: with safetensors selected, a **Weight Type** list applied as the weights load:
+  native, BF16, FP16, FP32, Q8_0. Changing it needs a restart, not a conversion.
+- The list is what the engine accepts and no more. Asked for anything smaller it answers
+  "weight_type currently supports only native, f32, f16, bf16, and q8_0", so the k-quants
+  the converter offers are deliberately absent - offering them would be offering a failure.
+
+## v3.73 patch7
+- Fix: the startup diagnosis added in patch6 read a blind 8KB tail of a log that spans
+  every run, so it reported a **previous** failure after the cause had been fixed. The
+  position the current run starts at is recorded when the server spawns, and only that
+  part is read.
+- Fix: **Stop** on the TTS page was disabled during startup - exactly when you want it, if
+  a model is taking minutes or is never going to answer. It is now only dead while a stop
+  is already running.
+- Add: an **Installed** badge beside Install Higgs v3 when the engine and a model are
+  present and selected.
+
+## v3.73 patch6
+- Fix: a TTS server that died while loading left the panel on "waiting for it to answer"
+  for ever - it was watching the port, and a server that dies never opens one. The process
+  is now polled, reaped, and its log read to say why.
+- Add: two hints for GGUFs that will not load. A **tensor-only** build says it needs its
+  sidecars (config.json, tokenizer, chat template) in the same folder; a GGUF written by
+  **another converter** says audio.cpp cannot read its tensor metadata.
+- Fix: downloading a log prompted "leave site?". The link was a plain `<a href>`, which
+  counts as a navigation and armed the close-page guard. It carries `download` now.
+
+## v3.73 patch5
+- Fix: "session start" was written with `log_error`, which **created an error log on every
+  clean run** - so there was always an error file, containing only a banner. It goes in the
+  ordinary log now; the error log writes its own header naming the version when a real error
+  first arrives. A clean session leaves no error file at all.
+- Audited the other 21 `log_error` calls: all describe something that actually failed, so
+  none were changed. The IP-allowlist rejections stay errors deliberately - they are the
+  usual explanation when SkyrimNet cannot reach the panel. A gate check now fails if a
+  `log_error` call does not describe a failure.
+- Add: **Clear All** in Log > Errors. Empties the collected issues and this session's error
+  log, asks first, host-only. It also clears the record of which server-log lines have
+  already been scraped, so a line that has been cleared can be seen again.
+
+## v3.73 patch4
+- Fix: a slow state read was logged with `log_error`, which writes to the error log **and
+  raises a UI issue** - so a timing observation looked like a fault. There is now a
+  `log_warn` level: panel.log, tagged, no issue raised. The slow model-folder scan was the
+  same and is demoted too.
+- The error log is for things that failed. A gate check fails if any timing observation is
+  logged as an error.
+
+## v3.73 patch3
+- Fix: `/api/state` took ~750ms, of which ~710ms was port probing. Probes are already run
+  in parallel, but the priming pass and the read disagreed about which ports: priming used
+  the slot's **stored** port while the read used the one **parsed from the launcher
+  script**, and the TTS port was never primed at all. Any port they disagreed on fell
+  through to a serial probe costing a full 350ms timeout each.
+  Both now resolve ports identically. Four dead ports went from 1401ms to 352ms in test.
+- Fix: priming skipped batches of fewer than two ports, so a single uncached port was
+  always probed serially.
+
+## v3.73 patch2
+- Fix: long lines in the Permissions tree ran across into the next column. SVG text does
+  not wrap, so they are now broken at word boundaries and the box is sized to whatever the
+  columns came to.
+- Change: the TTS page is divided into headed sections - TTS, Install, Folders & Model,
+  Voice, Ports & Naming, Audio Tags - each separated by a rule.
+- Change: **Install Higgs v3** is bigger and lit in the accent colour.
+
+## v3.73 patch1
+- Change: **TTS is its own tab**, under Server, rather than a sub-tab of Proxy. The TTS
+  Terminal stays with the other terminals.
+- Change: spoken lines are shown in the Proxy terminal by default.
+- Change: the install button reads **Install Higgs v3**.
 
 ## v3.73
 

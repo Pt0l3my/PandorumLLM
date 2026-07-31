@@ -26,8 +26,8 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 APP_NAME    = "PandorumLLM"
-APP_VERSION = "v3.73 Beta"
-APP_RELEASE_TAG = "v3.73-beta"            # the tag this build ships under
+APP_VERSION = "v3.74 Beta"
+APP_RELEASE_TAG = "v3.74-beta"            # the tag this build ships under
 APP_PATCH = 0                                 # patch number; 0 = none
 TERM_SCALE_KINDS = ("dashboard", "thinking", "splitd", "splitt", "tts")
 TERM_SCALE_LEGACY = ("split",)                # older configs stored one "split" entry
@@ -81,7 +81,7 @@ DEF_SETTINGS = {
     "ttsEngine": "moss",                          # moss | audiocpp
     "ttsTags": "off",                             # inline control tags, audio.cpp only
     "ttsOutDir": "", "ttsVoiceDir": "",
-    "termStamps": "on", "termInsTts": "off",
+    "termStamps": "on", "termInsTts": "on",
     "termStampsOff": "",                          # terminals hiding the time
     "splitSrcD": "dashboard", "splitSrcT": "thinking",
     "ttsAcppDir": "", "ttsAcppExe": "", "ttsAcppModelsDir": "", "ttsAcppModel": "", "ttsAcppModelId": "higgs",
@@ -470,6 +470,26 @@ def api_errors_snapshot(remote=False):
         return {"total": ERR_TOTAL[0], "byType": {}, "byLevel": dict(ERR_BY_LEVEL), "errors": []}
     return {"total": ERR_TOTAL[0], "byType": dict(ERR_BY_TYPE), "byLevel": dict(ERR_BY_LEVEL),
             "errors": list(reversed(ERR_LOG))}
+def api_errors_clear(body=None):
+    """Empty the collected issues and this session's error log. Host-only."""
+    n = ERR_TOTAL[0]
+    del ERR_LOG[:]
+    ERR_TOTAL[0] = 0
+    ERR_BY_TYPE.clear()
+    ERR_BY_LEVEL.clear()
+    ERRTRACK.clear()          # or a line already scraped from a server log never returns
+    path = ERR_FILE[0]
+    if path:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("=== %s %s error log - cleared %s ===\n"
+                        % (APP_NAME, APP_VER_UI, time.strftime("%Y-%m-%d %H:%M:%S")))
+        except OSError:
+            pass
+    panel_log("[panel] cleared %d issue(s)" % n)
+    return {"ok": True, "cleared": n}
+
+
 def log_error(source, msg, record=True):
     try:
         if ERR_FILE[0] is None:
@@ -517,6 +537,16 @@ def panel_log(msg):
     except Exception:
         pass
     print(msg)
+
+def log_warn(source, msg):
+    """Something worth noticing that did not fail.
+
+    log_error() also raises a UI issue, so using it for an observation - a slow state
+    read, say - tells the user something is broken when nothing is. A warning goes to
+    panel.log, tagged, and raises nothing.
+    """
+    panel_log("[warn] [%s] %s" % (source, str(msg).strip()[:500]))
+
 
 # ---------------------------------------------------------------- scanning
 PORT_RX = [re.compile(r'"--port"\s*,\s*"(\d+)"'), re.compile(r'--port\s+(\d+)')]
@@ -1353,8 +1383,9 @@ def list_models(cfg):
     _kind_flush()
     _took = (time.time() - _t_scan) * 1000
     if _took > 1000:
-        log_error("panel", "model folder scan: %dms for %d models (headers are read once "
-                           "per file and remembered in model-kinds.json)" % (_took, len(items)))
+        # also an observation: the scan finished, it just took a while
+        log_warn("panel", "model folder scan: %dms for %d models (headers are read once "
+                          "per file and remembered in model-kinds.json)" % (_took, len(items)))
     _models_cache.update(t=now, dir=key, items=items)
     return items
 
@@ -1448,7 +1479,7 @@ def prime_slot_status(ports):
             hit = _ST_CACHE.get(int(p0))
             if not (hit and now - hit[0] < _ST_TTL):
                 todo.append(int(p0))
-    if len(todo) < 2:
+    if not todo:
         return
     ths = [threading.Thread(target=slot_status, args=(x,), daemon=True) for x in todo]
     for t in ths:
@@ -4233,7 +4264,7 @@ class TtsWrapper:
             self.log("")
         except Exception as e:
             # a crashed server just closes the socket; its own log says why
-            hint = tts_diagnose(cfg) if tts_engine(cfg) == "audiocpp" else ""
+            hint = tts_diagnose(cfg, TTS_PROC.get("log_at")) if tts_engine(cfg) == "audiocpp" else ""
             ev["err"] = (str(e) + ((" - " + hint) if hint else ""))[:300]
             self.log("\u274C TTS failed: %s" % str(e)[:200])
             if hint:
@@ -4546,6 +4577,13 @@ TTS_HINTS = (
      "the server has no CUDA kernels for the card it is pinned to. The prebuilt "
      "CUDA package covers RTX 20xx and newer; a self-build needs "
      "-CudaArchitectures covering this card (a 3090 is 86-real)"),
+    ("missing model file 'config'",
+     "this .gguf carries no config of its own - it is a tensor-only build and needs its "
+     "sidecar files (config.json, tokenizer, chat template) in the SAME folder. "
+     "audio.cpp's own GGUFs embed them; ones built for another app often do not"),
+    ("exact tensor shape metadata is invalid",
+     "this .gguf was written by a different converter and audio.cpp cannot read its "
+     "tensor metadata - use a GGUF built for audio.cpp"),
     ("missing model package file",
      "the model path points at the wrong place - select a model folder or .gguf, not the "
      "folder above it"),
@@ -4641,7 +4679,8 @@ HIGGS_GGUF_REPO = "audio-cpp/audio.cpp-gguf"
 HIGGS_GGUF_PATH = "Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf"
 HIGGS_NEED_BYTES = 8 * 1024 * 1024 * 1024        # ~5.1 GB model plus room to unzip
 HIGGS_INSTALL = {"running": False, "cancel": False, "step": "", "pct": 0.0,
-                 "error": "", "done": False, "engine": "", "model": ""}
+                 "error": "", "done": False, "engine": "", "model": "",
+                 "warn": ""}
 
 
 def higgs_paths(cfg=None):
@@ -4783,9 +4822,23 @@ def higgs_install_worker():
                  ", ".join(a["name"] for a in assets[:9]) or "no assets at all"))
         _hi_log("   found %s" % tag)
         os.makedirs(paths["engine"], exist_ok=True)
-        if find_acpp_exe(paths["engine"]):
-            _hi_log("\u2705 Engine already unpacked - skipping the download")
-            chosen = []
+        # ALWAYS replace. A previous version kept whatever was here if an
+        # audiocpp_server.exe existed, which adopted a CPU-only build someone had
+        # unpacked by hand. Trusting our own marker instead still vouched for an install
+        # that antivirus had since gutted - a complete-looking folder with its DLLs gone.
+        # The engine is a couple of hundred MB; a wrong one costs far more than that in
+        # someone else's afternoon. The 5 GB model is still kept and resumed separately.
+        stamp = os.path.join(paths["engine"], ".pandorum-engine.json")
+        if os.listdir(paths["engine"]):
+            _hi_log("\U0001F5D1 Clearing %s - the engine is always installed fresh"
+                    % paths["engine"])
+            for n_ in os.listdir(paths["engine"]):
+                victim = os.path.join(paths["engine"], n_)
+                try:
+                    shutil.rmtree(victim) if os.path.isdir(victim) else os.remove(victim)
+                except OSError as e:
+                    raise RuntimeError("could not clear %s: %s - close anything using it "
+                                       "and try again" % (victim, e))
         for a in chosen:
             name = a["name"]
             zp = os.path.join(tmp, name)
@@ -4801,6 +4854,11 @@ def higgs_install_worker():
         if not exe:
             raise RuntimeError("unpacked, but no %s was found - the release layout may "
                                "have changed" % ACPP_EXE_NAME)
+        try:                       # so a later run knows this one is ours, and which
+            with open(stamp, "w", encoding="utf-8") as f:
+                json.dump({"tag": tag, "when": time.strftime("%Y-%m-%d %H:%M:%S")}, f)
+        except OSError:
+            pass
         _hi_log("\u2705 Engine ready: %s" % exe)
 
         # ---- 2. the model
@@ -4830,9 +4888,18 @@ def higgs_install_worker():
                 st["ttsAcppModelsDir"] = paths["models"]
                 st["ttsAcppModel"] = gguf
                 st["ttsAcppVersion"] = tag        # audiocpp_server has no --version
+                # the panel answers SkyrimNet itself - an install that leaves this
+                # pointing at a wrapper the user does not have produces silence
+                st["ttsWrapMode"] = "on"
+                if not str(st.get("ttsWrapperPort") or "").strip():
+                    st["ttsWrapperPort"] = "7860"
+                if not str(st.get("ttsServerPort") or "").strip():
+                    st["ttsServerPort"] = "1240"
                 save_config(c)
         except Exception as e:
             HIGGS_INSTALL["done"] = True
+            HIGGS_INSTALL["warn"] = ("downloaded and unpacked, but the settings could not "
+                                     "be saved: %s" % str(e)[:160])
             _hi_log("\u2705 Downloaded and unpacked, but the settings could not be saved: %s"
                     % str(e)[:160])
             _hi_log("   Nothing is lost. Set these by hand on this page:")
@@ -4881,7 +4948,7 @@ def higgs_present(cfg=None):
                 models.append(os.path.join(root, f))
     wired = bool((st.get("ttsAcppDir") or "").strip()
                  and (st.get("ttsAcppModel") or "").strip())
-    return {"exe": exe, "models": models[:8],
+    return {"exe": exe, "models": models[:8], "wired": wired,
             "adoptable": bool(exe and models and not wired)}
 
 
@@ -4919,10 +4986,10 @@ def api_higgs_install(body):
     if not (body or {}).get("confirm"):
         return {"error": "not confirmed"}
     if str((body or {}).get("action", "")) == "dismiss":
-        HIGGS_INSTALL.update(done=False, error="", step="")
+        HIGGS_INSTALL.update(done=False, error="", step="", warn="")
         return {"ok": True}
     HIGGS_INSTALL.update(running=True, cancel=False, step="", pct=0.0, error="",
-                         done=False, engine="", model="")
+                         done=False, engine="", model="", warn="")
     threading.Thread(target=higgs_install_worker, daemon=True).start()
     return {"ok": True}
 
@@ -5075,7 +5142,7 @@ def tts_save_named(src_bytes, npc, cfg=None):
         return ""
 
 
-def tts_diagnose(cfg=None):
+def tts_diagnose(cfg=None, since=None):
     """Turn an audio.cpp crash into something a person can act on.
 
     A dropped connection reads as WinError 10054 on our side and says nothing. The
@@ -5087,7 +5154,11 @@ def tts_diagnose(cfg=None):
         path = os.path.join(log_dir(cfg or load_config()), TTS_SERVER_LOG_NAME)
         with open(path, "rb") as f:
             f.seek(0, 2)
-            f.seek(max(0, f.tell() - 8192))
+            end = f.tell()
+            # THIS run only. The log spans every start, so reading a blind tail reported
+            # the previous failure again after the cause had been fixed.
+            start = max(0, end - 8192) if since is None else min(max(0, since), end)
+            f.seek(start)
             tail = f.read().decode("utf-8", "replace")
     except Exception:
         return ""
@@ -5311,12 +5382,25 @@ def tts_server_status(cfg=None):
     port = tts_server_port(cfg)
     out = dict(slot_status(port))
     out["port"] = port
+    # A server that dies while loading never opens the port, and nothing here noticed -
+    # the panel sat on "waiting for it to answer" for ever. Reap it and say why.
+    proc = TTS_PROC.get("proc")
+    if proc is not None and proc.poll() is not None and not TTS_PROC.get("stopping"):
+        code = proc.returncode
+        TTS_PROC["pid"], TTS_PROC["proc"] = None, None
+        hint = tts_diagnose(cfg, TTS_PROC.get("log_at"))
+        TTS_PROC["died"] = ("the server stopped while starting (exit %s)%s"
+                            % (code, (" - " + hint) if hint else ""))
+        log_error("tts", TTS_PROC["died"])
+        TTSW.log("\u274C %s" % TTS_PROC["died"])
     out["pid"] = TTS_PROC.get("pid")
     out["stopping"] = bool(TTS_PROC.get("stopping"))
+    out["died"] = TTS_PROC.get("died") or ""
     return out
 
 
-TTS_PROC = {"pid": None, "proc": None, "stopping": False, "said_ready": False}
+TTS_PROC = {"pid": None, "proc": None, "stopping": False, "said_ready": False,
+            "died": "", "log_at": None}
 
 
 def stop_tts_server(reason="", wait=True):
@@ -5463,7 +5547,11 @@ def _api_tts_server(body):
         logf.close()      # the child holds its own duplicate; keeping ours leaks a
     except Exception:     # handle on every start
         pass
-    TTS_PROC["pid"], TTS_PROC["proc"] = p.pid, p
+    try:                       # where this run's output begins in the shared log
+        TTS_PROC["log_at"] = os.path.getsize(os.path.join(log_dir(cfg), TTS_SERVER_LOG_NAME))
+    except OSError:
+        TTS_PROC["log_at"] = 0
+    TTS_PROC["pid"], TTS_PROC["proc"], TTS_PROC["died"] = p.pid, p, ""
     with _ST_LOCK:
         _ST_CACHE.pop(port, None)
     panel_log("[tts] started %s on :%d (pid %d)" % (os.path.basename(exe), port, p.pid))
@@ -6623,6 +6711,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/slot-launcher-save": api_slot_launcher_save, "/api/slot-launcher-load": api_slot_launcher_load,
             "/api/slot-launcher-default": api_slot_launcher_default, "/api/slot-launcher-revert": api_slot_launcher_revert,
             "/api/stats-reset": api_stats_reset,
+            "/api/errors-clear": api_errors_clear,
         }
         REMOTE_POST_OK = {"/api/tail", "/api/client-error", "/api/heartbeat", "/api/bye"}
         if getattr(self, "_scope", "host") == "remote":
@@ -7071,6 +7160,25 @@ PAGE = """<!doctype html>
                               border-top:1.6px solid var(--acc);
                               box-shadow:0 0 4px var(--acc), 0 0 10px var(--acc),
                                           0 0 20px var(--acc); }
+  /* a section heading on the TTS page, with the rule that separates it from the last */
+  #dpane-tts .tsect { margin:26px 0 10px; padding-top:16px; font-size:14px;
+                      font-weight:700; letter-spacing:.4px; color:var(--txt);
+                      border-top:1px solid rgba(255,255,255,.07); }
+  #dpane-tts .tsect:first-child { margin-top:6px; padding-top:0; border-top:none; }
+  /* the one step nothing can detect. Pulsing so it reads as waiting on you, not broken */
+  .gmanual { margin-top:6px; font-size:11px; font-weight:700; letter-spacing:.04em;
+             text-transform:uppercase; color:var(--ok); text-align:center;
+             animation:gmanualPulse 1.9s ease-in-out infinite; }
+  @keyframes gmanualPulse {
+    0%, 100% { opacity:.62; text-shadow:0 0 4px rgba(181,243,32,.35); }
+    50%      { opacity:1;   text-shadow:0 0 9px rgba(181,243,32,.95),
+                                        0 0 18px rgba(181,243,32,.5); }
+  }
+  @media (prefers-reduced-motion: reduce) { .gmanual { animation:none; opacity:1; } }
+  /* the one action on the page that does something big */
+  .bigbtn { padding:9px 18px; font-size:14px; font-weight:700; letter-spacing:.3px;
+            color:var(--acc); text-shadow:0 0 8px var(--acc), 0 0 18px var(--acc); }
+  .bigbtn:hover { text-shadow:0 0 6px var(--acc), 0 0 16px var(--acc), 0 0 30px var(--acc); }
   .hdg.guidehl { animation:guideShape 2s ease-in-out 1; box-shadow:none; }
   /* Buttons are glowing text, not filled boxes: "button { box-shadow:none !important }"
      above, and an !important declaration overrides an animation - so the box-shadow
@@ -7563,6 +7671,7 @@ body.tmaxidle #navfly { display: none; }
 <nav>
   <button id="nav-network" class="on" onclick="showTab('network')">Live Network</button>
   <button id="nav-servers" onclick="showTab('servers')">Server</button>
+  <button id="nav-tts" data-hostonly onclick="showTab('tts')">TTS</button>
   <button id="nav-provmgmt" onclick="showTab('provmgmt')">Provider</button>
   <button id="nav-dashboard" onclick="showTab('dashboard')">Proxy</button>
   <button id="nav-launcher" onclick="showTab('launcher')">Launcher</button>
@@ -7621,7 +7730,6 @@ body.tmaxidle #navfly { display: none; }
       <button id="dsub-term" class="on" onclick="showDsub('term')">Dashboard</button>
       <button id="dsub-setup" onclick="showDsub('setup')">Proxy Setup</button>
       <button id="dsub-yaml" data-hostonly onclick="showDsub('yaml')">SkyrimNet YAML</button>
-      <button id="dsub-tts" data-hostonly onclick="showDsub('tts')">TTS</button>
     </div>
     <div id="dpane-term">
       <div class="row" style="gap:8px;margin-bottom:10px">
@@ -7653,7 +7761,9 @@ body.tmaxidle #navfly { display: none; }
     </div>
     <div id="dpane-setup" style="display:none"></div>
     <div id="dpane-yaml" style="display:none"></div>
-    <div id="dpane-tts" style="display:none"></div>
+  </div>
+  <div id="tab-tts" style="display:none">
+    <div id="dpane-tts"></div>
   </div>
   <div id="tab-setup" style="display:none"></div>
   <div id="tab-custom" style="display:none"></div>
@@ -7751,8 +7861,26 @@ function permTreeHtml() {
       + (sub ? '<text x="'+cx+'" y="'+(cy + 13)+'" text-anchor="middle" fill="'+C.dim
              + '" font-size="11.5">'+esc(sub)+'</text>' : '');
   }
+  // SVG text does not wrap, so a long line ran straight into the next column. Break it
+  // at word boundaries and report how tall it ended up, so the caller can advance.
+  const LI_CHARS = 52, LI_STEP = 26, LI_WRAP = 16;
   function li(x, y, mark, label, col) {
-    return '<text x="'+x+'" y="'+y+'" fill="'+col+'" font-size="12.5">'+mark+' <tspan fill="'+C.dim+'">'+esc(label)+'</tspan></text>';
+    const words = String(label).split(" ");
+    const rows = [];
+    let cur = "";
+    words.forEach(w => {
+      if (cur && (cur + " " + w).length > LI_CHARS) { rows.push(cur); cur = w; }
+      else { cur = cur ? (cur + " " + w) : w; }
+    });
+    if (cur) rows.push(cur);
+    let out = "";        // not "svg": the outer builder uses that name
+    rows.forEach((r, i) => {
+      out += '<text x="' + (i ? x + 12 : x) + '" y="' + (y + i * LI_WRAP)
+           + '" fill="' + col + '" font-size="12.5">'
+           + (i ? "" : mark + " ")
+           + '<tspan fill="' + C.dim + '">' + esc(r) + '</tspan></text>';
+    });
+    return { svg: out, h: LI_STEP + (rows.length - 1) * LI_WRAP };
   }
   const hostItems = ["Launch / Terminate / Exit the fleet",
                      "Create & edit launcher templates (.ps1)",
@@ -7777,8 +7905,9 @@ function permTreeHtml() {
                        "Any IPs and file paths are masked before being sent",
                        "Terminal TEXT is not: dialogue, reasoning and character names show",
                        "The statistics endpoint is not answered at all"];
-  // 650 tall: the host column is the longest and its last line sits at y=612
-  let svg = '<svg viewBox="0 0 1180 650" width="100%" style="max-width:1180px;background:#0d0e10;border:none;border-radius:12px">';
+  // The box is sized to whatever the columns came to, since a wrapped bullet adds a row
+  // and a fixed height would clip the bottom of the longest column.
+  let svg = '<svg viewBox="0 0 1180 __H__" width="100%" style="max-width:1180px;background:#0d0e10;border:none;border-radius:12px">';
   // root
   svg += node(470, 20, 240, 56, "#6b7280", "Incoming request", "which machine is it from?");
   // connectors
@@ -7789,18 +7918,21 @@ function permTreeHtml() {
   svg += node(840, 130, 300, 64, C.deny, "Outside / unknown", "anything not on your LAN");
   // host branch
   svg += node(40, 230, 300, 40, C.host, "FULL CONTROL", "");
-  hostItems.forEach((it, k) => { svg += li(48, 300 + k*26, "\u2713", it, C.host); });
+  let hy = 300;
+  hostItems.forEach(it => { const r = li(48, hy, "\u2713", it, C.host); svg += r.svg; hy += r.h; });
   // remote branch
   svg += node(440, 230, 300, 40, C.remote, "READ-ONLY", "");
-  remoteItems.forEach((it, k) => { svg += li(448, 300 + k*26, "\u25CF", it, C.remote); });
+  let ry = 300;
+  remoteItems.forEach(it => { const r = li(448, ry, "\u25CF", it, C.remote); svg += r.svg; ry += r.h; });
   // deny branch
   svg += node(840, 230, 300, 40, C.deny, "REJECTED", "");
-  svg += li(848, 300, "\u2715", "Request refused at the door", C.deny);
-  svg += li(848, 326, "\u2715", "Also blocks malicious web pages", C.deny);
-  svg += li(848, 352, "\u2715", "and DNS-rebinding attempts", C.deny);
+  svg += li(848, 300, "\u2715", "Request refused at the door", C.deny).svg;
+  svg += li(848, 326, "\u2715", "Also blocks malicious web pages", C.deny).svg;
+  svg += li(848, 352, "\u2715", "and DNS-rebinding attempts", C.deny).svg;
   // connectors to leaves
   svg += '<path d="M190 194 L190 230 M590 194 L590 230 M990 194 L990 230" stroke="'+C.line+'" stroke-width="2" fill="none"/>';
   svg += '</svg>';
+  svg = svg.replace("__H__", String(Math.max(650, hy + 20, ry + 20)));
   return svg
     + '<div class="hint" style="margin-top:12px;line-height:1.6">These rules are enforced by the panel itself on every request - not by hiding buttons in the browser - so a read-only remote session genuinely cannot perform host actions or read hidden values, even by crafting its own request.</div>';
 }
@@ -7873,7 +8005,7 @@ function showTab(t) {
   }
   navSync();
   curTab = t;
-  ["servers","provmgmt","network","launcher","dashboard","setup","log","helper","custom","perms"].forEach(x => {
+  ["servers","tts","provmgmt","network","launcher","dashboard","setup","log","helper","custom","perms"].forEach(x => {
     $("tab-"+x).style.display = x === t ? "" : "none";
     $("nav-"+x).classList.toggle("on", x === t);
   });
@@ -7889,6 +8021,7 @@ function showTab(t) {
   if (t === "perms") renderPerms();
   if (t === "setup") setTimeout(wireLlamaCheck, 60);
 
+  if (t === "tts") { ttsModels = null; renderTts(); }
   if (t === "dashboard") showDsub(curDsub);
   if (t === "launcher") showSub(curSub === "inspector" ? "inspector" : "creator");
 }
@@ -8492,7 +8625,7 @@ function logCard(f) {
     + '<div style="display:flex;align-items:center;gap:8px"><span style="flex-shrink:0">\U0001F4C4</span>'
     +   '<b style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(f.name) + '">' + esc(f.name) + '</b></div>'
     + '<div class="row" style="gap:6px;margin-top:8px"><button class="stop" data-act="logView" data-f="' + esc(f.name) + '">View</button>'
-    +   '<a class="btnlink" href="/api/log-download?f=' + encodeURIComponent(f.name) + '">Download</a></div>'
+    +   '<a class="btnlink" download href="/api/log-download?f=' + encodeURIComponent(f.name) + '">Download</a></div>'
     + '<div class="hint" style="margin-top:8px">' + esc(f.size) + '</div>'
     + '<div class="hint">created: ' + esc(f.created) + '</div>'
     + '<div class="hint">last edit: ' + esc(f.modified) + '</div>'
@@ -8608,7 +8741,11 @@ function paintErrors() {
   const ppOpts = [10, 20, 30, 40, 50].map(n => '<option value="' + n + '"' + (n === errPerPage ? " selected" : "") + '>' + n + '</option>').join("");
   const ctrl = '<div class="row errctrl" style="gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:12px">'
     + '<label class="hint" style="width:auto">Show Most Recent <select onchange="errSetRetain(this.value)">' + retOpts + '</select></label>'
-    + '<label class="hint" style="width:auto">Per Page <select onchange="errSetPerPage(this.value)">' + ppOpts + '</select></label></div>';
+    + '<label class="hint" style="width:auto">Per Page <select onchange="errSetPerPage(this.value)">' + ppOpts + '</select></label>'
+    + '<span style="margin-left:auto"></span>'
+    + '<button class="stop" data-hostonly data-act="errClear"'
+    + (errData.total ? "" : " disabled")
+    + ' title="empty the list and the error log for this session">Clear All</button></div>';
   const all = (errData.errors || []).slice(0, errRetain);
   const totalPages = Math.max(1, Math.ceil(all.length / errPerPage));
   if (errPage > totalPages) errPage = totalPages;
@@ -8909,11 +9046,22 @@ async function termStampsToggle(which) {
   refreshCurTerm();
 }
 // the buttons are shared markup, so the lit state is applied rather than rendered
+// ": On" in blue, ": Off" plain - the same reading as Remote Access and Fullscreen in
+// the header, so a state you can toggle looks the same wherever it appears.
+function onOffLabel(name, on) {
+  return esc(name) + ": " + (on ? '<span class="blueglow">On</span>' : "Off");
+}
 function syncTermToggleUI() {
-  document.querySelectorAll('[data-act="termStamps"]').forEach(b =>
-    b.classList.toggle("on", termStampsOn(b.dataset.kind || "")));
-  document.querySelectorAll('[data-act="termInsTts"]').forEach(b =>
-    b.classList.toggle("on", termInsTtsOn()));
+  document.querySelectorAll('[data-act="termStamps"]').forEach(b => {
+    const on = termStampsOn(b.dataset.kind || "");
+    b.classList.toggle("on", on);
+    b.innerHTML = onOffLabel("Timestamps", on);
+  });
+  document.querySelectorAll('[data-act="termInsTts"]').forEach(b => {
+    const on = termInsTtsOn();
+    b.classList.toggle("on", on);
+    b.innerHTML = onOffLabel("Insert TTS", on);
+  });
 }
 // [20:45:12.86] at the start of a line, and nowhere else
 const TSTAMP_RX = /^\\[\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?\\]\\s?/;
@@ -9482,7 +9630,12 @@ function renderHelper() {
             + ' title="' + (skp ? "put this step back" : "mark this step done") + '">'
             + cornerMarkEl(skp ? "undo" : ((i === stepAt("yamlmade") || i === stepAt("yamlsent")) ? "tick" : "skip")) + '</span>'
           : '')
-      + '</div><div class="glabel">' + esc(s.label) + '</div></div>';
+      + '</div><div class="glabel">' + esc(s.label) + '</div>'
+      // this one has ok: () => false - nothing can ever satisfy it but the tick, so it
+      // sat red for ever on people who did not realise
+      + ((i === stepAt("yamlsent") && !res[i])
+          ? '<div class="gmanual">Manual step - click the tick</div>' : "")
+      + '</div>';
   }).join("");
 
   const branch = '<div class="gbranch' + (manual ? " gon" : "") + '" id="gbranch">'
@@ -9921,26 +10074,34 @@ async function refreshTail(which) {
 
 /* ---------- TTS ---------- */
 let ttsBusy = "";        // "" | "start" | "stop"
+// A ["##", "Title"] row is a section heading with a rule above it, so the page reads as
+// groups rather than one long column of fields.
 const TTS_FIELDSETS = {
   moss: [
+    ["##", "Files"],
     ["ttsServerExe", "TTS Server Binary (moss-tts-server.exe)", [".exe"]],
     ["ttsModel", "TTS Model (.gguf)", [".gguf"]],
-    ["ttsServerPort", "TTS Server Port", null],
-    ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
-    ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
     ["ttsPython", "Python Executable (the venv that runs the wrapper)", [".exe"]],
     ["ttsWrapper", "Wrapper Script (.py)", [".py"]],
+    ["##", "Voice"],
+    ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
+    ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
+    ["##", "Ports"],
+    ["ttsServerPort", "TTS Server Port", null],
     ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null]
   ],
   audiocpp: [
+    ["##", "Folders & Model"],
     ["ttsAcppDir", "audio.cpp Folder (the panel finds audiocpp_server.exe inside)", "folder"],
     ["ttsAcppModelsDir", "TTS Models Folder (scanned for .gguf and safetensors)", "folder"],
-    ["ttsAcppModelId", "Model Id (the name used in requests)", null],
-    ["ttsAcppRefSlots", "Cached Voices (how many speakers stay encoded; raise it if you use many)", null],
-    ["ttsServerPort", "Server Port", null],
+    ["##", "Voice"],
     ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
     ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
-    ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null]
+    ["ttsAcppRefSlots", "Cached Voices (how many speakers stay encoded; raise it if you use many)", null],
+    ["##", "Ports & Naming"],
+    ["ttsServerPort", "Server Port", null],
+    ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null],
+    ["ttsAcppModelId", "Model Id (the name used in requests)", null]
   ]
 };
 function ttsFields() {
@@ -10158,7 +10319,7 @@ async function ttsLoadModels(force) {
 function higgsInstallRow() {
   const g = (state && state.higgsInstall) || {};
   if (g.running) {
-    return '<div class="tgroup"><div class="row" style="gap:10px;align-items:center">'
+    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="row" style="gap:10px;align-items:center">'
          + '<b>Installing Higgs v3</b>'
          + '<button class="stop" data-act="higgsCancel">Stop</button></div>'
          + '<div class="hint" style="margin-top:7px;line-height:1.7">' + esc(g.step || "starting...")
@@ -10169,7 +10330,7 @@ function higgsInstallRow() {
          + 'Stopping keeps what has downloaded, so starting again resumes.</div></div>';
   }
   if (g.error) {
-    return '<div class="tgroup"><div class="hint" style="color:#ff5d5d;line-height:1.7">'
+    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="hint" style="color:#ff5d5d;line-height:1.7">'
          + 'Install ' + esc(g.error) + '</div>'
          + '<div class="hint" style="margin-top:6px;line-height:1.7">Anything already '
          + 'downloaded is kept, so trying again resumes rather than starting over.</div>'
@@ -10179,18 +10340,23 @@ function higgsInstallRow() {
   if (g.done) {
     // without this the row falls back to the install button and a finished install
     // looks exactly like one that never ran
-    return '<div class="tgroup"><div class="hint" style="color:var(--ok);line-height:1.7">'
+    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="hint" style="color:var(--ok);line-height:1.7">'
          + '\u2705 Higgs Audio v3 installed' + (g.model ? (' - ' + esc(g.model)) : '') + '.</div>'
+         + (g.warn ? '<div class="hint" style="color:var(--warn);margin-top:6px;line-height:1.7">'
+                     + esc(g.warn) + '</div>' : '')
          + '<div class="hint" style="margin-top:6px;line-height:1.7">'
          + (g.engine ? ('Engine in <code>' + esc(g.engine) + '</code>. ') : '')
          + 'The fields below are set for you - press <b>Start TTS</b>.</div>'
          + '<button class="stop" data-act="higgsDismiss" style="margin-top:8px">Dismiss</button></div>';
   }
   const f = (state && state.higgsFound) || {};
+  // already here AND selected: the button stays, but stop making people wonder
+  const done = f.exe && (f.models || []).length && !f.adoptable;
+  const badge = done ? ' <span class="mand">Installed</span>' : "";
   if (f.adoptable) {
     // the files are there but the settings are not - a config save failing at the last
     // step of an install did exactly this, and so does installing by hand
-    return '<div class="tgroup"><div class="hint" style="color:var(--ok);line-height:1.7">'
+    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="hint" style="color:var(--ok);line-height:1.7">'
          + '\u2705 Higgs is already installed here, but not selected.</div>'
          + '<div class="hint" style="margin-top:6px;line-height:1.7">Found '
          + '<code>' + esc(f.exe || "") + '</code> and ' + (f.models || []).length
@@ -10198,8 +10364,8 @@ function higgsInstallRow() {
          + '<button class="stop" data-act="higgsAdopt" style="margin-top:8px">Use it</button>'
          + '<button class="stop" data-act="higgsInstall" style="margin-top:8px">Reinstall</button></div>';
   }
-  return '<div class="tgroup"><div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">'
-       + '<button class="stop" data-act="higgsInstall">Install Higgs v3 for me</button>'
+  return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">'
+       + '<button class="stop bigbtn" data-act="higgsInstall">Install Higgs v3</button>' + badge
        + '<span class="hint" style="width:auto">1 click install into the PandorumLLM '
        + 'directory</span></div></div>';
 }
@@ -10295,7 +10461,7 @@ function renderTts() {
     // Choose the TTS, not the engine: the engine follows from it. Kept keyed on the
     // engine value so no existing config needs migrating - a second TTS on the same
     // engine would add an option here rather than a new setting.
-    + '<label>TTS</label><div class="row" style="flex-wrap:nowrap">'
+    + '<div class="tsect">TTS</div><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsEngine" data-act="ttsEngineSel">'
     + '<option value="audiocpp"' + (eng === "audiocpp" ? " selected" : "") + '>Higgs Audio v3 (4B) - runs on audio.cpp</option>'
     + '<option value="moss"' + (eng === "moss" ? " selected" : "") + '>MOSS-TTS Local - runs on the MOSS server</option>'
@@ -10313,13 +10479,15 @@ function renderTts() {
     + '<span class="hint" id="tts-imp" style="width:auto">points at your existing .bat and fills these in</span></div>')
         : '')
     + ttsFields().map(f =>
-        '<label>' + esc(f[1]) + '</label><div class="row" style="flex-wrap:nowrap">'
-        + '<input class="txt" id="tts-' + f[0] + '" onchange="saveTts()" value="'
-        + esc(st[f[0]] || "").replace(/"/g, "&quot;") + '">'
-        + (f[2] === "folder"
-             ? '<button class="stop" data-act="ttsPickDir" data-k="' + f[0] + '">Choose folder</button>'
-             : (f[2] ? '<button class="stop" data-act="ttsPick" data-k="' + f[0] + '">Choose file</button>' : ''))
-        + '</div>' + ttsFieldExtra(f[0])).join("")
+        f[0] === "##"
+          ? '<div class="tsect">' + esc(f[1]) + '</div>'
+          : '<label>' + esc(f[1]) + '</label><div class="row" style="flex-wrap:nowrap">'
+            + '<input class="txt" id="tts-' + f[0] + '" onchange="saveTts()" value="'
+            + esc(st[f[0]] || "").replace(/"/g, "&quot;") + '">'
+            + (f[2] === "folder"
+                 ? '<button class="stop" data-act="ttsPickDir" data-k="' + f[0] + '">Choose folder</button>'
+                 : (f[2] ? '<button class="stop" data-act="ttsPick" data-k="' + f[0] + '">Choose file</button>' : ''))
+            + '</div>' + ttsFieldExtra(f[0])).join("")
     + '<label>Who translates for SkyrimNet</label><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsWrapMode" onchange="saveTtsMode()">'
     + '<option value="off"' + (mode === "on" ? "" : " selected") + '>Your own wrapper (the panel only writes the launcher)</option>'
@@ -10336,7 +10504,7 @@ function renderTts() {
     + '<option value="on"' + (ping === "off" ? "" : " selected") + '>Yes - return silence, never touch the GPU</option>'
     + '<option value="off"' + (ping === "off" ? " selected" : "") + '>No - generate it like any other line</option>'
     + '</select></div>'
-    + '<label>Audio Tags</label><div class="row" style="flex-wrap:nowrap">'
+    + '<div class="tsect">Audio Tags</div><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsTags" onchange="saveTts()">'
     + '<option value="off"' + (tags === "on" ? "" : " selected") + '>Strip them - speak the words only</option>'
     + '<option value="on"' + (tags === "on" ? " selected" : "") + '>Pass them to the engine</option>'
@@ -10359,13 +10527,18 @@ function renderTts() {
            + ' title="start the TTS server; the panel is already answering SkyrimNet">'
            + (busy === "start" ? "Launching\u2026" : svLoad ? "Loading the model\u2026" : "\u25B6 Start TTS")
            + '</button>'
-           + '<button class="stop" data-act="ttsStop"' + (busy || svGoing || !(svUp || svLoad) ? " disabled" : "")
+           + '<button class="stop" data-act="ttsStop"'
+           // enabled while starting too: a model that takes minutes to load, or one that
+           // is never going to answer, is precisely when you want to stop it
+           + (busy === "stop" || svGoing || !(svUp || svLoad || busy === "start") ? " disabled" : "")
            + ' title="stop the TTS server">' + (busy === "stop" ? "Stopping\u2026" : "\u25A0 Stop") + '</button>'
            + '<span class="pill ' + (ready ? "serving" : (busy || svLoad || svGoing) ? "loading" : "down") + '">'
            + (ready ? "ready" : busy === "start" ? "starting" : busy === "stop" ? "shutting down"
               : svGoing ? "shutting down" : svLoad ? "model loading" : "stopped") + '</span>'
            + '<span class="hint" id="tts-run" style="width:auto">'
-           + (busy === "start"
+           + (sv.died
+               ? '<span style="color:#ff5d5d">' + esc(sv.died) + '</span>'
+               : busy === "start"
                ? "started the server - waiting for it to answer on " + esc(String(sv.port || ""))
                  + " (the model takes a moment to load)"
                : busy === "stop" ? "shutting the server down\u2026"
@@ -10440,9 +10613,9 @@ async function ttsLauncher(save) {
 let curDsub = "term";
 let curTsub = "proxy";
 function showDsub(s) {
-  if ((s === "setup" || s === "yaml" || s === "tts") && state && state.scope === "remote") s = "term";
+  if ((s === "setup" || s === "yaml") && state && state.scope === "remote") s = "term";
   curDsub = s;
-  ["term","setup","yaml","tts"].forEach(x => {
+  ["term","setup","yaml"].forEach(x => {
     const p = $("dpane-"+x), b = $("dsub-"+x);
     if (p) p.style.display = x === s ? "" : "none";
     if (b) b.classList.toggle("on", x === s);
@@ -12566,6 +12739,14 @@ document.addEventListener("click", ev => {
   }
   if (d.act === "termInsTts") { termToggle("termInsTts", "on", "off"); return; }
   if (d.act === "higgsCancel") { higgsCancel(); return; }
+  if (d.act === "errClear") {
+    if (!confirm("Clear all collected issues and the error log for this session?")) return;
+    post("/api/errors-clear", {}).then(async () => {
+      errData = null; errPage = 1;
+      await renderErrors();
+    });
+    return;
+  }
   if (d.act === "higgsAdopt") {
     post("/api/higgs-adopt", {}).then(async r => {
       if (r && r.error) { uiAlert(r.error); return; }
@@ -14036,7 +14217,7 @@ async function launchTts(btn) {
   const NL = String.fromCharCode(10);
   if (miss.length) {
     uiAlert("Set these on the TTS page first:" + NL + NL + "- " + miss.join(NL + "- "));
-    showTab("dashboard"); showDsub("tts");
+    showTab("tts");            // its own tab since v3.73
     return;
   }
   window.__ttsLaunching = true;
@@ -14053,7 +14234,7 @@ function syncTtsButton() {
   // state for it the button kept reading "TTS running..." and looked ignored.
   if (srv.stopping) s = "term";
   else if (String(srv.state || "") === "serving") s = "run";
-  else if (window.__ttsLaunching && srv.pid) s = "launching";
+  else if (window.__ttsLaunching && srv.pid && !srv.died) s = "launching";
   else s = "idle";
   // The panel tells us whether it still has a process. Without that, terminating before
   // the server ever answered left this stuck on "Starting TTS..." with nothing to clear
@@ -14292,23 +14473,44 @@ def _ph_parts(dt_ms):
         ph["everything-else"] = rest / 1000.0
     return sorted(ph.items(), key=lambda x: -x[1])
 
+def state_probe_ports(cfg=None):
+    """Exactly the ports a state read is about to probe.
+
+    Priming used the slot's STORED port while the read uses the one parsed out of the
+    launcher script - so whenever a launcher set a different port, the primed entry was
+    for the wrong one and the read fell through to a serial probe. The TTS port was not
+    primed at all. Both then cost a full timeout each, one after the other, which is
+    where 700ms of a 750ms state read was going.
+    """
+    cfg = cfg or load_config()
+    ports = []
+    for s in (cfg.get("slots") or []):
+        script = s.get("script") or ""
+        ports.append((parse_ps1_port(script) if script else None) or s.get("port"))
+    st = cfg.get("settings", {})
+    if (st.get("ttsServerExe") or st.get("ttsAcppDir") or "").strip():
+        ports.append(tts_server_port(cfg))
+    return [p for p in ports if p]
+
+
 def api_state(*a, **k):
     _ph_reset(); t0 = time.time()
     try:
-        prime_slot_status([x.get("port") for x in (load_config().get("slots") or [])])
+        prime_slot_status(state_probe_ports())
     except Exception:
         pass
     out = _api_state_raw(*a, **k)
     dt = (time.time() - t0) * 1000
     if dt > 500:
         parts = ", ".join("%s=%dms" % (k2, v * 1000) for k2, v in _ph_parts(dt))
-        log_error("panel", "slow /api/state: %dms (%s)" % (dt, parts))
+        # an observation, not a failure: the read still returned the right answer
+        log_warn("panel", "slow /api/state: %dms (%s)" % (dt, parts))
     return out
 _debug_report_raw = debug_report
 def debug_report():
     _ph_reset(); t0 = time.time()
     try:
-        prime_slot_status([x.get("port") for x in (load_config().get("slots") or [])])
+        prime_slot_status(state_probe_ports())
     except Exception:
         pass
     txt = _debug_report_raw()
@@ -14499,7 +14701,10 @@ def main():
                 ld = log_dir()
                 prune_keep_newest(ld, "*_dashboard.log", 4)   # this session's file makes 5
                 prune_keep_newest(ld, "*_thinking.log", 4)
-                log_error("panel", "session start %s" % APP_VER_UI, record=False)
+                # not an error: this used to create an error_N.log on every clean
+                # run. The file writes its own header naming the version when a
+                # real error first arrives, so nothing is lost.
+                panel_log("[panel] session start %s" % APP_VER_UI)
                 PROXY.sync()    # embedded SN proxy listeners come up with the panel
                 try:
                     TTSW.sync()     # embedded TTS wrapper, only if it has been switched on

@@ -2,8 +2,8 @@
 1 24 "app.manifest"
 
 1 VERSIONINFO
-FILEVERSION 3,73,0,0
-PRODUCTVERSION 3,73,0,0
+FILEVERSION 3,74,0,0
+PRODUCTVERSION 3,74,0,0
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
@@ -11,9 +11,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "PandorumLLM"
       VALUE "FileDescription", "PandorumLLM - local llama.cpp fleet control panel for SkyrimNet"
-      VALUE "FileVersion", "3.73.0.0"
+      VALUE "FileVersion", "3.74.0.0"
       VALUE "ProductName", "PandorumLLM"
-      VALUE "ProductVersion", "3.73.0.0"
+      VALUE "ProductVersion", "3.74.0.0"
       VALUE "LegalCopyright", "Copyright (c) 2026 Pt0l3my. Apache-2.0 style open source."
       VALUE "InternalName", "PandorumLLM"
       VALUE "OriginalFilename", "PandorumLLM.exe"

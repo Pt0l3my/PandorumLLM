@@ -1,4 +1,4 @@
-PandorumLLM v3.73 Beta - local LLM stack for SkyrimNet, all in one folder
+PandorumLLM v3.74 Beta - local LLM stack for SkyrimNet, all in one folder
 ============================================================
 
 
@@ -3839,3 +3839,53 @@ speech: a one-click install, voices named after the characters speaking them, pe
 tags the dialogue model can write, and spoken lines shown in the terminal beside the reply
 that produced them. There are separate Launch LLM and Launch TTS buttons, and the panel no
 longer loads anything from the internet just to draw its own interface.
+
+v3.73 patch1: TTS now has its own entry in the menu on the left, under Server, instead of
+being tucked inside Proxy. Spoken lines appear in the Proxy terminal without having to turn
+them on first.
+
+v3.73 patch2: text in the Permissions diagram no longer runs across into the next column.
+The TTS page is split into labelled sections so it is easier to find your way around, and
+the install button is larger.
+
+v3.73 patch3: the panel was spending about three quarters of a second checking whether
+servers were running, most of it waiting on ports it had already meant to check in the
+background. It now checks them all at once, as intended.
+
+v3.73 patch4: notes about something being slow no longer appear in the error log or raise a
+problem in the panel. Nothing had failed - they are observations, and they now go in the
+ordinary log marked as warnings.
+
+v3.73 patch5: a session with no problems no longer leaves an error log behind - it was
+writing one every time just to record that the panel had started. Log > Errors now has a
+Clear All button.
+
+v3.73 patch6: if the speech server stops while loading a model, the panel now says so and
+explains what went wrong instead of waiting indefinitely. Downloading a log no longer asks
+whether you want to leave the page.
+
+v3.73 patch7: the explanation shown when the speech server fails to start now describes the
+attempt you just made rather than an earlier one. Stop works while it is starting, and the
+TTS page shows an Installed badge once Higgs is set up.
+
+v3.73 patch8: you can now point the TTS page at the original model files instead of a
+prepared one, and choose the precision to load them at - full, half, or a smaller Q8. That
+means trying a lighter setup without downloading or converting anything.
+
+v3.73 patch9: removes the model source choice added in the last patch. It could not offer
+anything smaller than the Q8 you already have, so it was complication without benefit.
+
+v3.73 patch10: the Timestamps and Insert TTS buttons now say whether they are on or off,
+the same way the Remote Access and Fullscreen indicators do.
+
+v3.73 patch11: fixes the Higgs installer skipping the download when another copy of
+audio.cpp was already in its folder - it now replaces anything that is not the version it
+means to install. Finishing an install also sets the SkyrimNet translation option, and a
+problem part-way through is shown on the page rather than only in the log. Step 7 of the
+guide now says that it is a manual step.
+
+v3.74: the one-click Higgs install now replaces the speech engine every time rather than
+keeping whatever it finds, so a copy downloaded by hand - or one damaged by antivirus -
+cannot be picked up by mistake. Finishing an install also sets the SkyrimNet translation
+option for you. Step 7 of the guide now says that it needs a manual tick, which several
+people had reasonably taken for a fault.

@@ -683,6 +683,55 @@ only, off by default. Two rules from Boson: an unrecognised tag is **read aloud*
 anything not in the catalogue is stripped either way; and a tag must sit flush against its
 word, so `tts_apply_tags` closes the space a language model will always leave.
 
+**A gate check that greps source will match its own explanation.** Four times now: a check
+for `new RegExp(` matched the comment saying not to use it; one for `(local clip)` matched
+the note about removing it; one for `data-act="termStamps"` counted the `querySelectorAll`
+that syncs those buttons; one for `log_error(` matched the docstring telling you to use
+`log_warn`. Match what only a real occurrence has - the opening quote of a call, an element
+rather than a substring - or strip comments first.
+
+**And "did we put it there" is not the same as "is it still intact".** The marker survived
+antivirus gutting an install, so it vouched for a folder with its DLLs gone. For anything
+cheap enough to fetch again, reinstalling beats any amount of cleverness about what is
+already present - the engine is ~200 MB, a wrong one costs someone an afternoon.
+
+**"Is the output already there" is not the same as "did we put it there".** The installer
+skipped its download whenever any `audiocpp_server.exe` was in its folder - which adopted a
+CPU-only build a user had unpacked by hand, installed nothing, and pointed the settings at
+it. Write a marker naming the release, and only skip on a match.
+
+**Higgs on audio.cpp has no path below q8_0.** Load-time `weight_type` refuses anything
+smaller, and the only published GGUFs for the family are bf16 and q8_0 - the same ceiling.
+The converter accepts `--type q4_k` generically, but that says nothing about whether this
+family's runtime can execute it. A source-selector UI was built and then removed in
+patch8/9 for exactly this reason: it worked, and bought nothing.
+
+**audio.cpp quantises at LOAD, from safetensors.** `--session-option
+higgs_audio_tts.weight_type=...` accepts native, f32, f16, bf16, q8_0 - and says so
+verbatim when refused. The k-quants `audiocpp_gguf` accepts are NOT available this way,
+which is likely why only bf16 and q8_0 are published for this family. Measured with two
+CLI calls; guessing either way would have been wrong.
+
+**A log that spans every run cannot be diagnosed by its tail.** `tts_diagnose` read the
+last 8KB and matched a failure from a previous start, so a fixed problem kept being
+reported. Record the file size when the server spawns and read only from there.
+
+**Watching a port cannot detect a process that never opens one.** A TTS server dying
+during model load left the panel on "waiting for it to answer" for ever. `tts_server_status`
+polls the process as well, reaps it, and reads the server log for a reason - the diagnosis
+helper already existed but only ran on a failed generate.
+
+**The error log is for things that failed.** `log_error()` also calls `_record_issue()`,
+which surfaces the message in the UI - so logging an observation that way tells the user
+something is broken when nothing is. `log_warn()` writes to panel.log, tagged, and raises
+nothing. Gated: no timing observation may go through `log_error`.
+
+**A cache only helps if it is keyed on what the reader asks for.** `prime_slot_status`
+probed slots in parallel using `slot["port"]`; `api_state` then read `parse_ps1_port(script)
+or slot["port"]`. Any launcher that set its own port meant the primed entry was never hit,
+and the read paid a full 350ms timeout - serially, per port. `state_probe_ports()` is now
+the single answer to "which ports", used by both.
+
 **A split pane shows a FEED but IS a pane.** `paintTail` is given the feed name, so a
 per-terminal setting keyed on the pane never matched - the left pane showing the proxy asked
 about "dashboard" while its button toggled "splitd". Pass the pane explicitly.
