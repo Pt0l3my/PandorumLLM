@@ -25,6 +25,14 @@ Everything from the v3.73 patches, with two changes that prompted the release.
 - A settings write that fails after a good download is reported in amber rather than passed
   off as success. An outright failure is red, under the button.
 
+**The GPU row said something untrue**
+- Leaving it unpinned was labelled "no pin - every visible card is offered". The server
+  config carries `"device": 0`, so unpinned means the **first** card and nothing else. On
+  one card that is correct and nothing needed doing - but the label gave no way to know
+  that, so people reasonably assumed they had missed a step. It now reads
+  "Automatic - <your card> (your only card)", or names which card will be taken when there
+  are several, with a warning that it may be the one already running your dialogue model.
+
 **Step 7 says it is manual**
 - It carries `ok: () => false` - nothing can ever satisfy it but the tick - so it sat red
   indefinitely for anyone who did not realise. It now shows a pulsing

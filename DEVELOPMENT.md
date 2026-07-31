@@ -683,12 +683,23 @@ only, off by default. Two rules from Boson: an unrecognised tag is **read aloud*
 anything not in the catalogue is stripped either way; and a tag must sit flush against its
 word, so `tts_apply_tags` closes the space a language model will always leave.
 
+**An anchor that is a PREFIX of a longer name matches the wrong thing.** Three times now:
+`renderTts` found `renderTtsGuide`; `let svg` found the local inside `li()`;
+`def tts_engine` found `def tts_engine_label`, which sits earlier, so the slice ran
+backwards and silently tested nothing. Anchor on something that cannot be a prefix - add
+the opening paren, the assignment, the closing quote.
+
 **A gate check that greps source will match its own explanation.** Four times now: a check
 for `new RegExp(` matched the comment saying not to use it; one for `(local clip)` matched
 the note about removing it; one for `data-act="termStamps"` counted the `querySelectorAll`
 that syncs those buttons; one for `log_error(` matched the docstring telling you to use
 `log_warn`. Match what only a real occurrence has - the opening quote of a call, an element
 rather than a substring - or strip comments first.
+
+**A label that describes the wrong behaviour is worse than no label.** The unpinned GPU
+choice read "every visible card is offered" while `server.json` carried `"device": 0` - the
+first card only. A single-GPU owner read it, concluded nothing needed setting, and was
+right by accident. State what the code does, and check the two against each other.
 
 **And "did we put it there" is not the same as "is it still intact".** The marker survived
 antivirus gutting an install, so it vouched for a folder with its DLLs gone. For anything

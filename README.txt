@@ -3889,3 +3889,6 @@ keeping whatever it finds, so a copy downloaded by hand - or one damaged by anti
 cannot be picked up by mistake. Finishing an install also sets the SkyrimNet translation
 option for you. Step 7 of the guide now says that it needs a manual tick, which several
 people had reasonably taken for a fault.
+
+Also in v3.74: the GPU setting on the TTS page now tells you which card will be used when
+you have not chosen one, rather than implying that all of them are available.

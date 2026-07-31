@@ -5284,10 +5284,17 @@ def tts_gpu_label(cfg=None):
     """The card the server was pinned to, by name where we know it."""
     cfg = cfg or load_config()
     want = (cfg.get("settings", {}).get("ttsGpuId") or "").strip()
-    for g in cfg.get("gpus", []) or []:
+    gpus = cfg.get("gpus", []) or []
+    for g in gpus:
         if want and str(g.get("uuid", "")) == want:
             return str(g.get("name") or want)
-    return want or "default device"
+    if want:
+        return want
+    # unpinned is device 0, so name it rather than saying "default" and leaving them to
+    # wonder which one that was
+    if gpus:
+        return "%s (automatic)" % (gpus[0].get("name") or gpus[0].get("id") or "first card")
+    return "first card (automatic)"
 
 
 def tts_engine(cfg=None):
@@ -10418,6 +10425,17 @@ async function recheckAcpp() {
   if (r && r.ok && r.exe) { msg.style.display = "none"; }
 }
 
+// Unpinned does not mean "any card" - the server config carries "device": 0, so it means
+// the FIRST one. Saying so stops a single-GPU owner wondering whether they missed a step.
+function gpuAutoLabel() {
+  const g = (state && state.gpus) || [];
+  if (!g.length) return "Automatic - the first card the driver reports";
+  const name = g[0].name || g[0].id;
+  return g.length === 1
+    ? "Automatic - " + name + " (your only card)"
+    : "Automatic - the first card (" + name + ")";
+}
+
 function ttsModelOptions() {
   const st = (state && state.settings) || {};
   const sel = st.ttsAcppModel || "";
@@ -10519,7 +10537,13 @@ function renderTts() {
         : '')
     + '<label>GPU (pinned by UUID, so a reboot cannot move it)</label>'
     + '<div class="row" style="flex-wrap:nowrap"><select class="txt" id="tts-ttsGpuId" onchange="saveTts()">'
-    + '<option value="">(no pin - every visible card is offered)</option>' + gsel + '</select></div>'
+    + '<option value="">' + esc(gpuAutoLabel()) + '</option>' + gsel + '</select></div>'
+    + (!st.ttsGpuId && (state.gpus || []).length > 1
+        ? '<div class="hint" style="margin:-4px 0 12px;line-height:1.7;color:var(--warn)">'
+          + 'With more than one card, pin the one you want - otherwise the server takes '
+          + 'the first, which may be the one already running your dialogue model.</div>'
+        : '<div class="hint" style="margin:-4px 0 12px;line-height:1.7">'
+          + 'Pinning is by UUID, so it survives a reboot reordering the cards.</div>')
     + (mode === "on"
         ? ('<div class="card" style="margin:4px 0 16px;padding:14px 16px">'
            + '<div class="row" style="gap:10px;align-items:center">'

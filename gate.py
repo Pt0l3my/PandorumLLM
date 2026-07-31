@@ -1173,6 +1173,26 @@ check("confirm(" in JS[JS.index('d.act === "errClear"'):JS.index('d.act === "err
       "and asks first, since it cannot be undone")
 
 
+section("the GPU row tells the truth")
+# it said "every visible card is offered" while the config carries "device": 0 - which
+# means the FIRST card and nothing else
+# the fleet launchers DO offer every card when unpinned - that wording is correct there.
+# Only the TTS row was wrong, so check the TTS row.
+_gpurow = JS[JS.index("GPU (pinned by UUID"):JS.index("GPU (pinned by UUID") + 900]
+check("every visible card is offered" not in _gpurow,
+      "the TTS row makes no claim that an unpinned server uses every card")
+check("function gpuAutoLabel" in JS, "the empty choice names what will actually be used")
+_gal = JS[JS.index("function gpuAutoLabel"):JS.index("function ttsModelOptions")]
+check("your only card" in _gal, "one card: says so, so nobody wonders if they missed a step")
+check("the first card" in _gal, "several: says which one it will take")
+check("pin the one you want" in JS,
+      "and with several cards unpinned, it says why that matters")
+# "def tts_engine" also matches def tts_engine_label, which sits EARLIER
+_tgl = py[py.index("def tts_gpu_label"):py.index("def tts_engine(cfg")]
+check('"default device"' not in _tgl, "the terminal names the card rather than 'default'")
+check("(automatic)" in _tgl, "while still saying the choice was not made by hand")
+
+
 section("install leaves nothing to chance")
 _hw = py[py.index("def higgs_install_worker"):py.index("def api_higgs_install")]
 # "is there any audiocpp_server.exe here" adopted a CPU build someone unpacked by hand,
