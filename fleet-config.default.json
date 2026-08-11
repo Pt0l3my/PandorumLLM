@@ -150,6 +150,42 @@
       "priority": 1,
       "emoji": "🔧",
       "diaryGrammar": false
+    },
+    {
+      "id": "prov14",
+      "title": "NE-Composer",
+      "port": 1264,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🎼",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov15",
+      "title": "NE-Director",
+      "port": 1265,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "🎬",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov16",
+      "title": "AE-Impulse",
+      "port": 1266,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "💥",
+      "diaryGrammar": false
+    },
+    {
+      "id": "prov17",
+      "title": "AE-Resolve",
+      "port": 1267,
+      "thinking": false,
+      "priority": 1,
+      "emoji": "⚖️",
+      "diaryGrammar": false
     }
   ]
 }

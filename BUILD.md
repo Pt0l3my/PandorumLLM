@@ -39,7 +39,7 @@ publish on GitHub, or the in-app update check reports the build as out of date.
 Verify afterwards:
 
 ```
-strings -a -el PandorumLLM.exe | grep 3.72.0.0
+strings -a -el PandorumLLM.exe | grep 3.75.0.0
 ```
 
 ## Cutting a release

@@ -60,7 +60,7 @@ sync. PandorumLLM does the juggling.
 Every release ships a SHA-256. Check it before you run anything:
 
 ```
-certutil -hashfile PandorumLLM-v3.72-Beta.zip SHA256
+certutil -hashfile PandorumLLM-v3.75-Beta.zip SHA256
 ```
 
 Compare it against the `.sha256.txt` attached to the same release. If they don't match,

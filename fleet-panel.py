@@ -17,25 +17,299 @@
 #  State: fleet-config.json (slots, settings, creator templates),
 #  fleet-history.json (last 50 launches).
 # ================================================================
-import hashlib
-import ctypes, glob, hashlib, hmac, ipaddress, json, os, re, secrets, shutil, socket, subprocess, sys, threading, time, traceback
+import ctypes, glob, hashlib, ipaddress, json, os, re, shutil, socket, subprocess, sys, threading, time, traceback
 from concurrent.futures import ThreadPoolExecutor
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import array
+import wave
+import io
+import collections
 from urllib.parse import urlparse, parse_qs
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 APP_NAME    = "PandorumLLM"
-APP_VERSION = "v3.74 Beta"
-APP_RELEASE_TAG = "v3.74-beta"            # the tag this build ships under
-APP_PATCH = 0                                 # patch number; 0 = none
-TERM_SCALE_KINDS = ("dashboard", "thinking", "splitd", "splitt", "tts")
+APP_VERSION = "v3.75 Beta"
+APP_RELEASE_TAG = "v3.75-beta"    # the tag this build ships under
+APP_PATCH = 0                                # patch number; 0 = none
+TERM_SCALE_KINDS = ("dashboard", "thinking", "splitd", "splitt", "tts", "ptipme")
 TERM_SCALE_LEGACY = ("split",)                # older configs stored one "split" entry
 _TTS_LANG_RX = re.compile(r"^[a-z]{2}(-[a-z]{2,4})?$", re.I)
-TTS_FRAME_RATE = 12.5          # MOSS audio tokens per second of audio
 TTS_ACPP_FRAME_RATE = 25.0     # Higgs Audio v3: 8 codebooks at 25 fps
-TTS_SERVER_LOG_NAME = "tts-server.log"
+TTS_SERVER_LOG_NAME = "tts-server.log"      # legacy single file, still readable
+# One per panel session, named like the fleet logs, so a terminal shows this run
+# rather than everything since the folder was created.
+TTS_SERVER_LOG_GLOB = "*_tts-server.log"
 TTS_LOG_NAME = "tts.log"                      # fixed name; the launcher writes it into log_dir()
+PTIPME_LOG_GLOB = "*_ptipme.log"              # what PTI and PME were asked, and answered
+# The tree the Proxy terminal draws. The page states these as TREE_PAD / TREE_MID /
+# TREE_END for the spoken lines it splices in client-side; a line the PANEL writes
+# has to carry the same glyphs or it hangs off nothing. The gate holds them equal.
+TREE_PAD = "   "
+TREE_MID = "\u251c\u2500"
+TREE_END = "\u2514\u2500"
+# which switch answers for which feature - read by tag_output_line and by the
+# upgrade that split the single one in two
+TAG_OUT_KEY = {"PTI": "ttsTagOutputPti", "PME": "ttsTagOutputPme"}
+
+# SkyrimNet asks its characters to end a reply with their private reasoning:
+#   "Put the thought last, after and below your spoken line, and stop once it closes."
+# It is never spoken, so it never reaches the TTS record - the only place to catch it is
+# the reply as it goes past.
+THOUGHT_RX = re.compile(r"<internal_thought>(.*?)</internal_thought>", re.S | re.I)
+
+# ActionEval answers under a json_schema: {"ACTION": "bathe"}. The actor is not named the
+# way a dialogue prompt names one - "You are selecting a SINGLE action" - so the profile
+# heading is what says who is acting.
+ACTION_RX = re.compile(r'"ACTION"\s*:\s*"([^"]{1,64})"')
+# the main prompt names its actor in the profile heading; the drilldown prompt names
+# them in its opening sentence and under a different heading. Ordered, profile first.
+# generic NPCs arrive as "Hunter [Hunter]" or "Frofnir Trollsbane [Bandit Chief]" -
+# the bracketed ROLE is part of how SkyrimNet names them, not part of the name, and a
+# pattern that did not expect it matched nothing, so the record said "someone".
+_ROLE = rb"(?:\s*\[[^\]\r\n]{1,24}\])?"
+ACTOR_RXS = (re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)" + _ROLE + rb"'s Character Profile"),
+             re.compile(rb"action for ([A-Z][A-Za-z' \-]{1,28}?)" + _ROLE
+                        + rb" from a specific action category"),
+             re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)" + _ROLE + rb"'s Current State"))
+ACTION_MARK = "\u26A1"                          # not a spoken mark: nobody said this
+DRILL_MARK = "\u2937"                           # worn by the record of a drilldown stage
+# SkyrimNet drills into a chosen category with a SECOND prompt, and that prompt
+# introduces itself. The stage cannot be read off the reply - the category rule asks
+# for an intent parameter the models routinely skip, and param-less direct actions
+# exist - so the REQUEST is what identifies it.
+DRILL_RX = re.compile(rb"A broader category was already identified|from a specific action category")
+
+
+def note_actor(body):
+    """Who a request is choosing an action for. Read, never remembered.
+
+    Deliberately NOT note_speaker: that queue pairs a spoken line with its character,
+    and an ActionEval request produces no speech. Feeding it would put this name on
+    somebody else's voice.
+    """
+    try:
+        for rx in ACTOR_RXS:
+            m = rx.search(body[:SPEAKER_SCAN])
+            if m:
+                return m.group(1).decode("utf-8", "replace").strip()
+        return ""
+    except Exception:
+        return ""
+
+
+def is_action_drill(body):
+    """The second stage of an action pick, by its own introduction."""
+    try:
+        return bool(body and DRILL_RX.search(body[:SPEAKER_SCAN])
+                    and b"Eligible Actions" in body[:65536])
+    except Exception:
+        return False
+
+
+def action_row(said, who="", drill=False):
+    """The branch text for a chosen action - pure, so the gate can hold it still.
+
+    A category pick reads `who > Category` and stays open (|-); the drilldown that
+    follows closes the branch (L-) with `who > Action (param: value, ...)`. The
+    reply is strict-schema JSON; when a model steps outside it anyway, the old
+    regex keeps the action name and the parameters simply are not shown.
+    """
+    s = str(said or "").strip()
+    act, params = "", {}
+    try:
+        j = json.loads(s[s.index("{"):s.rindex("}") + 1])
+        act = str(j.get("ACTION") or "").strip()
+        p = j.get("PARAMS")
+        if isinstance(p, dict):
+            params = p
+    except Exception:
+        m = ACTION_RX.search(s)
+        act = m.group(1).strip() if m else ""
+    # "None" is the commonest answer by far and a line per turn saying so would bury
+    # the ones that matter - but a drilldown's None CLOSES a branch its category row
+    # opened, so that one is written.
+    if not act or (act.lower() == "none" and not drill):
+        return ""
+    tail = ""
+    if params:
+        tail = " (" + ", ".join("%s: %s" % (k, " ".join(str(v).split())[:60])
+                                for k, v in params.items()) + ")"
+    return "%s %s %s > %s%s" % (TREE_PAD + (TREE_END if drill else TREE_MID),
+                                ACTION_MARK, who or "someone", act, tail)
+
+
+def action_line(said, who="", cfg=None, drill=False):
+    """Write the action a character chose, as a branch under the request that chose it."""
+    st = (cfg or load_config()).get("settings", {})
+    if str(st.get("ttsActionOut", "off")).lower() != "on":
+        return ""
+    row = action_row(said, who, drill)
+    if not row:
+        return ""
+    try:
+        sess = getattr(PROXY, "session", None) or SESSION_STAMP
+        with open(os.path.join(log_dir(), "%s_dashboard.log" % sess), "a",
+                  encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (_stamp(), row))
+    except Exception:
+        pass
+    return row
+THOUGHT_MARK = "\U0001F4AD"                    # a thought bubble, not a spoken mark
+
+
+def thought_lines(said, who="", cfg=None):
+    """Write any internal thought in a reply as a branch under the line that carried it.
+
+    Written the moment the reply lands, so it sits ABOVE the spoken line that Insert TTS
+    splices in afterwards - which is where a thought belongs, since the character had it
+    before they opened their mouth.
+    """
+    # SkyrimNet STRIPS the [enthusiasm]-style tags before its TTS requests, so
+    # the completion is the only place they exist. Captured FIRST, above the
+    # thought guard - the owner's field reply carried tags the old placement
+    # only saw when a thought happened to ride along, and a tag-only reply
+    # (no thought at all) must count too. An entry is written even when EMPTY:
+    # it tells the armer "this reply is parsed, no tags", so untagged replies
+    # never wait out the race window. (patch170)
+    if who:
+        _mq = []
+        for _w in re.findall(r"\[\s*([a-zA-Z][a-zA-Z_ ]{0,20})\s*\]",
+                             THOUGHT_RX.sub(" ", str(said or ""))):
+            _pr = TTS_ALIAS.get(" ".join(_w.split()).lower())
+            if _pr:
+                _mq.append(_pr)
+        MOOD_QUEUE[who] = (_mq, time.time())
+        # The reply's SPOKEN text, thought blocks removed. Hoisted here with the
+        # mood queue: a reply with no thought in it is still this character's
+        # words, and those words are what names the voice that speaks them when
+        # two characters share one sample. (patch183)
+        REPLY_FULL[who] = (_th_norm(THOUGHT_RX.sub(" ", str(said or ""))), time.time())
+    rows = [" ".join(m.split())[:400] for m in THOUGHT_RX.findall(str(said or "")) if m.strip()]
+    if not rows:
+        return
+    # the freshest thought is remembered for the auto thought-audio pass WHATEVER
+    # the terminal display setting says - hearing it and showing it are separate
+    if who:
+        THOUGHT_FRESH[who] = (rows[-1], time.time())
+    st = (cfg or load_config()).get("settings", {})
+    if str(st.get("ttsThoughtOut", "off")).lower() != "on":
+        return
+    try:
+        sess = getattr(PROXY, "session", None) or SESSION_STAMP
+        with open(os.path.join(log_dir(), "%s_dashboard.log" % sess), "a",
+                  encoding="utf-8") as f:
+            for r in rows:
+                # ALWAYS a mid branch: the spoken lines are spliced in beneath this, so
+                # the thought is never the last thing hanging off the reply - and an end
+                # elbow stops at its own row, which is what left a wrapped thought with
+                # nothing joining its rows together.
+                f.write("[%s] %s %s %s: \u3030\uFE0F %s \u3030\uFE0F\n"
+                        % (_stamp(), TREE_PAD + TREE_MID, THOUGHT_MARK,
+                           who or "thought", r))
+    except Exception:
+        pass
+
+# PTI and PME are providers now, wired to a slot in Live Network like any other, with
+# the same priority, sampler overrides and Thinking switch. Two things differ, and both
+# follow from WHO calls them: the panel does, not SkyrimNet.
+#   - no listener is bound. A provider port exists so SkyrimNet can connect to it; these
+#     are called in-process, and binding 0.0.0.0 for something only ever reached from
+#     127.0.0.1 would be two LAN sockets bought for nothing.
+#   - Sampler Source is Server Side, permanently, and there is no SkyrimNet value to
+#     detect - the panel composes the request itself, so there is no other side.
+# Their enabled state is not stored on the record: it IS the TTS page switch, read
+# through panel_prov_on(), so the power button and the toggle cannot disagree.
+PANEL_PROVIDERS = (
+    {"id": "pti", "title": "PTI", "setting": "ttsPlayerTags",
+     "srvKey": "ttsPlayerTagsSrv"},
+    {"id": "pme", "title": "PME", "setting": "ttsMoodEval",
+     "srvKey": "ttsMoodSrv"},
+)
+PANEL_PROV_IDS = frozenset(p["id"] for p in PANEL_PROVIDERS)
+
+
+def panel_prov(pid):
+    for p in PANEL_PROVIDERS:
+        if p["id"] == pid:
+            return p
+    return None
+
+
+def panel_prov_record(spec):
+    """A fresh record for a panel-called provider.
+
+    `port` is absent deliberately: nothing connects to these, so there is no port to
+    give out, and the card says so rather than showing a number that binds nothing.
+    """
+    return {"id": spec["id"], "title": spec["title"], "port": "",
+            "thinking": False, "priority": 1, "diaryGrammar": False, "cache": False,
+            "custom": False, "panelOwned": True,
+            "samplerSource": "server", "detectSN": False,
+            "emoji": PANDORUM_MARK,
+            # The panel used to force temperature 0 on every one of these, overruling
+            # whatever the server was launched with and saying so nowhere. Same value,
+            # carried as an override that shows on the card and can be cleared.
+            "samplerOverrides": {"temp": "0"}}
+
+
+def ensure_panel_providers(cfg):
+    """Make sure both records exist, once, and carry the old server choice over.
+
+    Returns True when it changed something. The TTS page used to hold the server for
+    each feature; that is now the slot they hang off in Live Network, so an existing
+    setting is spent here on the initial wiring and then deleted.
+    """
+    changed = False
+    st = cfg.setdefault("settings", {})
+    slots = cfg.get("slots", []) or []
+    park = cfg.setdefault("unallocatedProviders", [])
+    for spec in PANEL_PROVIDERS:
+        found = None
+        for s in slots:
+            for p in s.get("providers", []) or []:
+                if p.get("id") == spec["id"]:
+                    found = p
+        for p in park:
+            if p.get("id") == spec["id"]:
+                found = p
+        if found is None:
+            rec = panel_prov_record(spec)
+            # wire it to whichever slot serves the port the TTS page was pointed at
+            want = str(st.get(spec["srvKey"]) or "").strip()
+            placed = False
+            if want.isdigit():
+                for s in slots:
+                    up = (parse_ps1_port(s.get("script") or "") if s.get("script") else None) or s.get("port")
+                    try:
+                        if int(up) == int(want):
+                            s.setdefault("providers", []).append(rec)
+                            placed = True
+                            break
+                    except Exception:
+                        continue
+            if not placed:
+                park.append(rec)
+            changed = True
+        else:
+            # these two are not negotiable, whatever an older config or a hand edit says
+            if found.get("samplerSource") != "server" or found.get("detectSN") or \
+                    not found.get("panelOwned") or found.get("emoji") != PANDORUM_MARK:
+                found["samplerSource"] = "server"
+                found["detectSN"] = False
+                found["panelOwned"] = True
+                found["emoji"] = PANDORUM_MARK
+                changed = True
+        if spec["srvKey"] in st:
+            st.pop(spec["srvKey"])
+            changed = True
+    return changed
+
+
+def panel_prov_on(pid, st):
+    """Whether this feature is switched on - the TTS page setting, not a second flag."""
+    p = panel_prov(pid)
+    return bool(p) and str((st or {}).get(p["setting"], "off")).strip().lower() == "on"
 APP_VER_UI = APP_VERSION.replace(" ", "-p%d " % APP_PATCH, 1) if APP_PATCH else APP_VERSION
 
 def _build_id():
@@ -65,8 +339,6 @@ DEFAULT     = os.path.join(STACK, "fleet-config.default.json")
 HISTORY     = os.path.join(STACK, "fleet-history.json")
 ARCHIVE     = os.path.join(STACK, "ps1-launchers")
 FLEET_PS1   = os.path.join(STACK, "launch-llm-fleet.ps1")
-GH_RELEASES = "https://github.com/ggml-org/llama.cpp/releases"
-GH_API      = ""  # update check removed - app no longer contacts GitHub
 
 DEF_SETTINGS = {
     "llamacppPath": "",
@@ -77,16 +349,103 @@ DEF_SETTINGS = {
     "peerAddr": "",
     "ttsServerExe": "", "ttsModel": "", "ttsServerPort": "1240", "ttsGpuId": "",
     "ttsPython": "", "ttsWrapper": "", "ttsWrapperPort": "7860",
-    "ttsWrapMode": "off", "ttsAnswerPing": "on",
+    # requested defaults: the Proxy translates for SkyrimNet, and the startup ping
+    # is sent to the engine and heard (No), out of the box
+    "ttsWrapMode": "on", "ttsAnswerPing": "off",
     "ttsEngine": "moss",                          # moss | audiocpp
-    "ttsTags": "off",                             # inline control tags, audio.cpp only
+    "ttsTags": "on",
+    "ttsThoughtAudio": "off",                     # voice NPC thoughts automatically
+    "ttsThoughtSeq": "before",                    # play them before/after the spoken line
+    # Audio-tag words the user clicked OFF in Player Tag System: space-separated,
+    # KIND-NAME as offered. They leave the BUILT-IN PTI and PME prompts and their
+    # answer filters; a custom prompt is the user's own text and is never edited.
+    "ttsTagsOff": "",
+    # The FINAL gate on the wire to Higgs: KIND-NAME (or bare prosody) words the
+    # user clicked off on the Audio Tags board. A tag here never reaches the
+    # engine, whoever wrote it - SkyrimNet's NPC lines, the player tagger, an
+    # alias. Independent of ttsTagsOff, which edits the built-in prompts.
+    "ttsTagsFinalOff": "",
+    # Tag Limits: WORD:N pairs. Once a tag is spoken, the SAME character does not get
+    # it again for N of their own turns - the player counts their own turns, an NPC
+    # counts that NPC's. Empty = no limits, which Reset restores.
+    "ttsTagLimits": "",                            # NPC lines (Allowed Tags board)
+    "ttsTagLimitsPlayer": "",                      # player lines (Player Audio Tags board)
+    # hold the TTS card at its maximum graphics clock while the server runs, so the
+    # first tokens of a line are not spent climbing out of an idle power state.
+    # Locked on start, released on stop and on exit. Needs the panel run as
+    # administrator; costs idle watts - which is why it is the user's switch.
+    "ttsGpuClockHold": "off",
     "ttsOutDir": "", "ttsVoiceDir": "",
     "termStamps": "on", "termInsTts": "on",
     "termStampsOff": "",                          # terminals hiding the time
     "splitSrcD": "dashboard", "splitSrcT": "thinking",
     "ttsAcppDir": "", "ttsAcppExe": "", "ttsAcppModelsDir": "", "ttsAcppModel": "", "ttsAcppModelId": "higgs",
     "ttsAcppFamily": "higgs_audio_tts", "ttsAcppRefSlots": "64",
+    # AR sampling. A missed end-of-content token is a SAMPLING accident: the model
+    # passes over EOC and then has no reason to stop. Temperature is the lever that
+    # changes how often that happens; a token or time ceiling only changes what it costs.
+    # Defaults are the model card's own for voice cloning - temperature 0.8, top_k 50,
+    # max_new_tokens 1024 - so out of the box this changes nothing.
+    # audio.cpp takes no sampling options for this family - it validates the list and
+    # exits on anything not on it, and temperature is not. patch68 tried, patch69 made
+    # the attempt survivable, and this removes it: an engine that will not be told is
+    # not a setting. What IS controllable is how much text is handed over at once.
+    "ttsChunkChars": "170",
+    "ttsAutoCal": "proxy",                        # per-line token cap: off / proxy / llm
+                                                  # proxy is the standard: arithmetic,
+                                                  # free, needs no server and no gap
+    "ttsAutoCalEvery": "12",                      # lines between automatic refits
+    "ttsCalibThink": "off",                       # and whether it may think while doing it
+    "ttsAutoCalMedian": "",                       # {"cps":..,"lead":..} written by the fit
+    "ttsAutoCalMedianN": "",                      # how many measured lines it was fitted
+    "ttsAutoCalMedianAt": "",                     # from, and when - the tooltip says both
+    "ttsAutoCalTried": "",                        # what the last fit ATTEMPT came to
+    "ttsAutoCalTriedAt": "",                      # and when - a fit that is being
+                                                  # refused every time looks exactly
+                                                  # like one that never runs
+    "ttsCalTermOpen": "off",                      # the calibration record, shown or not
+    # set by a calibration, applied to every outgoing speech request, and empty until
+    # one has run - an empty string means "not chosen", which is not the same as a value
+    "ttsCalTemp": "", "ttsCalTopP": "", "ttsCalRepPen": "", "ttsCalMinP": "",
+    "ttsRetrySafe": "on",                         # a retry aims to finish, not to perform
+    "ttsSampAutoCal": "on",                       # who moves the speech samplers: "on" is
+                                                  # LLM Controlled, and the every-N run
+                                                  # changes them; "off" is Manual, and only
+                                                  # you do. Values set here are sent with
+                                                  # every line either way - the choice is
+                                                  # who moves them, never whether they apply
+    "ttsDiagLast": "", "ttsDiagAt": "",
+    # How long each calibration model may think before "Answer now." - one per job,
+    # set on the slider beside that job's Thinking switch
+    "ttsCalibThinkBudget": "2000",
+    # Tokens a character may cost: the whole of Fixed mode, and the ceiling every
+    # other mode stays under. 3.5 is Higgs' own natural rate doubled, which is what
+    # the Reset button puts back.
+    "ttsFixedTokPerChar": "3.5",
+    # The ONLY bound that was actually stopping a runaway. A per-request token cap is
+    # sent as well, but this build ignores it - a failed line ran 18.15s against the
+    # 20s that used to be hardcoded here. The longest chunk the panel sends is 170
+    # characters, about 15s of speech, and Higgs generates well above realtime when it
+    # is behaving - so 9s leaves room for a legitimate long line and takes half the
+    # cost off a runaway.
+    "ttsAcppBusyMs": "9000",
     "ttsAcppVersion": "",                         # the release tag installed
+    "ttsAcppProfile": "balance",                  # balance | fast
+    "ttsPlayerTags": "off",                       # ask a fleet model to tag player lines
+    "ttsMoodEval": "off",                         # read the scene after each NPC line
+    "ttsMoodHistory": "25",                       # how many spoken turns PME reads
+    "ttsMoodCount": "3",
+    "ttsMoodEvery": "5",                          # read the scene every Nth NPC line
+    "moodEveryV3": False,                         # one-time move off the shipped 1
+    "moodHistV25": False,                         # one-time move off the shipped 8
+    "ttsMoodPostpone": "off",                     # wait for TTS to finish first
+    "ttsPtiPrompt": "", "ttsPmePrompt": "",       # blank = the built-in wording
+    "ttsPtiBudget": "2000", "ttsPmeBudget": "3000",   # room to reason, in tokens
+    "ttsTagOutputPti": "off",                     # show what PTI answered
+    "ttsTagOutputPme": "off",                     # show what PME answered
+    "ttsThoughtOut": "off",                       # show an NPC's <internal_thought>
+    "ttsActionOut": "off",                        # show the action ActionEval chose
+    "termHideProv": "",                           # provider ids the Proxy terminal hides
     "launchArc": False,               # the guide step highlights instead
     "autoRefresh": 0,
     "srvEdOpen": False,
@@ -141,6 +500,7 @@ _TTSSRV_LOCK = threading.Lock()
 
 
 CFG_LOCK = threading.RLock()
+EOC_LOCK = threading.RLock()
 
 def save_config(cfg):
     """Write the config atomically, retrying a Windows lock rather than failing.
@@ -181,13 +541,63 @@ DEFAULT_PROVIDER_SEED = {
     1236: [("Dialogue", 1251, False, 0), ("GM", 1252, False, 0), ("Combat", 1253, False, 0), ("AI-Assistant", 1256, False, 0)],
     1237: [("Meta", 1254, False, 2), ("UT", 1255, False, 2)],
     1238: [("ActionEval", 1257, False, 1), ("Charbio", 1258, True, 1), ("Diary", 1259, False, 1),
-           ("Memory", 1260, False, 1), ("Vision", 1261, False, 1), ("IntelEngine", 1262, True, 1), ("SeverActions", 1263, True, 1)],
+           ("Memory", 1260, False, 1), ("Vision", 1261, False, 1), ("IntelEngine", 1262, True, 1), ("SeverActions", 1263, True, 1),
+           # the NarrativeEngine plugin's pair: real SN providers on the next two
+           # ports. Existing configs receive them unallocated on the next start
+           # (the seeder creates only what is missing, and touches nothing else);
+           # they enter providers.yaml like any provider once placed on a server.
+           ("NE-Composer", 1264, False, 1), ("NE-Director", 1265, False, 1),
+           # the AgencyEngine plugin's pair: AE-Impulse asks whether a companion
+           # raises something unprompted, AE-Resolve judges whether a raised
+           # thing was answered or done. Real SN providers on the next two
+           # ports, riding the patch151 rails: existing configs receive them
+           # unallocated on the very next start (create_missing_default_providers
+           # runs in load_config), and they enter providers.yaml once placed.
+           ("AE-Impulse", 1266, False, 1), ("AE-Resolve", 1267, False, 1)],
 }
 DEFAULT_PROVIDER_GPUS = {}
 DEFAULT_PROVIDER_PAIRS = {(nm, pp) for lst in DEFAULT_PROVIDER_SEED.values() for (nm, pp, _thk, _prio) in lst}
 
 def is_default_provider(p):
     return (p.get("title"), int(p.get("port") or 0)) in DEFAULT_PROVIDER_PAIRS
+
+def create_missing_default_providers(cfg):
+    """Create any shipped default that is missing ENTIRELY - by port, anywhere -
+    as an unallocated provider. Additive only: nothing existing is read, reset or
+    moved. This is how a provider added in an update reaches an existing config
+    on its next start. Returns True when something was created."""
+    factory = {}
+    for port, entries in DEFAULT_PROVIDER_SEED.items():
+        for (nm, pp, thk, prio) in entries:
+            factory[pp] = (nm, thk, prio)
+    everywhere = ([p for s in cfg.get("slots", []) for p in s.get("providers", []) or []]
+                  + list(cfg.get("unallocatedProviders", []) or []))
+    have = {int(p.get("port") or 0) for p in everywhere}
+    # a default created before its mark existed shows "(none)" in its slot - the
+    # owner's AE pair did. An EMPTY emoji on a factory-titled provider heals to
+    # the shipped mark; a mark the user chose is never touched. (patch181)
+    healed = False
+    for p in everywhere:
+        _t = str(p.get("title") or "")
+        if not p.get("custom") and not p.get("emoji") and DEFAULT_PROVIDER_EMOJI.get(_t):
+            p["emoji"] = DEFAULT_PROVIDER_EMOJI[_t]
+            healed = True
+    missing = sorted(pp for pp in factory if pp not in have)
+    if not missing:
+        return healed
+    used = {p.get("id") for p in everywhere}
+    un = cfg.setdefault("unallocatedProviders", [])
+    n = 1
+    for pp in missing:
+        while ("prov%d" % n) in used:
+            n += 1
+        used.add("prov%d" % n)
+        nm, thk, prio = factory[pp]
+        un.append({"id": "prov%d" % n, "title": nm, "port": pp, "thinking": thk,
+                   "priority": prio, "diaryGrammar": nm == "Diary", "custom": False,
+                   "emoji": DEFAULT_PROVIDER_EMOJI.get(nm, "")})
+    return True
+
 
 def seed_default_providers(cfg):
     """Put the shipped providers back to their factory names and settings, in place.
@@ -205,13 +615,7 @@ def seed_default_providers(cfg):
             factory[pp] = (nm, thk, prio)
     everywhere = ([p for s in cfg.get("slots", []) for p in s.get("providers", []) or []]
                   + list(cfg.get("unallocatedProviders", []) or []))
-    used = {p.get("id") for p in everywhere}
-    def next_id():
-        n = 1
-        while ("prov%d" % n) in used:
-            n += 1
-        used.add("prov%d" % n)
-        return "prov%d" % n
+    create_missing_default_providers(cfg)
     seen = set()
     for p in everywhere:
         if p.get("custom"):
@@ -231,14 +635,41 @@ def seed_default_providers(cfg):
         p["emoji"] = DEFAULT_PROVIDER_EMOJI.get(nm, "")
         p["enabled"] = True                       # shipped state is on
         seen.add(int(p.get("port")))
-    missing = [pp for pp in factory if pp not in seen]
-    if missing:
-        un = cfg.setdefault("unallocatedProviders", [])
-        for pp in sorted(missing):
-            nm, thk, prio = factory[pp]
-            un.append({"id": next_id(), "title": nm, "port": pp, "thinking": thk,
-                       "priority": prio, "diaryGrammar": nm == "Diary", "custom": False})
     return cfg
+
+_CFG_CACHE = {"sig": None, "cfg": None}
+_CFG_CACHE_LOCK = threading.Lock()
+
+
+def load_config_cached():
+    """The hot path's config: load_config's answer at the price of one stat.
+
+    Invalidated by mtime and size, so a change saved in the UI is seen on the very
+    next line. The returned dict is SHARED - hot-path callers read it and must not
+    write to it. The spoken-line worker was parsing the whole config file for every
+    line it spoke, several times per line.
+    """
+    try:
+        _s = os.stat(CONFIG)
+        sig = (_s.st_mtime_ns, _s.st_size)
+    except OSError:
+        sig = None
+    with _CFG_CACHE_LOCK:
+        if sig is not None and sig == _CFG_CACHE["sig"]:
+            return _CFG_CACHE["cfg"]
+    cfg = load_config()
+    # the signature is taken AFTER the load: load_config may itself have saved
+    # (filling defaults), and a signature from before that write would miss once
+    # on every call until the file went quiet
+    try:
+        _s = os.stat(CONFIG)
+        sig = (_s.st_mtime_ns, _s.st_size)
+    except OSError:
+        sig = None
+    with _CFG_CACHE_LOCK:
+        _CFG_CACHE["sig"], _CFG_CACHE["cfg"] = sig, cfg
+    return cfg
+
 
 def load_config():
     cfg = load_json(CONFIG, None)
@@ -263,6 +694,24 @@ def load_config():
             st["termFontSize"] = 12
         st["termScaleV12"] = True
         changed = True
+    if not st.get("moodHistV25"):
+        if str(st.get("ttsMoodHistory") or "") == "8":
+            st["ttsMoodHistory"] = DEF_SETTINGS["ttsMoodHistory"]
+        st["moodHistV25"] = True
+        changed = True
+    if not st.get("moodEveryV3"):
+        if str(st.get("ttsMoodEvery") or "") == "1":
+            st["ttsMoodEvery"] = DEF_SETTINGS["ttsMoodEvery"]
+        st["moodEveryV3"] = True
+        changed = True
+    # one-time: the single Player Tag Output switch became one per feature. Both take
+    # the old value, so nothing changes behaviour on upgrade - the PTI half is what
+    # repeats the player's line beside the spoken one, and can now be turned off alone.
+    if "ttsTagOutput" in st:
+        _old = str(st.pop("ttsTagOutput") or "off").strip().lower()
+        for _tk in TAG_OUT_KEY.values():
+            st[_tk] = "on" if _old == "on" else "off"
+        changed = True
     # repair booleans that may have been stored as strings by an older build
     for _bk in ("onePC", "devMode", "welcomeSeen", "termBlack", "termScaleOn"):
         if isinstance(st.get(_bk), str):
@@ -281,6 +730,10 @@ def load_config():
             _s["providers"] = []
             _s["gpuId"] = ""
         st["wiringV250"] = True
+    # AFTER the wiring migration: that one parks every provider it finds, so a
+    # record created before it would be unwired again on the same pass.
+    if ensure_panel_providers(cfg):
+        changed = True
         changed = True
     if not cfg.get("settings", {}).get("sevEmojiV2"):
         for s2 in cfg.get("slots", []):
@@ -359,6 +812,20 @@ def load_config():
         changed = True
     if st.get("launcherDir") and cfg["launcherDirs"] != [st["launcherDir"]]:
         cfg["launcherDirs"] = [st["launcherDir"]]
+        changed = True
+    # the auto-name style dropped its brackets in patch153: labels the old namer
+    # wrote are retitled in place, one regex, nothing hand-named is touched
+    for s in cfg.get("slots", []):
+        _m = re.match(r"^Server \((\d+)\): (.*)$", str(s.get("label") or ""))
+        if _m:
+            s["label"] = "Server %s: %s" % (_m.group(1), _m.group(2))
+            changed = True
+    if "ttsAutoCalUseFit" in (cfg.get("settings") or {}):
+        cfg["settings"].pop("ttsAutoCalUseFit", None)   # the switch retired in patch158
+        changed = True
+    # a shipped default added in an update - the NarrativeEngine pair, for one -
+    # arrives on the very next start, unallocated, without a button press
+    if create_missing_default_providers(cfg):
         changed = True
     if changed or not os.path.isfile(CONFIG):
         save_config(cfg)
@@ -566,10 +1033,10 @@ def parse_ps1_model(path):
     return leaf(v) if v else ""
 
 SAMPLER_KEYS = [("temp", "--temp"), ("top_p", "--top-p"), ("min_p", "--min-p"),
+                ("n_predict", "--n-predict"),
                 ("top_k", "--top-k"), ("n_sigma", "--top-n-sigma"), ("typ_p", "--typical"),
                 ("xtc_p", "--xtc-probability"), ("xtc_t", "--xtc-threshold"),
                 ("dry", "--dry-multiplier"), ("freq", "--frequency-penalty"), ("pres", "--presence-penalty")]
-SAMPLER_DEFAULTS = {"temp": "0.8", "top_p": "0.95", "min_p": "0.05", "top_k": "40", "dry": "0", "n_sigma": "-1", "typ_p": "1.0", "xtc_p": "0", "xtc_t": "0.1", "freq": "0", "pres": "0"}
 
 # Per-provider sampler fields the proxy observes in each request body and can override.
 # Maps our short key -> the JSON field name llama.cpp / SkyrimNet uses in the request.
@@ -600,6 +1067,10 @@ def parse_ps1_samplers(path):
         mm = re.search("[\"']%s[\"']\\s*,\\s*[\"']([^\"']+)[\"']" % re.escape(flag), region)
         if mm:
             out[key] = mm.group(1)
+    if "n_predict" not in out:
+        mm = re.search("[\"']-n[\"']\\s*,\\s*[\"']([0-9]+)[\"']", region)
+        if mm:
+            out["n_predict"] = mm.group(1)
     return out
 
 def _latest_srv_log(slot_id, ld):
@@ -641,6 +1112,35 @@ def parse_log_samplers(slot_id, ld):
         return out
     except Exception:
         return {}
+
+_PS1_REASON = {}                # path -> (mtime, size, value); the file is on the
+_PS1_REASON_LOCK = threading.Lock()   # hot path via PTI, so it is read once per edit
+
+
+def slot_reasoning(slot):
+    """What the server card's Reasoning dial says, cached against the launcher file.
+
+    `--reasoning off` tells the SERVER not to emit thinking. Some models ignore the
+    flag and only honour the per-request kwarg, so a slot set to off now forces the
+    request side off as well: both, because builds disagree about which they read.
+    """
+    path = (slot or {}).get("script") or ""
+    if not path:
+        return ""
+    try:
+        s = os.stat(path)
+        sig = (s.st_mtime_ns, s.st_size)
+    except OSError:
+        return ""
+    with _PS1_REASON_LOCK:
+        hit = _PS1_REASON.get(path)
+        if hit and hit[0] == sig:
+            return hit[1]
+    val = parse_ps1_reasoning(path)
+    with _PS1_REASON_LOCK:
+        _PS1_REASON[path] = (sig, val)
+    return val
+
 
 def parse_ps1_reasoning(path):
     try:
@@ -966,6 +1466,14 @@ def debug_report():
     A("")
     A("-- servers -----------------------------------------------------")
     A("  configured         : %d" % len(slots))
+    # requests open on each upstream right now. The proxy has counted this on every
+    # forward since patch98 and NOTHING read it - the counter was paid for and
+    # thrown away. It belongs here: "one server is holding four" is the first thing
+    # a slow-fleet report needs to say. (patch184)
+    _open = [(s.get("port"), PROXY.busy(s.get("port") or 0)) for s in slots]
+    if any(n for _p, n in _open):
+        A("  requests open now  : %s" % ", ".join("port %s: %d" % (p, n)
+                                                  for p, n in _open if n))
     for s in slots:
         p = s.get("params", {}) or {}
         mdl = (p.get("model") or "").strip()
@@ -1189,7 +1697,75 @@ def gguf_skip_array(f, SZ):
     else:
         f.seek(SZ.get(et, 4) * ln, 1)
 
-GGUF_WANT = ("general.architecture", "clip.has_vision_encoder", "clip.has_audio_encoder")
+GGUF_WANT = ("general.architecture", "clip.has_vision_encoder", "clip.has_audio_encoder",
+             "general.name", "general.size_label")
+
+# What a file SAYS it is. llama.cpp registers an architecture per model family and
+# every GGUF names its own in the header, so this is read, never guessed from a
+# filename - a repack, a merge or a rename cannot move a model between families.
+# An architecture missing from this table is still reported, under its own name.
+MODEL_ARCH_NAMES = {
+    "muse-glimmer": "Muse Glimmer (Meta)",
+    "gemma": "Gemma", "gemma2": "Gemma 2", "gemma3": "Gemma 3",
+    "gemma3n": "Gemma 3n", "gemma4": "Gemma 4",
+    "qwen2": "Qwen 2", "qwen2moe": "Qwen 2 MoE", "qwen2vl": "Qwen 2 VL",
+    "qwen3": "Qwen 3 family", "qwen3moe": "Qwen 3 family (MoE)",
+    "qwen3vl": "Qwen 3 VL", "qwen3vlmoe": "Qwen 3 VL (MoE)",
+    "qwen3next": "Qwen 3-Next",
+    "llama": "Llama family - also Mistral, NeMo, Yi and most fine-tunes of them",
+    "llama4": "Llama 4", "mllama": "Llama 3.2 Vision",
+    "mistral3": "Mistral 3", "pixtral": "Pixtral",
+    "deepseek": "DeepSeek", "deepseek2": "DeepSeek V2/V3/R1 family",
+    "glm4": "GLM-4", "glm4moe": "GLM-4 (MoE)", "chatglm": "ChatGLM",
+    "command-r": "Command-R", "cohere2": "Command-A / Cohere 2",
+    "phi2": "Phi-2", "phi3": "Phi-3/3.5/4", "phimoe": "Phi MoE",
+    "olmo": "OLMo", "olmo2": "OLMo 2", "olmoe": "OLMoE",
+    "granite": "Granite", "granitemoe": "Granite MoE",
+    "nemotron": "Nemotron", "nemotron_h": "Nemotron-H",
+    "exaone": "EXAONE", "exaone4": "EXAONE 4",
+    "internlm2": "InternLM 2", "minicpm": "MiniCPM", "minicpm3": "MiniCPM 3",
+    "stablelm": "StableLM", "starcoder2": "StarCoder 2", "falcon": "Falcon",
+    "falcon-h1": "Falcon-H1", "mpt": "MPT", "gptneox": "GPT-NeoX",
+    "gpt-oss": "gpt-oss", "dbrx": "DBRX", "arcee": "Arcee",
+    "smollm3": "SmolLM 3", "seed_oss": "Seed-OSS", "dots1": "dots.llm1",
+    "bailingmoe": "Ling / Bailing (MoE)", "bailingmoe2": "Ling 2 (MoE)",
+    "hunyuan-dense": "Hunyuan", "hunyuan-moe": "Hunyuan (MoE)",
+    "ernie4_5": "ERNIE 4.5", "ernie4_5-moe": "ERNIE 4.5 (MoE)",
+    "lfm2": "LFM2", "plamo2": "PLaMo 2", "jamba": "Jamba",
+    "mamba": "Mamba", "mamba2": "Mamba 2", "rwkv6": "RWKV-6", "rwkv7": "RWKV-7",
+    "bitnet-25": "BitNet", "orion": "Orion", "bloom": "BLOOM", "gpt2": "GPT-2",
+    "clip": "vision projector (CLIP/ViT)", "dflash": "DFlash drafter",
+}
+
+# Families whose chat template opens the thinking channel unconditionally: on and
+# off do nothing, and what the person actually controls is HOW MUCH. Meta says so
+# plainly for Muse Glimmer - the strength rides in the template kwargs.
+ARCH_REASON_STRENGTH = ("muse-glimmer",)
+REASON_STRENGTHS = ("low", "medium", "high", "xhigh")
+
+
+def arch_label(arch):
+    """A family name for an architecture, or the architecture itself when it is one
+    the panel has not been taught - never a guess from the file's name."""
+    a = str(arch or "").strip().lower()
+    if not a:
+        return ""
+    if a in MODEL_ARCH_NAMES:
+        return MODEL_ARCH_NAMES[a]
+    for pre, fam in (("qwen3", "Qwen 3 family"), ("qwen2", "Qwen 2 family"),
+                     ("gemma", "Gemma family"), ("llama", "Llama family"),
+                     ("deepseek", "DeepSeek family"), ("mistral", "Mistral family"),
+                     ("phi", "Phi family"), ("rwkv", "RWKV family")):
+        if a.startswith(pre):
+            return fam + (" (MoE)" if "moe" in a else "")
+    return a
+
+# A drafter that says what it is in its own header. Meta's Muse Glimmer ships its
+# DFlash assistant as architecture "dflash" with ordinary tensor names, so the
+# tensor scan - which finds Gemma's MTP and EAGLE heads by name - could never have
+# found it. The header is the stronger fact anyway: it is what llama.cpp reads.
+DRAFT_ARCHS = frozenset(("dflash", "mtp", "nextn", "eagle", "eagle2", "eagle3",
+                         "medusa", "draft"))
 
 def gguf_meta(path):
     """Read a few named values out of a GGUF header, without reading the weights.
@@ -1227,7 +1803,11 @@ def gguf_meta(path):
                     v = None
                 else:
                     break                               # unknown kind: stop, keep what we have
-                if k in GGUF_WANT:
+                # the named keys, plus a drafter's own block size and any model's
+                # block count - one says how deep it drafts, the other says the
+                # file is a language model and not a projector (patch185)
+                if k in GGUF_WANT or k.endswith((".block_size", ".block_count",
+                                                 ".context_length")):
                     out[k] = v
     except Exception:
         pass
@@ -1286,13 +1866,20 @@ def gguf_tensor_hint(path):
 _KIND_FILE = os.path.join(STACK, "model-kinds.json")
 _KIND = {"map": None, "dirty": False}
 _KIND_LOCK = threading.Lock()
+_KIND_RULES = "188"        # bumped whenever what a remembered verdict MEANS changes
+
+
 def _kind_map():
     if _KIND["map"] is None:
         try:
             with open(_KIND_FILE, encoding="utf-8") as f:
-                _KIND["map"] = json.load(f) or {}
+                _m = json.load(f) or {}
+            # every verdict in the file was reached under the rules of its day; when
+            # those rules change, the file is stale even though the models are not.
+            # Muse Glimmer's drafter was cached as a plain model. (patch185)
+            _KIND["map"] = _m if _m.get("_rules") == _KIND_RULES else {"_rules": _KIND_RULES}
         except Exception:
-            _KIND["map"] = {}
+            _KIND["map"] = {"_rules": _KIND_RULES}
     return _KIND["map"]
 def _kind_flush():
     with _KIND_LOCK:
@@ -1318,26 +1905,65 @@ def model_kind(path):
         return _model_kind_read(path)
     with _KIND_LOCK:
         hit = _kind_map().get(key)
-    if hit:
+    if isinstance(hit, dict):
+        return hit["kind"]
+    val = _model_facts_read(path)
+    with _KIND_LOCK:
+        _kind_map()[key] = val
+        _KIND["dirty"] = True
+    return val["kind"]
+
+def _model_facts_read(path):
+    """Everything the card needs about a .gguf, from ONE header read: what it is,
+    which family it belongs to, and the two numbers worth showing beside that."""
+    meta = gguf_meta(path)
+    arch = str(meta.get("general.architecture") or "").lower()
+    return {"kind": _model_kind_read(path, meta), "arch": arch,
+            "label": arch_label(arch),
+            "blocks": int(meta.get(arch + ".block_count") or 0),
+            "ctx": int(meta.get(arch + ".context_length") or 0),
+            "size": str(meta.get("general.size_label") or "")}
+
+
+def model_facts(path):
+    """The cached form of the above - the same key as the kind cache, one entry."""
+    try:
+        stt = os.stat(path)
+        key = "%s|%d|%d" % (os.path.abspath(path).lower(), stt.st_size, int(stt.st_mtime))
+    except Exception:
+        return _model_facts_read(path)
+    with _KIND_LOCK:
+        hit = _kind_map().get(key)
+    if isinstance(hit, dict):
         return hit
-    val = _model_kind_read(path)
+    val = _model_facts_read(path)
     with _KIND_LOCK:
         _kind_map()[key] = val
         _KIND["dirty"] = True
     return val
 
-def _model_kind_read(path):
+
+def model_arch(path):
+    """The architecture a file declares, lowercase, or "" if it will not say."""
+    return str((model_facts(path) or {}).get("arch") or "") if path else ""
+
+
+def _model_kind_read(path, meta=None):
     """What a .gguf actually is: a chat model, a vision projector, or a draft model.
 
     The header is asked first. The name is only consulted when the header says nothing
     useful, because names are a convention and not a guarantee.
     """
-    meta = gguf_meta(path)
+    meta = gguf_meta(path) if meta is None else meta
     arch = str(meta.get("general.architecture") or "").lower()
     if arch == "clip" or meta.get("clip.has_vision_encoder") or meta.get("clip.has_audio_encoder"):
         return "vision"
+    if arch in DRAFT_ARCHS or any(str(k).split(".")[0] in DRAFT_ARCHS for k in meta):
+        return "draft"                            # it says so in its own header
     hint = gguf_tensor_hint(path)                 # what the file is built from
-    if hint:
+    if hint == "vision" and meta.get(arch + ".block_count"):
+        hint = ""                                 # it CARRIES a vision tower; it is
+    if hint:                                      # still the model that runs
         return hint
     low = os.path.basename(path).lower()          # only then, what it is called
     if "mmproj" in low or "-vision" in low or low.startswith("vision"):
@@ -1377,8 +2003,13 @@ def list_models(cfg):
                 if full.lower() in seen:
                     continue
                 seen.add(full.lower())
+                _f188 = model_facts(full)
                 items.append({"path": full, "name": os.path.relpath(full, base),
-                              "kind": model_kind(full)})
+                              "kind": _f188.get("kind", "main"),
+                              "arch": _f188.get("arch", ""),
+                              "archLabel": _f188.get("label", ""),
+                              "blocks": _f188.get("blocks", 0),
+                              "archCtx": _f188.get("ctx", 0)})
     items.sort(key=lambda x: x["name"].lower())
     _kind_flush()
     _took = (time.time() - _t_scan) * 1000
@@ -1554,6 +2185,9 @@ def api_state():
         last = next((h for h in hist if h.get("slotId") == s.get("id")), None)
         return {**s, "actualPort": actual, "status": st, "speeds": spd, "lastLaunch": last,
                 "model": (parse_ps1_model(script) if script else ""),
+                # "" is a language model; "vision" and "draft" are not, and neither can
+                # answer a chat request. Read once per file and remembered.
+                "modelKind": (model_kind(parse_ps1_model(script)) if script else ""),
                 "scriptExists": bool(script) and os.path.isfile(script),
                 "gpuId": s.get("gpuId", ""), "gpu": s.get("gpu", ""),
                 "params": {k: v for k, v in (s.get("params", {}) or {}).items() if k != "prevCustom"}}
@@ -1567,12 +2201,23 @@ def api_state():
                      "srvSamplers": (parse_log_samplers(s.get("id"), log_dir(cfg)) if s.get("script") else {}),
                      "samplerSource": (p.get("samplerSource") or "server"),
                      "detectSN": bool(p.get("detectSN")),
+                     "panelOwned": p.get("id") in PANEL_PROV_IDS,
+                     "cache": bool(p.get("cache")),
+                     "cacheSlot": cached_slot_map(s).get(str(p.get("id") or "")),
+                     "enabled": (panel_prov_on(p.get("id"), cfg.get("settings", {}))
+                                 if p.get("id") in PANEL_PROV_IDS
+                                 else p.get("enabled") is not False),
                      "samplerOverrides": {k: v for k, v in (p.get("samplerOverrides") or {}).items() if str(v).strip() != ""}} for p in (s.get("providers") or [])]}
                for s in cfg.get("slots", [])]
-    return {"app": APP_NAME, "version": APP_VER_UI, "build": BUILD_ID, "stack": STACK,
+    return {"version": APP_VER_UI, "build": BUILD_ID, "stack": STACK,
             "paramDefs": [{"key": k, "label": lab, "kind": kind, "def": dv, "opt": o,
-                           "flag": f, "ref": ref}
+                           "flag": f, "ref": ref, "group": PARAM_GROUP.get(k, "Other"),
+                           "caution": PARAM_CAUTION.get(k) or {}}
                           for (k, lab, kind, dv, o, f, ref) in SERVER_PARAMS],
+            # the order the card lays the groups out in - the launcher writer already
+            # groups by the same names, so a heading on the card names a block of flags
+            # you can find in the .ps1
+            "paramGroups": list(PARAM_GROUP_ORDER),
             "elevated": is_admin(), "slots": slots, "settings": cfg.get("settings", {}),
             "creatorSlots": cfg.get("creatorSlots", []), "routing": routing,
             "unallocated": cfg.get("unallocatedProviders", []) or [],
@@ -1584,6 +2229,17 @@ def api_state():
             "higgsInstall": dict(HIGGS_INSTALL),
             "higgsFound": higgs_present(cfg),
             "ttsServer": tts_server_status(cfg),
+            # shown in the prompt editor so "the built-in wording" is not a mystery -
+            # as it CURRENTLY reads, clicked-off tags and all
+            # the tab compares this against the tag baked into its own page and
+            # reloads itself on a mismatch - a terminal left open across panel
+            # updates was running week-old JS, and every fix "changed nothing"
+            "app": APP_RELEASE_TAG,
+            "defaultPtiPrompt": tts_tag_prompt("", tags_off(cfg.get("settings", {}))),
+            "defaultPmePrompt": mood_prompt(mood_count(cfg.get("settings", {})), "",
+                                            tags_off(cfg.get("settings", {}))),
+            # the vocabulary the Audio Tags buttons draw, grouped as offered
+            "tagOffer": [[label, list(words)] for label, words in TAG_OFFER],
             "launchers": list_launchers(cfg), "history": hist[:50]}
 
 def is_admin():
@@ -1627,7 +2283,12 @@ def api_action(body, mode):
             _cfg = load_config()
             _s = next((x for x in _cfg.get("slots", []) if x.get("id") == sid), None)
             if _s and (_s.get("params") or {}).get("model"):
-                if not isinstance(regen_slot_script(_cfg, _s), dict):
+                # regen_slot_script returns a PATH for a generated launcher and a
+                # {"changed": [...]} dict for one edited in place. Only a dict carrying
+                # "error" is a failure - testing isinstance skipped the save for every
+                # hand-written launcher.
+                _r = regen_slot_script(_cfg, _s)
+                if not (isinstance(_r, dict) and _r.get("error")):
                     save_config(_cfg)
             if _s:
                 _up = (parse_ps1_port(_s.get("script") or "") if _s.get("script") else None) or _s.get("port")
@@ -1760,17 +2421,25 @@ def full_exit(reason, kill_servers=True):
     LIFE["exiting"] = True
     panel_log("[panel] EXIT (%s)%s" % (reason, "" if kill_servers else " - servers left running"))
     if kill_servers:
+        try:
+            # the SAME stop the TTS page's Stop button runs, in the same order: the
+            # handled process first, then whatever owns the TTS port - which is what
+            # catches a server a PREVIOUS panel run started, exactly as the button
+            # already did. patch123 wrote a second discovery (a command-line sweep)
+            # instead of calling the one that existed, and its PowerShell quoting
+            # emitted rows no parser matched - a second copy of a rule, drifted, on
+            # its first day. TTS first: on a closing console this handler has ~5
+            # seconds, and the fleet's own -Stop below can eat all of them.
+            stop_tts_server(reason)
+            _kill_port_owner(tts_server_port())
+            tts_clock_release("panel exit")
+        except Exception:
+            pass
         out = run_fleet(["-Stop"])
         panel_log(out)
         n = sweep_launcher_shells()          # -Stop misses shells with no live port
         if n:
             panel_log("[panel] closed %d leftover launcher window(s)" % n)
-        try:
-            # a TTS server the panel started is the panel's to clean up; left running it
-            # holds the model in VRAM with nothing able to reach it
-            stop_tts_server(reason)
-        except Exception:
-            pass
     try:
         for srv in list(PROXY._servers.values()):
             import threading as _th
@@ -1844,10 +2513,16 @@ def apply_auto_names(cfg):
     for s in cfg.get("slots", []):
         if s.get("autoName") and s.get("gpuId") in gpus:
             per.setdefault(s["gpuId"], []).append(s)
+    n = 0
     for gid, ss in per.items():
-        base = gpu_short(gpus[gid]) + " server"
-        for i, s in enumerate(ss):
-            s["label"] = base + ((" %d" % (i + 1)) if len(ss) > 1 else "")
+        # Server (N): <gpu>, numbered across the fleet in slot order, and the gpu
+        # part clamped so the card's first row cannot be pushed into a second
+        gpu = gpu_short(gpus[gid])
+        if len(gpu) > 24:
+            gpu = gpu[:23].rstrip() + "\u2026"
+        for s in ss:
+            n += 1
+            s["label"] = "Server %d: %s" % (n, gpu)
 
 def api_gpu_edit(body):
     cfg = load_config()
@@ -1890,7 +2565,6 @@ def api_detect_gpus(body=None):
             used.add("gpu%d" % n)
             gl.append({"id": "gpu%d" % n, "uuid": uuid, "index": idx, "name": name,
                        "mem": mem, "sub": sub, "brand": brand})
-    ids = {g["id"] for g in gl}
     for s in cfg.get("slots", []):   # auto-link by legacy gpu-name-substring tag
         if not s.get("gpuId") and s.get("gpu"):
             hits = [g for g in gl if s["gpu"].lower() in (g.get("name") or "").lower()]
@@ -2010,6 +2684,10 @@ def api_yaml_generate(body):
     provs = []
     for s in cfg.get("slots", []):
         for p in s.get("providers", []) or []:
+            # the panel's own PTI/PME are proxy-internal: SkyrimNet never calls
+            # them, and their port is 0 - exporting them wrote :0 endpoints
+            if p.get("panelOwned") or int(p.get("port") or 0) <= 0:
+                continue
             if p.get("enabled") is not False:
                 provs.append(p)
     provs.sort(key=lambda p: int(p.get("port") or 0))
@@ -2359,6 +3037,421 @@ def _api_launch_stack(body):
     lines.append(_stamp_log(run_fleet([])))
     return {"log": "\n".join(lines)}
 
+def tts_echo_wav(path):
+    """An inner-monologue echo baked into the wav: two decaying taps (~130/260 ms),
+    channel-aligned, with a soft clip. 16-bit PCM only - anything else passes
+    through untouched rather than being guessed at."""
+    try:
+        with _wave.open(path, "rb") as w:
+            if w.getsampwidth() != 2:
+                return False
+            nch, rate = w.getnchannels(), w.getframerate()
+            frames = w.readframes(w.getnframes())
+        import array, math as _m
+        s = array.array("h")
+        s.frombytes(frames)
+        d1, d2 = int(rate * 0.13) * nch, int(rate * 0.26) * nch
+        # taps halved again (patch159) - the echo is a shade, not a room - and
+        # the BOOM moved down to ~70 Hz with more weight, so the 60 Hz body the
+        # request asked for actually lands in the chest
+        g1, g2, gb = 0.055, 0.026, 1.8
+        alpha = 1.0 - _m.exp(-2.0 * _m.pi * 70.0 / float(rate or 24000))
+        lp = [0.0] * nch
+        out = array.array("h", s)
+        for i in range(len(s)):
+            ch = i % nch
+            lp[ch] += alpha * (s[i] - lp[ch])
+            v = 0.88 * s[i] + gb * lp[ch]
+            if i >= d1:
+                v += g1 * s[i - d1]
+            if i >= d2:
+                v += g2 * s[i - d2]
+            out[i] = int(max(-32768.0, min(32767.0, v)))
+        with _wave.open(path, "wb") as w:
+            w.setnchannels(nch)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            w.writeframes(out.tobytes())
+        return True
+    except Exception as e:
+        panel_log("[tts] echo skipped: %s" % e)
+        return False
+
+
+def _wav_join(datas):
+    """Concatenate complete little WAV files into one - same rate and width, as
+    one voice on one server always is. Frames only; one fresh header."""
+    import wave, io
+    if len(datas) == 1:
+        return datas[0]
+    frames, params = [], None
+    for d in datas:
+        with wave.open(io.BytesIO(d), "rb") as r:
+            if params is None:
+                params = r.getparams()
+            frames.append(r.readframes(r.getnframes()))
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setparams(params)
+        for fr in frames:
+            w.writeframes(fr)
+    return buf.getvalue()
+
+
+def tts_thought_make(who, text, cfg=None):
+    """Synthesize a thought in `who`'s remembered reference with the echo baked in.
+    Cached by content. Returns (eid, seconds) or (None, reason)."""
+    text = re.sub(r"\*[^*]{0,40}\*", " ", str(text or ""))
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if not who or not text:
+        return None, "nothing to voice"
+    cfg = cfg or load_config()
+    if tts_engine(cfg) != "audiocpp":
+        return None, "thought voicing needs the audio.cpp engine"
+    ref = TTS_REF_BY_NAME.get(who)
+    if not ref:
+        return None, "no voice learned for %s yet - they need to speak one line first" % who
+    eid = "th" + hashlib.sha1((who + "|" + text).encode("utf-8")).hexdigest()[:12]
+    out = os.path.join(TTSW.dir(), "out-%s.wav" % eid)
+    if not os.path.isfile(out):
+        st = cfg.get("settings", {})
+        mid = st.get("ttsAcppModelId") or "higgs"
+        base = "http://127.0.0.1:%d" % tts_server_port(cfg)
+        _t0m = time.time()
+        # ONE sentence per request: audio.cpp ends a clip at a sentence's EOC on
+        # its own schedule - the owner's field wav held sentence 1 of 2, 5.6 s of
+        # a 7.5 s thought. Ask for each sentence and join the answers. (patch179)
+        _parts = [p for p in re.split(r"(?<=[.!?])\s+", str(text or "").strip())
+                  if p.strip()][:4] or [str(text or "")]
+        _wavs = []
+        for _p179 in _parts:
+            wav, _hdrs = tts_acpp_speak(base, mid, _p179, tts_ref_canonical(ref))
+            if not wav:
+                return None, "no audio returned by audio.cpp"
+            _wavs.append(wav)
+        wav = _wav_join(_wavs)
+        _syn = time.time() - _t0m
+        with open(out, "wb") as f:
+            f.write(wav)
+        tts_echo_wav(out)
+        TTSW.prune()
+        try:
+            TTSW.blk.acquire()
+            TTSW.log("")
+            TTSW.log("\U0001F4AD %s (thought): \u3030 %s \u3030" % (who, text))
+            TTSW.log("")
+            with _wave.open(out, "rb") as _wf0:
+                _fr0 = _wf0.getframerate() or 24000
+                _nf0 = _wf0.getnframes()
+                _sec0 = _nf0 / float(_fr0)
+            # the SAME row shapes the dialogue writer uses, so the painter colours
+            # and spaces them identically - the owner's screenshot showed the old
+            # merged line uncoloured and glued to the next chunk
+            TTSW.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)"
+                     % ((_sec0 / _syn) if _syn else 0.0, _syn, _sec0))
+            TTSW.log("   %-9s%6.0f ms   (synthesis)" % ("server:", _syn * 1000.0))
+            TTSW.log("   %-9s%13d samples @ %d Hz" % ("audio:", _nf0, _fr0))
+            TTSW.log("\U0001F4BE Saved: %s (%.1f KB)   voice: %s"
+                     % (os.path.basename(out), os.path.getsize(out) / 1024.0,
+                        os.path.basename(str(ref))))
+        except Exception:
+            pass
+        # NO wave marks here: the dashboard splicer treats a waved line as SPOKEN
+        # dialogue and inserted this note under the nearest record as a response
+        # row - which is exactly the bug the owner photographed
+        TTSW.log("")
+        TTSW.log("\U0001F4AD\U0001F50A Thought voiced: \U0001F4AD %s: \u3030 %s \u3030"
+                 % (who, text))
+        TTSW.log("")
+        try:
+            TTSW.blk.release()
+        except Exception:
+            pass
+    secs = 0.0
+    try:
+        with _wave.open(out, "rb") as w:
+            secs = w.getnframes() / float(w.getframerate() or 1)
+    except Exception:
+        pass
+    return eid, secs
+
+
+# one pending AFTER-thought per speaker: the reply's chunks keep extending the
+# modeled playback end and re-arming the timer, so the thought fires once, after
+# the LAST chunk's audio - never between chunks of one reply.
+# The wav's own length is exact, but the game adds time around it: a delivery-to-
+# audible start latency, and an engine gap between chunks of one reply. Modeling
+# only the wav made the thought land while the last line was still sounding.
+def _th_norm(s):
+    return re.sub(r"[^a-z0-9]+", "", str(s or "").lower())
+
+
+REPLY_FULL = {}          # who -> (normalized spoken reply, when) - patch162
+# EVERY NPC chunk is traced here, thought or no thought - the field log showed the
+# reply's early chunks arriving BEFORE the streamed completion had yielded its
+# thought, so the conditional scheduler path never saw them. The trace is written
+# unconditionally; when the thought finally lands, the whole reply's playback is
+# reconstructed from it. (patch163)
+CHUNK_TRACE = {}         # who -> [(delivery_t, secs, normalized_text), ...]
+MOOD_QUEUE = {}          # who -> ([alias pairs in reading order], when) - patch168
+
+
+def tts_npc_mood_arm(who, text, cool=frozenset()):
+    """The NPC counterpart of the player's tag injection, one step earlier.
+
+    SkyrimNet strips the [enthusiasm]-style tags before its TTS requests, so the
+    completion is the only place they exist - captured there into MOOD_QUEUE, in
+    reading order. Each spoken chunk pops ONE entry and wears it as the real
+    control token, so Higgs finally HEARS the emotion instead of the panel only
+    painting a face. Everything downstream is the same wire the player rides:
+    tts_apply_tags, the final-off board, this character's own cooldown limits.
+    Emotions measured to break the voice (TTS_EMOTION_BLOCK) are consumed but
+    never injected, exactly as the alias pass refuses them. (patch169)
+
+    Each chunk takes the NEXT tag the model wrote, in reading order: the model
+    decides how many emotions a reply carries and where they change, and the
+    panel places none of its own. When it wrote fewer tags than the reply has
+    chunks, the last one HOLDS, so a delivery does not fall back to neutral half
+    way through. The Emotion Chunk Placement setting that used to choose between
+    one assertion and one repeated assertion is gone with this. (patch190)"""
+    q = MOOD_QUEUE.get(who)
+    if q is None or time.time() - q[1] > 20.0:
+        # the chunk beat the completion's own parse by milliseconds (the owner's
+        # field log: 20 ms). A FRESH entry - even an empty one - means the reply
+        # is parsed; none at all - or only a PREVIOUS reply's leftover - means
+        # this one is being parsed RIGHT NOW: wait a bounded moment. The window
+        # is 20 s, a reply's own span - the old 120 s let last reply's empty
+        # entry suppress the wait, and the tag landed a chunk late. (patch171)
+        _dl = time.time() + 1.5
+        while time.time() < _dl:
+            time.sleep(0.05)
+            q = MOOD_QUEUE.get(who)
+            if q is not None and time.time() - q[1] <= 20.0:
+                break
+    if not q or not q[0] or time.time() - q[1] > 20.0:
+        return text
+    if TTS_TOKEN_RX.search(str(text or "")):
+        return text                     # the line already carries its own token
+    # SOUND tags are never injected: SkyrimNet performs [chuckle] itself as a
+    # spoken *laughs* prefix, and injecting the token too doubled the laugh -
+    # the owner's field line said it twice. Emotions and styles only. (patch171)
+    _elig = [_pr for _pr in q[0] if _pr[0] in ("emotion", "style")]
+    if not _elig:
+        return text
+    pick = _elig[0]
+    if (pick[0] == "emotion" and pick[1] in TTS_EMOTION_BLOCK) \
+            or ("%s:%s" % pick) in cool:
+        q[0].remove(pick)               # refused, and the next chunk moves on
+        return text
+    if len(_elig) > 1:
+        q[0].remove(pick)               # more were written: the next chunk takes it
+    return "<|%s:%s|> %s" % (pick[0], pick[1], text)
+
+
+def tts_chunk_trace(who, secs, text):
+    with TH_AFTER_LOCK:
+        q = CHUNK_TRACE.setdefault(who, [])
+        q.append((time.time(), max(0.0, float(secs or 0.0)), _th_norm(text)))
+        del q[:-12]
+
+
+def tts_chunk_is_last(who, chunk_text):
+    """The owner's rule: the proxy has SEEN the whole reply, so the final TTS
+    chunk is recognised, not counted - it is the one whose text ends the reply.
+    Tag-stripped and normalized on both sides; unknown replies answer False and
+    the additive chain stays as the fallback."""
+    full = REPLY_FULL.get(who)
+    # a STALE reply is no reply: the owner's 02:38:52 chunk raced its own
+    # completion and matched the PREVIOUS reply's text forever - fresh only
+    if not full or time.time() - full[1] > 25.0:
+        return False
+    nf, nc = full[0], _th_norm(chunk_text)
+    if not nf or not nc:
+        return False
+    # match by COMMON SUFFIX: the true final chunk ENDS as the reply ends,
+    # whatever SkyrimNet injected in front of it. Tail-probe endswith could
+    # never see past a prefix inside a SHORT chunk's window (the owner's
+    # 02:40 final, five defers deep), and a fixed reply-tail overruns the
+    # chunk boundary on short replies. Suffixes are immune to both.
+    _n = 0
+    while (_n < len(nf) and _n < len(nc)
+           and nf[len(nf) - 1 - _n] == nc[len(nc) - 1 - _n]):
+        _n += 1
+    return _n >= min(12, len(nf), len(nc))
+
+
+TH_START_LAT = 0.45      # delivery -> audible, per re-anchor
+TH_CHUNK_GAP = 0.60      # the engine's breath after each chunk - doubled in
+                         # patch173: tag-performed lines (the laugh IS in the
+                         # wav) take longer to hand between chunks in-game, and
+                         # the field fire kept landing ~half a second inside
+                         # the last chunk with the old 0.30
+TH_FIRE_PAD = 0.20       # and a hair after the modeled end before the thought
+TH_AFTER = {}
+TH_AFTER_LOCK = threading.Lock()
+
+
+def tts_thought_fire(who):
+    """Fires the OLDEST pending thought for this speaker - pendings are a queue,
+    one per reply, so a fast model thinking ahead can never erase the thought
+    of the reply still sounding. A pending that was never FINAL-anchored may be
+    firing into the gap before the reply's next chunk even arrives - the owner's
+    01:55 log: fired at +2.4s, chunk 2 delivered at +2.9s and found the queue
+    empty. Such a fire DEFERS in 2 s steps (bounded) while the reply is visibly
+    still arriving, and stands down for good once the final chunk re-anchors it."""
+    with TH_AFTER_LOCK:
+        q = TH_AFTER.get(who) or []
+        p = q[0] if q else None
+        if p is not None and not p.get("fin") and p.get("defer", 0) < 3:
+            _rf = REPLY_FULL.get(who)
+            _nf = _rf[0] if (_rf and time.time() - _rf[1] < 25.0) else ""
+            _tr = CHUNK_TRACE.get(who, [])
+            # the owner's 16:49 and 16:57 field cases: SkyrimNet ABANDONED a
+            # queued chunk (its estimate logged, its delivery never came), and
+            # the defer waited its full ladder on a ghost. An unfinished reply
+            # only earns a defer while chunks are ACTUALLY still arriving -
+            # quiet for 3.5s means the missing chunk is not coming, and the
+            # chain fires on what really played. (patch182)
+            _last_rx = max((r[0] for r in _tr), default=0.0)
+            _arriving = (time.time() - _last_rx) <= 3.5
+            # unknown or stale reply text claims NOTHING: the defer stands down
+            # and the chain fires exactly as patch170 did
+            def _cs172(a, b):
+                _k = 0
+                while _k < len(a) and _k < len(b) and a[len(a) - 1 - _k] == b[len(b) - 1 - _k]:
+                    _k += 1
+                return _k
+            _unfinished = bool(_nf) and _arriving and not any(
+                r[2] and _cs172(_nf, r[2]) >= min(12, len(_nf), len(r[2]))
+                for r in _tr[-3:])
+            if _unfinished:
+                p["defer"] = p.get("defer", 0) + 1
+                p["end"] = time.time() + 2.0
+                tm = threading.Timer(2.0 + TH_FIRE_PAD, tts_thought_fire, args=(who,))
+                tm.daemon = True
+                p["timer"] = tm
+                tm.start()
+                calterm_log(["thought DEFER %s: reply still arriving, +2.0s (%d)"
+                             % (who, p["defer"])])
+                return
+        p = q.pop(0) if q else None
+        if not q:
+            TH_AFTER.pop(who, None)
+    if not p:
+        return
+    eid, _why = tts_thought_make(who, p["text"])
+    calterm_log(["thought FIRE %s: waited %.1fs%s"
+                 % (who, time.time() - p.get("t0", time.time()),
+                    "" if eid else " - synthesis failed, nothing to play")])
+    if eid:
+        sse_notify("replay", {"id": eid})
+
+
+def tts_thought_after_chunk(who, text, secs, cfg=None, is_last=False):
+    """Called for EVERY NPC chunk in after-mode. `text` is the reply's thought on
+    the first chunk and None on the rest. In-game playback is sequential while
+    requests pipeline ahead of it, so the end is modeled, not observed:
+    end = max(end, now) + this chunk's seconds - and each chunk pushes the one
+    timer later. The synthesis is warmed in the background on the first chunk, so
+    the timer's fire is a cache hit and a broadcast, nothing more."""
+    now = time.time()
+    with TH_AFTER_LOCK:
+        q = TH_AFTER.setdefault(who, [])
+        if text:
+            # a NEW reply's thought while another is pending must not erase it:
+            # the field race - a fast model thinking ahead of slow playback -
+            # popped the fresh thought on chunk 2 and RESET the chain, so the
+            # first thought never played and the second fired mid-dialogue.
+            # Each reply gets its own pending, chained after the one before.
+            base = max(q[-1]["end"], now) if q else now
+            q.append({"text": text, "end": base, "t0": now, "timer": None})
+            threading.Thread(target=tts_thought_make, args=(who, text, cfg),
+                             daemon=True).start()
+        if not q:
+            return
+        p = q[0] if is_last else q[-1]
+        if is_last:
+            # the recognised FINAL chunk closes the reply - but chunks delivered
+            # while the completion still streamed (before the thought existed)
+            # are in the unconditional trace: chain THEM, so the backlog the
+            # 2-4x-realtime synthesis piled up is counted, not discarded
+            nf = (REPLY_FULL.get(who) or ("", 0))[0]
+            # membership by the chunk's TAIL: SkyrimNet injects vocalization
+            # prefixes (*sighs* Ahh, ...) at TTS time that the completion never
+            # contained, so whole-text membership evicted those chunks and the
+            # chain fired early - the owner's 19:30 log, chunk 2 dropped
+            _tr = [r for r in CHUNK_TRACE.get(who, [])
+                   if nf and _th_member(r[2], nf) and now - r[0] < 120.0]
+            if _tr:
+                _e = 0.0
+                for _rt, _rs, _ in _tr:
+                    _e = max(_e, _rt + TH_START_LAT) + _rs + TH_CHUNK_GAP
+                p["end"] = _e
+                p["fin"] = True
+            else:
+                p["end"] = now + TH_START_LAT + max(0.0, float(secs or 0.0)) + 0.2
+                p["fin"] = True
+        else:
+            p["end"] = (max(p["end"], now + TH_START_LAT)
+                        + max(0.0, float(secs or 0.0)) + TH_CHUNK_GAP)
+        if p.get("timer"):
+            try:
+                p["timer"].cancel()
+            except Exception:
+                pass
+        tm = threading.Timer(max(0.2, p["end"] - now + TH_FIRE_PAD), tts_thought_fire,
+                             args=(who,))
+        tm.daemon = True
+        p["timer"] = tm
+        tm.start()
+        _w = p["end"] - now + TH_FIRE_PAD
+        calterm_log(["thought ARM %s: %schunk %.2fs, fires in %.1fs, %d pending"
+                     % (who, "FINAL " if is_last else "", float(secs or 0.0),
+                        _w, len(q))])
+        if is_last:
+            _n = len(_tr) if _tr else 1
+            _a = sum(r[1] for r in _tr) if _tr else float(secs or 0.0)
+            try:
+                TTSW.log("\U0001F4AD\u23F2 thought delay %s: %d chunk%s, %.1fs audio "
+                         "+ %.2fs start + %d\u00D7%.2fs gap + %.1fs pad "
+                         "\u2192 plays in %.1fs"
+                         % (who, _n, "" if _n == 1 else "s", _a, TH_START_LAT,
+                            _n, TH_CHUNK_GAP, 0.5 if not _tr else 0.2 + TH_FIRE_PAD,
+                            _w))
+            except Exception:
+                pass
+
+
+def api_tts_thought(body):
+    """A click on a thought line: synthesize (or reuse) and broadcast it."""
+    eid, why = tts_thought_make(str((body or {}).get("who") or "").strip(),
+                                (body or {}).get("text"))
+    if not eid:
+        return {"error": why}
+    sse_notify("replay", {"id": eid})
+    return {"ok": True, "id": eid}
+
+
+def api_slot_log(body):
+    """The last stretch of a slot's newest console log, ANSI-stripped - the card's
+    small terminal polls this while a launch or a stop is in flight, so the window
+    the user pressed for stays alive until the server is up or gone."""
+    cfg = load_config()
+    sid = str((body or {}).get("slot") or "")
+    files = sorted(glob.glob(os.path.join(log_dir(cfg), "srv_%s_*.log" % glob.escape(sid))),
+                   key=os.path.getmtime, reverse=True)
+    if not files:
+        return {"log": ""}
+    try:
+        with open(files[0], "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 8192))
+            text = ANSI_RX.sub("", f.read().decode("utf-8", errors="ignore"))
+        return {"log": text[-4000:]}
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def api_show_terminal(body):
     cfg = load_config()
     s = next((x for x in cfg.get("slots", []) if x.get("id") == body.get("slot")), None)
@@ -2551,6 +3644,35 @@ def llama_exe(cfg):
     base = ((cfg.get("settings", {}) or {}).get("llamacppPath") or "C:\\llama.cpp-cuda").rstrip("\\/")
     return base + "\\llama-server.exe"
 
+DRAFT_SPEC_FLAGS = ("--spec-draft-model", "--spec-type", "--spec-draft-n-max",
+                    "--spec-draft-ngl")
+
+
+def draft_launch_args(draft_path, ngl=""):
+    """The flags a chosen drafter needs, decided by the drafter's OWN header.
+
+    A DFlash assistant is not a small model of the same family with a smaller
+    weight file: llama.cpp loads it through the speculative path, has to be told
+    which kind of speculation it is, and takes the drafter's own block size as the
+    draft depth. Meta's Muse Glimmer ships exactly this - arch "dflash",
+    block_size 16 - and a bare --model-draft cannot start it. A conventional
+    drafter keeps the flag it has always had. (patch185)
+    """
+    p = str(draft_path or "").strip()
+    if not p:
+        return []
+    meta = gguf_meta(p) if os.path.isfile(p) else {}
+    if str(meta.get("general.architecture") or "").lower() != "dflash":
+        return [("--model-draft", p)]
+    out = [("--spec-draft-model", p), ("--spec-type", "draft-dflash"),
+           ("--spec-draft-n-max", str(int(meta.get("dflash.block_size") or 16)))]
+    if str(ngl).strip() != "":
+        # the drafter follows the main model's placement: the panel does not
+        # decide to put layers on a card the user kept off it
+        out.append(("--spec-draft-ngl", str(ngl).strip()))
+    return out
+
+
 def render_launcher_lines(t, dest, llexe):
     """Substitute a launcher template with one parameter set.
 
@@ -2561,11 +3683,22 @@ def render_launcher_lines(t, dest, llexe):
     vis_off = t.get("vision") in ("", "N/A", "Disabled", None)
     drf_off = t.get("draft") in ("", "N/A", "Disabled", None)
     out_lines = []
+    drop_value_next = False
     for line in (t.get("content") or "").splitlines():
+        # a template may put a flag and its value on separate lines: when the flag
+        # line is skipped, a bare quoted value left behind would reach llama-server
+        # as a positional argument - "error: invalid argument: <path>"
+        if drop_value_next:
+            drop_value_next = False
+            if re.match(r'\s*"[^"]*"\s*,?\s*$', line) and "--" not in line:
+                continue
         # conditional flags: skip the whole line (placeholder OR already-resolved) when the dropdown is empty
         if ('"--mmproj"' in line or "<MMPROJ_PATH>" in line) and vis_off:
+            drop_value_next = line.count('"') < 4 and "<MMPROJ_PATH>" not in line
             continue
-        if ('"--model-draft"' in line or "<DRAFT_PATH>" in line) and drf_off:
+        if (('"--model-draft"' in line or "<DRAFT_PATH>" in line
+             or any(('"%s"' % _f) in line for _f in DRAFT_SPEC_FLAGS)) and drf_off):
+            drop_value_next = line.count('"') < 4 and "<DRAFT_PATH>" not in line
             continue
         if "<GPU_ID>" in line and t.get("gpu") in ("", "N/A", "Disabled", None):
             continue
@@ -2593,7 +3726,17 @@ def render_launcher_lines(t, dest, llexe):
     if not vis_off:
         _inject("--mmproj", t.get("vision"))
     if not drf_off:
-        _inject("--model-draft", t.get("draft"))
+        # a template that already speaks the speculative dialect must not also be
+        # handed --model-draft: llama-server would receive two drafters
+        _have = any(('"%s"' % f) in ln for f in DRAFT_SPEC_FLAGS for ln in out_lines)
+        _ngl = ""
+        _m = re.search(r'"(?:--n-gpu-layers|-ngl)"\s*,\s*"(\d+)"', "\n".join(out_lines))
+        if _m:
+            _ngl = _m.group(1)
+        for _f, _v in draft_launch_args(t.get("draft"), _ngl):
+            if _have and _f == "--model-draft":
+                continue
+            _inject(_f, _v)
     return out_lines
 
 def _gpu_pin_value(cfg, gpu_id):
@@ -2620,6 +3763,20 @@ SERVER_PARAMS = [
     ("nommap",    "Disable mmap",        "sel",  "off",   {"opts": ["off", "on"]},                    "--no-mmap",          "Threads / mmap / fit"),
     ("nocontbat", "Disable cont batching","sel", "off",   {"opts": ["off", "on"]},                    "--no-cont-batching", "Concurrency (parallel slots)"),
     ("fit",       "Auto fit to VRAM",    "sel",  "off",   {"opts": ["off", "on"]},                    "--fit",              "Threads / mmap / fit"),
+    # -1 is llama.cpp's default and means unrestricted; 0 ends thinking at once; above
+    # that is a real token budget. This is the SERVER default - a provider with its
+    # Thinking switch off sends a per-request budget of 0, which is how one server can
+    # reason for some callers and not others.
+    ("reasonbudget", "Reasoning budget", "int",  "-1",    {"min": -1,   "max": 32768,  "step": 1},    "--reasoning-budget", "Reasoning budget"),
+    ("reasonfmt",    "Reasoning format", "sel",  "auto",  {"opts": ["auto", "deepseek", "deepseek-legacy", "none"]}, "--reasoning-format", "Reasoning format"),
+    # `on` was written unconditionally: the server was always able to reason and each
+    # provider decided for itself. That is still the default and still the sane choice,
+    # but it is a dial now - `off` refuses reasoning for EVERY provider on this server,
+    # whatever their Thinking switch says, and the provider card already warns about it.
+    ("reasoning",    "Reasoning",        "sel",  "on",    {"opts": ["on", "auto", "off"]}, "--reasoning",        "Reasoning on/off"),
+    # llama.cpp default is 8. 0 disables checkpointing, which is what the No-cache switch
+    # used to write unconditionally; it is a dial now so the two do not disagree.
+    ("ctxcheck",  "Context checkpoints", "int",  "8",     {"min": 0,    "max": 64,     "step": 1},    "--ctx-checkpoints",  "Context size"),
 ]
 
 # Which heading each parameter is written under in a generated launcher, and the order
@@ -2631,9 +3788,27 @@ PARAM_GROUP = {
     "ubatch": "Batching and concurrency", "nocontbat": "Batching and concurrency",
     "threads": "CPU", "nommap": "CPU",
     "npredict": "Generation",
+    "reasonbudget": "Generation", "reasonfmt": "Generation", "reasoning": "Generation",
+    "ctxcheck": "Context and cache",
 }
 PARAM_GROUP_ORDER = ["Model", "Server", "GPU", "Context and cache",
                      "Batching and concurrency", "CPU", "Generation", "Logging", "Other"]
+
+# A dial value that does something its label does not say. Keyed by VALUE, because it
+# is the value that earns the caution, not the setting: `--reasoning-format none` is a
+# legitimate choice and the right one for reading a model raw, but on a model that
+# writes channel markers it leaves them in message.content - and TTS then speaks them.
+# That is what put "<|channel>thought" at the head of every line on a Gemma 4 server,
+# and nothing on the card said the dial could do it (patch100).
+PARAM_CAUTION = {
+    "reasonfmt": {
+        "none": "the model's thinking is left in the visible answer instead of being"
+                " split off - on a model that writes thought markers (Gemma 4's"
+                " <|channel>thought, DeepSeek's <think>) they arrive as text and TTS"
+                " will speak them. Use auto or deepseek unless you want the raw stream.",
+    },
+}
+
 
 def param_defaults():
     return {k: d for (k, _lab, _kind, d, _o, _f, _r) in SERVER_PARAMS}
@@ -2666,9 +3841,11 @@ def build_param_launcher(cfg, s, dest):
     if (p.get("vision") or "N/A") not in ("", "N/A", "Disabled"):
         args.append(("Model", "--mmproj", p["vision"]))
     if (p.get("draft") or "N/A") not in ("", "N/A", "Disabled"):
-        args.append(("Model", "--model-draft", p["draft"]))
+        for _df, _dv in draft_launch_args(p["draft"], gv("ngl")):
+            args.append(("Model", _df, _dv))
     args += [("Server", "--port", str(s.get("port") or "")),
-             ("Server", "--host", "0.0.0.0"),
+             # the proxy is the LAN face; llama itself is reached from this machine
+             ("Server", "--host", "127.0.0.1"),
              ("Server", "--alias", title)]
     bare = {"nommap", "nocontbat", "fit"}          # switches, not values
     for (k, _lab, kind, _dv, _o, flag, _ref) in SERVER_PARAMS:
@@ -2680,13 +3857,30 @@ def build_param_launcher(cfg, s, dest):
                 args.append((PARAM_GROUP.get(k, "Other"), flag, None))
             continue
         args.append((PARAM_GROUP.get(k, "Other"), flag, v))
-    # reasoning is always enabled on the server - each provider then turns thinking
-    # on or off for its own requests through the proxy
-    args.append(("Generation", "--reasoning", "on"))
+    # Caching is a property of the SERVER as much as of the provider: a pinned slot only
+    # exists if the server was started with enough of them, and automatic slot selection
+    # would otherwise hand a pinned request to whichever slot looked similar. Both follow
+    # from the switches, so neither is a separate thing to remember.
+    # `--parallel` and `--ctx-size` stay exactly as set on the server card: how many KV
+    # slots to open, and how much context each gets, is a VRAM decision that belongs to
+    # whoever is paying for it.
+    #
+    # NOTHING ELSE IS ADDED. patch46 wrote `--slot-prompt-similarity 0` here, on a
+    # reading of the docs that said automatic slot selection would override an explicit
+    # id_slot. It does not - an explicit slot is honoured first and similarity is the
+    # FALLBACK - so all that flag did was switch off the mechanism that still works when
+    # a build ignores id_slot on the OpenAI-compatible endpoint. Measured on two slots
+    # with it set: `cache 0/384 0%` on every call.
+    _rs188 = str(p.get("reasonStrength") or "").lower()
+    if model_arch(p.get("model") or "") in ARCH_REASON_STRENGTH:
+        if _rs188 in REASON_STRENGTHS:
+            args.append((PARAM_GROUP.get("reasoning", "Other"), CTK_FLAG,
+                         '{"reasoning_strength":"%s"}' % _rs188))
+    elif str(p.get("reasoning") or "").lower() == "off":
+        args.append((PARAM_GROUP.get("reasoning", "Other"), CTK_FLAG, CTK_NO_THINK))
     args.append(("Logging", "-lv", "4"))          # verbose log level, kept out of the UI
     if str(p.get("noCache", "1")) in ("1", "true", "True"):
         args.append(("Context and cache", "--cache-ram", "0"))
-        args.append(("Context and cache", "--ctx-checkpoints", "0"))
     # An array can be commented and needs no line continuations, so each group of flags
     # can be labelled. The panel reads the same "--flag", "value" pairs out of it.
     L.append("$llamaArgs = @(")
@@ -2696,7 +3890,15 @@ def build_param_launcher(cfg, s, dest):
             continue
         L.append("    # %s %s" % (group, "-" * max(4, 56 - len(group))))
         for flag, val in rows:
-            L.append('    "%s"' % flag if val is None else '    "%s", "%s"' % (flag, q(val)))
+            if val is None:
+                L.append('    "%s"' % flag)
+            elif '"' in str(val):
+                # PowerShell takes a single-quoted string literally, so a JSON kwarg
+                # needs no escaping and stays readable - the same choice ps1_set_flag
+                # makes, so the two writers produce the same line (patch188)
+                L.append('    "%s", \'%s\'' % (flag, str(val).replace("'", "''")))
+            else:
+                L.append('    "%s", "%s"' % (flag, q(val)))
         L.append("")
     while L and L[-1] == "":
         L.pop()
@@ -2706,12 +3908,284 @@ def build_param_launcher(cfg, s, dest):
     L.append("")
     return "\n".join(L) + "\n"
 
-def regen_slot_script(cfg, s):
-    """Render a server slot's parameters into a generated launcher and point the
-    slot at it. The .ps1 is an implementation detail: the UI edits parameters,
-    and launch-llm-fleet.ps1 keeps launching a script path exactly as before."""
+def ps1_args_span(text):
+    """Offsets of the body of `$llamaArgs = @( ... )`, or None if there is no array.
+
+    The same region parse_ps1_samplers reads. Edits are confined to it so a launcher's
+    own code - a VRAM report, a sampler table, anything that mentions a flag in a
+    comment or a Write-Host - is never touched.
+    """
+    m = re.search(r"llamaArgs\s*=\s*@\(", text, re.I)
+    if not m:
+        return None
+    end = text.find("\n)", m.end())
+    return (m.end(), end if end > 0 else len(text))
+
+
+def _ps1_commas(body):
+    """Every element but the last ends with a comma, and the last does not.
+
+    PowerShell rejects `@(1, 2,)`, and a stray comma inside a splatted array passes an
+    empty argument to the server. Removing an entry can leave the one before it without
+    its comma and adding one after the last leaves that one without its own, so the
+    array is normalised after any edit rather than at each of them.
+    """
+    lines = body.split("\n")
+    idx = [i for i, l in enumerate(lines)
+           if l.strip() and not l.strip().startswith("#")]
+    for j, i in enumerate(idx):
+        stripped = lines[i].rstrip()
+        bare = stripped.rstrip(",")
+        lines[i] = bare + ("" if j == len(idx) - 1 else ",")
+    return "\n".join(lines)
+
+
+def ps1_set_flag(text, flag, value, after=None):
+    """Set, change or remove ONE flag in a launcher, leaving every other line alone.
+
+    value: a string sets `"--flag", "value"`; "" sets a bare `"--flag"`; None removes it.
+    after: put a NEW flag on the line below this one, so a flag that belongs with
+    another is written where a reader expects it rather than at the end of the array.
+    Returns the new text, or the text unchanged if there is no $llamaArgs array to edit -
+    a launcher the panel cannot edit safely is one it must not edit at all.
+    """
+    span = ps1_args_span(text)
+    if not span:
+        return text
+    lo, hi = span
+    body, indent = text[lo:hi], "    "
+    im = re.search(r"\n([ \t]+)[\"']", body)
+    if im:
+        indent = im.group(1)
+    # The value is optional because a bare switch has none - but it must not be allowed
+    # to swallow the NEXT flag's name. `--no-cont-batching` followed by `"--flash-attn",
+    # "on"` ate the name and left the value orphaned on a line of its own. A flag is a
+    # dash followed by a letter or another dash; a value like "-1" is not.
+    # the value may be single-quoted and hold double quotes (a JSON kwarg), so the two
+    # quotings are matched separately rather than as one character class. A value may
+    # also be a bare PowerShell VARIABLE - `"-m", $modelPath,` - and a matcher blind
+    # to that removed only the flag, re-inserted it with the quoted path, and left
+    # $modelPath behind as a stray positional: llama-server answered
+    # "error: invalid argument: <model path>" (slot 2 in the field, patch153)
+    # REPEATED, not optional: an earlier launch's setter left "-m", "path",
+    # $modelPath baked into the stored launcher, and a matcher that consumes one
+    # value re-strands it forever. Consuming every consecutive value token makes
+    # each edit HEAL what a past edit broke - the config repairs itself on the
+    # very next launch.
+    pair = re.compile(r"[ \t]*[\"']%s[\"']"
+                      r"(?:\s*,\s*(?:\"(?!-[A-Za-z-])[^\"]*\"|'(?!-[A-Za-z-])[^']*'"
+                      r"|\$[A-Za-z_][A-Za-z0-9_:.]*))*"
+                      r"\s*,?[ \t]*\r?\n?" % re.escape(flag))
+    had = pair.search(body)
+    body = pair.sub("", body, count=1)
+    if value is not None:
+        if value == "":
+            line = indent + '"%s",\n' % flag
+        elif '"' in value:
+            # single quotes: PowerShell takes the contents literally, so a JSON
+            # value needs no escaping and stays readable
+            line = indent + '"%s", \'%s\',\n' % (flag, value.replace("'", "''"))
+        else:
+            line = indent + '"%s", "%s",\n' % (flag, value)
+        anchor = None
+        if not had and after:
+            am = re.search(r"[ \t]*[\"']%s[\"'][^\n]*\n" % re.escape(after), body)
+            anchor = am.end() if am else None
+        if had:                                   # put it back where it was
+            body = body[:had.start()] + line + body[had.start():]
+        elif anchor is not None:                  # beside the flag it belongs with
+            body = body[:anchor] + line + body[anchor:]
+        else:                                     # otherwise at the end of the array
+            body = body.rstrip() + ("\n" if body.strip() else "") + line
+    else:
+        # removing the last line of the array must not leave the blank one it sat on
+        body = body.rstrip() + "\n" if body.strip() else body
+    return text[:lo] + _ps1_commas(body) + text[hi:]
+
+
+def ps1_set_path(text, flag, value):
+    """Point a launcher's model flag at a new file, through a variable if it uses one.
+
+    `parse_launcher_params` follows `"-m", $modelPath` back to where $modelPath was set;
+    this is the inverse. Rewriting the flag to a literal instead would leave the rest of
+    the launcher - a VRAM report, a title line - still reading a $modelPath that no
+    longer matches what is loaded.
+    """
+    for f in (flag, "--model" if flag == "-m" else "-m"):
+        m = re.search(r'"%s"\s*,\s*\$([A-Za-z_][A-Za-z0-9_]*)' % re.escape(f), text)
+        if m:
+            var = m.group(1)
+            pat = re.compile(r'(\$%s\s*=\s*")([^"]*)(")' % re.escape(var))
+            if pat.search(text):
+                # a LAMBDA replacement is taken literally, so a Windows path needs no
+                # escaping here - escaping it anyway doubled every backslash
+                return pat.sub(lambda mm: mm.group(1) + value + mm.group(3),
+                               text, count=1)
+        if re.search(r'"%s"\s*,\s*"' % re.escape(f), text):
+            return ps1_set_flag(text, f, value)
+    return text
+
+
+CTK_AFTER = "--reasoning"       # where the kwarg belongs when it is new
+
+
+def ps1_edit_flags(path, flags):
+    """Apply `{flag: value or None}` to a launcher in place, keeping a copy of the first
+    version this panel ever touched. Returns what it changed, or an error."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            text = f.read()
+    except Exception as e:
+        return {"error": "cannot read %s (%s)" % (path, e)}
+    if not ps1_args_span(text):
+        return {"error": "no $llamaArgs = @( ... ) array in %s - the panel will not "
+                         "guess where a flag belongs" % os.path.basename(path)}
+    out = text
+    for flag, value in sorted(flags.items()):
+        # the model is a PATH and may be reached through a variable; every other flag is
+        # a plain value in the array
+        out = (ps1_set_path(out, flag, value) if flag in ("-m", "--model")
+               else ps1_set_flag(out, flag, value,
+                                 after=CTK_AFTER if flag == CTK_FLAG else None))
+    if out == text:
+        return {"changed": []}
+    try:
+        os.makedirs(ARCHIVE, exist_ok=True)
+        keep = os.path.join(ARCHIVE, os.path.basename(path) + ".before-panel")
+        if not os.path.exists(keep):
+            with open(keep, "w", encoding="utf-8-sig", newline="") as f:
+                f.write(text)
+        with open(path, "w", encoding="utf-8-sig", newline="") as f:
+            f.write(out)
+    except Exception as e:
+        return {"error": "cannot write %s (%s)" % (path, e)}
+    panel_log("[panel] edited %s in place: %s"
+              % (os.path.basename(path), ", ".join(sorted(flags))))
+    return {"changed": sorted(flags)}
+
+
+def slot_owns_script(s):
+    """True when the launcher this slot runs is one the panel wrote."""
+    sc = os.path.abspath(str(s.get("script") or "")) if s.get("script") else ""
+    return bool(sc) and sc.startswith(os.path.abspath(GEN_LAUNCHER_DIR) + os.sep)
+
+
+# llama.cpp calls setting enable_thinking this way deprecated and points at
+# --reasoning instead - but some models honour only the template kwarg, which is the
+# whole reason for writing both. Server-side default for every request; a provider
+# still overrides it per request.
+CTK_FLAG = "--chat-template-kwargs"
+CTK_NO_THINK = '{"enable_thinking":false}'
+
+
+def _slot_params_from_launcher(p, path):
+    """Read a launcher on disk back into the card's parameters, quietly."""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            p.update(parse_launcher_params(f.read()))
+    except Exception:
+        pass
+
+
+def slot_flag_values(cfg, s, present="", force=()):
+    """The flags to write into an EXISTING launcher, as {flag: value or None}.
+
+    Deliberately not everything `build_param_launcher` writes. A hand-written launcher
+    that names no `--threads` is not asking for the panel's default of 8; pouring every
+    parameter in would bury someone's tuning under settings they never chose. So a flag
+    is written only when it is already in the array - the card is then editing what is
+    there - or when its value differs from the shipped default, which is the only signal
+    that a person went and set it. The caching flag is the exception: it is the one thing
+    the feature cannot work without, and it exists for no other reason.
+
+    force: the keys the person just changed on the card. THOSE are written whatever
+    their value, because a card change is an instruction about the launcher, not a
+    preference stored beside it. Turning Reasoning back on wrote nothing before this,
+    "on" being the shipped default as well - so the card said one thing and the file
+    that ran said another. (patch187)
+    """
     p = s.get("params") or {}
-    if not (p.get("model") or "").strip():
+    out, bare = {}, {"nommap", "nocontbat", "fit"}
+    # the model is not in SERVER_PARAMS - the launcher builder writes it itself - so it
+    # was never in this dict, and changing it on the card reached the generated launcher
+    # and no other
+    if (p.get("model") or "").strip():
+        out["-m"] = str(p["model"])
+    # The two optional model pickers were never in this map at all. On a hand-edited
+    # launcher that meant the card could say Disabled while the file that RAN still
+    # loaded the projector or the drafter - the card describing something other than
+    # what starts. The card owns these completely: a path names the flag, Disabled
+    # removes it, and switching between a DFlash assistant and a conventional drafter
+    # takes the other one's flags out with it. (patch186)
+    _off186 = ("", "N/A", "Disabled", None)
+    if "vision" in p:
+        out["--mmproj"] = None if p.get("vision") in _off186 else str(p["vision"])
+    if "draft" in p:
+        _want186 = {} if p.get("draft") in _off186 else dict(
+            draft_launch_args(p.get("draft"), p.get("ngl") or ""))
+        for _f186 in ("--model-draft", "-md") + DRAFT_SPEC_FLAGS:
+            if _f186 in _want186:
+                out[_f186] = _want186[_f186]
+            elif _f186 == "--spec-draft-ngl" and "--spec-draft-model" in _want186:
+                continue      # spec drafter on, no placement opinion: leave it be
+            else:
+                out[_f186] = None
+    for (k, _lab, _kind, dv, _o, flag, _ref) in SERVER_PARAMS:
+        if k not in p:
+            continue          # the card has no opinion: never delete what is already there
+        v = p.get(k)
+        if v == "" or v is None:
+            continue
+        if (k not in force and ('"%s"' % flag) not in present
+                and str(v) == str(dv)):
+            continue                          # neither there already nor chosen
+        out[flag] = "" if (k in bare and str(v) == "on") else (None if k in bare else str(v))
+    out["--slot-prompt-similarity"] = "0" if cached_slot_map(s) else None
+    # Reasoning off writes BOTH ways of saying it. Only ever the enable_thinking
+    # form: a --chat-template-kwargs set for someone else's reasons is left alone,
+    # because this dial has no opinion about the rest of that JSON.
+    if model_arch(p.get("model") or "") in ARCH_REASON_STRENGTH:
+        # This family's template opens the thinking channel whatever --reasoning says,
+        # so the dial that matters is HOW MUCH. It rides in the same kwarg the
+        # thinking switch uses, which is why the two can never both be written.
+        _rs = str(p.get("reasonStrength") or "").lower()
+        if _rs in REASON_STRENGTHS:
+            out[CTK_FLAG] = '{"reasoning_strength":"%s"}' % _rs
+        elif "reasoning_strength" in present:
+            out[CTK_FLAG] = None        # back to the model's own default
+    else:
+        _rz = str(p.get("reasoning") or "").lower()
+        if _rz == "off":
+            out[CTK_FLAG] = CTK_NO_THINK      # placed beside --reasoning, see CTK_AFTER
+        elif _rz in ("on", "auto") and CTK_NO_THINK in present:
+            out[CTK_FLAG] = None        # written by this dial, removed by this dial
+    return out
+
+
+def regen_slot_script(cfg, s, force=()):
+    """Put a slot's parameters into the launcher it runs.
+
+    A launcher the panel generated is rewritten whole. ANYTHING ELSE IS EDITED IN PLACE:
+    a hand-written launcher is mostly not flags - VRAM reports, stamp parsing, sampler
+    tables - and regenerating it would throw all of that away to gain nothing. Only the
+    `$llamaArgs` array is touched, and the first version the panel ever saw is kept in
+    ps1-launchers/ beside it.
+    """
+    p = s.setdefault("params", {})
+    if s.get("script") and not slot_owns_script(s):
+        try:
+            with open(s["script"], encoding="utf-8-sig") as _f:
+                _cur = _f.read()
+        except Exception:
+            _cur = ""
+        _r187 = ps1_edit_flags(s["script"], slot_flag_values(cfg, s, _cur, force))
+        _slot_params_from_launcher(p, s["script"])
+        return _r187
+    # The model check guards BUILDING a launcher from nothing. A launcher that already
+    # exists needs no model named in the parameters to have a flag changed in it - and a
+    # `$modelPath` variable the panel cannot follow used to mean every card change was
+    # dropped here in silence, before the text was even looked at.
+    if not (p.get("model") or "").strip() and not (p.get("custom") or "").strip():
         return ""                                     # no model yet - nothing launchable
     try:
         os.makedirs(GEN_LAUNCHER_DIR, exist_ok=True)
@@ -2719,7 +4193,25 @@ def regen_slot_script(cfg, s):
         return {"error": "cannot create %s (%s)" % (GEN_LAUNCHER_DIR, e)}
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(s.get("id") or "slot"))
     dest = os.path.join(GEN_LAUNCHER_DIR, safe + ".ps1")
+    # A launcher held in the Server Editor was written back VERBATIM, so every change
+    # made on a server card updated the parameters in the config and was then overwritten
+    # by the untouched original - the card and the editor could never agree. The editor
+    # holds the text; the cards edit flags within it. Same writer as a launcher on disk,
+    # so the same rules apply: only the $llamaArgs array, only flags already there or
+    # deliberately changed, and nothing else in the file is touched.
     custom = (p.get("custom") or "").strip()
+    if custom:
+        edited = custom
+        for _flag, _val in sorted(slot_flag_values(cfg, s, custom, force).items()):
+            edited = ps1_set_flag(edited, _flag, _val,
+                                  after=CTK_AFTER if _flag == CTK_FLAG else None)
+        if edited != custom:
+            p["custom"] = edited
+            custom = edited
+            # and the card is read back OUT of the text that will run: the launcher
+            # is the root, the cards are a view of it, and two stores that are never
+            # reconciled are two stores that drift (patch187)
+            p.update(parse_launcher_params(edited))
     try:
         with open(dest, "w", encoding="utf-8-sig", newline="\r\n") as f:
             f.write((custom + "\n") if custom else build_param_launcher(cfg, s, dest))
@@ -2736,10 +4228,13 @@ def api_slot_params(body):
     if not s:
         return {"error": "unknown server slot"}
     p = s.setdefault("params", {})
-    for k in ["model", "vision", "draft", "noCache"] + [x[0] for x in SERVER_PARAMS]:
+    changed = []
+    for k in (["model", "vision", "draft", "noCache", "reasonStrength"]
+              + [x[0] for x in SERVER_PARAMS]):
         if k in body:
             p[k] = str(body[k])
-    r = regen_slot_script(cfg, s)
+            changed.append(k)
+    r = regen_slot_script(cfg, s, force=changed)
     save_config(cfg)
     if isinstance(r, dict) and r.get("error"):
         return r
@@ -2774,6 +4269,12 @@ def parse_launcher_params(text):
     out["vision"] = grab("--mmproj") or "N/A"
     # a draft model is named by either flag depending on which llama.cpp is in use
     out["draft"] = grab("--model-draft") or grab("--spec-draft-model") or grab("-md") or "N/A"
+    # the kwarg is written with single quotes when it holds JSON, so it is read
+    # with its own matcher rather than grab()'s double-quoted one
+    # the kwarg may be single-quoted, double-quoted, or backtick-escaped inside
+    # double quotes depending on who wrote it: the NAME is what anchors the read
+    _rs188 = re.search(r"reasoning_strength[\"'`:\s]+([a-z]+)", text)
+    out["reasonStrength"] = _rs188.group(1) if _rs188 else ""
     OFF = {"off", "false", "0", "no"}
     for (k, _lab, _kind, _dv, _o, flag, _ref) in SERVER_PARAMS:
         if k in bare:
@@ -2812,6 +4313,7 @@ LAUNCH_FLAGS = {
     "--cache-ram": "host cache size", "--ctx-checkpoints": "context checkpoints",
     "--spec-type": "the kind of speculative decoding",
     "--spec-draft-n-max": "speculative decoding depth",
+    "--spec-draft-ngl": "how much of the drafter goes on the GPU",
     "--draft-max": "speculative decoding depth", "--draft-min": "speculative decoding depth",
     "-lv": "log verbosity", "--log-file": "where llama-server writes its own log",
     "--verbose": "log verbosity", "--no-webui": "turns off llama-server's own page",
@@ -3101,6 +4603,18 @@ def _peer_loop():
             pass
         time.sleep(5)
 
+def api_tts_replay(body):
+    """A click anywhere plays everywhere: validate the kept wav, then hand the id to
+    every open page over the event stream. The host page and a LAN viewer on the
+    game PC each play it locally - which is exactly where the TTS lands in play."""
+    aid = os.path.basename(str((body or {}).get("id") or ""))
+    p = os.path.join(TTSW.dir(), "out-%s.wav" % aid) if aid else ""
+    if not (aid and os.path.isfile(p)):
+        return {"error": "that line's audio has rotated out"}
+    sse_notify("replay", {"id": aid})
+    return {"ok": True}
+
+
 def api_peer(body=None):
     with _PEER_LOCK:
         pr = dict(PEER)
@@ -3274,7 +4788,7 @@ def tts_launcher_text(cfg=None):
     st = cfg.get("settings", {})
     # When the panel is the wrapper it already holds the wrapper port, so a launcher
     # that starts one too would collide. Server half only in that mode.
-    panel_wraps = str(st.get("ttsWrapMode", "off")).lower() == "on"
+    panel_wraps = str(st.get("ttsWrapMode", "on")).lower() == "on"
     gid = st.get("ttsGpuId") or ""
     gpu = next((g for g in cfg.get("gpus", []) if g.get("id") == gid), None)
     uuid = (gpu or {}).get("uuid") or ""
@@ -3334,7 +4848,7 @@ def tts_launcher_text(cfg=None):
     a('where pwsh >nul 2>&1 && (set PS=pwsh) || (set PS=powershell)')
     a('')
     a('echo Starting TTS server on port %PORT% ...')
-    a('start "TTS Server (%PORT%)" cmd /k ""%SERVER%" --model "%MODEL%" --main-gpu 0 --host 0.0.0.0 --port %PORT% --no-webui"')
+    a('start "TTS Server (%PORT%)" cmd /k ""%SERVER%" --model "%MODEL%" --main-gpu 0 --host 127.0.0.1 --port %PORT% --no-webui"')
     a('')
     a('echo Waiting for the server to answer /health ...')
     a('set /a TRIES=0')
@@ -3494,14 +5008,636 @@ def api_tts_import(body):
 #   POST /gradio_api/call/generate_audio         -> {"event_id": "<32 hex>"}
 #   GET  /gradio_api/call/generate_audio/<id>    -> SSE complete|error
 #   GET  /gradio_api/file=<abs path>             -> the WAV bytes
-import array, base64, io, tempfile, uuid, wave as _wave
+import base64, tempfile, uuid, wave as _wave
 from urllib.parse import unquote
 
 TTS_CHUNK_CHARS = 170        # chunk cap; longer utterances drift
-TTS_CHUNK_GAP_MS = 100       # silence stitched between chunks
-TTS_MAX_WORKERS = 4
-TTS_MAX_NEW_TOKENS = 2048
+
+
+def tts_chunk_chars(st=None):
+    """How much text goes to the engine at once - the one lever the panel still has.
+
+    Every token generated is another chance to pass over end-of-content, so a shorter
+    chunk fails less often AND costs less when it does. It is also the only thing a
+    calibration can sweep, now that the engine refuses to be told about its sampling.
+    """
+    try:
+        v = int(str((st or {}).get("ttsChunkChars", TTS_CHUNK_CHARS)).strip()
+                or TTS_CHUNK_CHARS)
+    except Exception:
+        v = TTS_CHUNK_CHARS
+    return max(40, min(v, 400))
+TTS_CAP_CEILING = 4096       # no line needs more; where the retry escalation stops
+# Higgs emits ~25 audio tokens per second and speech runs at ~15 characters per second,
+# so a line needs roughly 1.7 tokens per character. Measured on a real overrun: 46
+# characters, 104 tokens, 4.2 seconds - 2.26 per character.
+#
+# THE POINT OF THE CAP is not to stop the model failing. It is sampled and it will
+# sometimes run past its own end-of-content token; that is upstream and it is retried.
+# The cap decides what that failure COSTS. Without one it generates to audio.cpp's own
+# default and a four-second line takes nineteen seconds before the retry even starts.
+TTS_ACPP_TOK_PER_CHAR = 3.5      # double the natural rate, so a real line is never cut
+TTS_ACPP_TOK_FLOOR = 128         # the flat floor's old value, kept as the CEILING of the
+                                 # scaled one - no line's floor is higher than it ever was
+TTS_ACPP_TOK_MIN = 48            # ~2 s of audio at 25 fps: the lead-in breath and the
+                                 # codec warm-up, which even a two-word line pays for
+
+
+def acpp_tok_per_char(st=None):
+    """Tokens a character may cost - the user's number, not the panel's.
+
+    TTS_ACPP_TOK_PER_CHAR stays as what it always was: Higgs' own rate doubled, and
+    what the Reset button puts back. Anything outside the range the slider offers is
+    refused rather than obeyed, because a 0 here would cap every line at the floor.
+
+    Settings are PASSED here, never read: load_config fills defaults and saves, so a
+    read from inside a per-line guard would write the config file from the hot path.
+    Without them the constant is the answer, which is what it always was.
+    """
+    try:
+        v = float(str((st or {}).get("ttsFixedTokPerChar", TTS_ACPP_TOK_PER_CHAR)).strip())
+    except Exception:
+        return TTS_ACPP_TOK_PER_CHAR
+    return max(1.0, min(25.0, v))
+
+
+def acpp_tok_floor(chars, st=None):
+    """The smallest cap a line is given: HALF its guard, inside fixed bounds.
+
+    The flat 128 read as "room for the lead-in", but 128 tokens is ~5 seconds of
+    audio - on a ten-character line that is one second of speech and four of licence,
+    and in a measured session the floor decided 99 caps to the estimate's 67, so the
+    fit the user calibrated was mostly not consulted. Half the guard keeps the two
+    bounds in one story (both are the user's tokens-per-character), 48 covers the
+    breath and the codec warm-up, and 128 stays as the ceiling so no line's floor is
+    ever HIGHER than it was.
+    """
+    half = int(round(int(chars or 0) * acpp_tok_per_char(st) / 2.0))
+    return min(TTS_ACPP_TOK_FLOOR, max(TTS_ACPP_TOK_MIN, half))
+
+
+def acpp_token_cap(text, st=None):
+    """How far a line is allowed to run before it is treated as a runaway."""
+    chars = len(str(text or ""))
+    return max(acpp_tok_floor(chars, st), int(chars * acpp_tok_per_char(st)))
+
+
+# --------------------------------------------------------------------------- auto cap
+# The manual calibration above records what went WRONG. This records every line that
+# went RIGHT - chars in, seconds out - which is what an estimate can actually stand
+# on. Audio tokens are the duration at a fixed frame rate, so the one thing to learn
+# is this machine's speech rate in characters per second.
+TTS_MEASURE_LOG = os.path.join(STACK, "tts-measure.jsonl")
+TTS_MEASURE_LEGACY = os.path.join(STACK, "tts-measure.json")   # patch85 wrote a list
+TTS_MEASURE_KEEP = 500         # same horizon as the overrun record
+TTS_MEASURE_EVERY = 128        # appends between compactions
+_MEASURE_N = [0]
+MEASURE_LOCK = threading.Lock()
+# pause seconds are read with the ONE existing TTS_PAUSE_RX, defined with the
+# splicer below - a second copy here is exactly the drift the gate hunts
+TTS_AUTOCAL_SEED_CPS = 15.0    # until five lines are measured: the code-comment rate
+TTS_AUTOCAL_LEAD_S = 0.4       # breath before the first word; measured lines carry it
+
+
+def tts_pause_secs(text):
+    """Seconds of silence the pause tags in a line ask for."""
+    try:
+        return sum(float(m) for m in TTS_PAUSE_RX.findall(str(text or "")))
+    except Exception:
+        return 0.0
+
+
+def tts_measure_row(text, secs, est=0, wall=0):
+    """One spoken line as a measurement - pure, so the gate can hold it still.
+
+    `est` is the BARE estimate that was in force for this line - before any
+    headroom. Recording it is what makes the estimator answerable: tok/est is how
+    wrong it was, and the spread of that ratio is the headroom actually needed.
+    """
+    t = str(text or "")
+    return {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "chars": len(t),
+            "tags": tts_tag_count(t), "pause_s": round(tts_pause_secs(t), 2),
+            "secs": round(float(secs), 2),
+            # the seconds the line took to MAKE - secs/wall is the realtime factor,
+            # the number the whole engine is judged by
+            "wall": round(float(wall or 0), 2),
+            "tok": round(float(secs) * TTS_ACPP_FRAME_RATE, 1),
+            "est": round(float(est or 0), 1),
+            # which of estimate/floor/guard settled the cap: only the first is the
+            # estimator being judged on its own work
+            "bound": AUTOCAL_BOUND[0], "cap": AUTOCAL_CAP[0],
+            # what was sent, so a success and a failure can be compared on it
+            "samp": {k: _num_str(v) for k, v in (TTS_SAMP_LAST or {}).items()
+                     if k != "attempt"},
+            "attempt": int((TTS_SAMP_LAST or {}).get("attempt", 1))}
+
+
+def tts_measure_record(text, secs, est=0, wall=0):
+    """Append ONE LINE to a record that survives a restart.
+
+    patch85 rewrote the whole 500-row list for every line spoken - an O(n) file
+    write on the hot path, growing with play. An append is one line, and every
+    128th append compacts the file back to the last 500 rows.
+    """
+    try:
+        row = tts_measure_row(text, secs, est, wall)
+        MEASURE_GEN[0] += 1              # the warm copy is stale from here
+        with MEASURE_LOCK:
+            with open(TTS_MEASURE_LOG, "a", encoding="utf-8") as f:
+                f.write(json.dumps(row) + "\n")
+            _MEASURE_N[0] += 1
+            if _MEASURE_N[0] % TTS_MEASURE_EVERY == 0:
+                _tts_measure_compact()
+    except Exception:
+        pass                   # a diagnostic must never break the line it describes
+
+
+def _tts_measure_compact():
+    """Inside MEASURE_LOCK: fold legacy + appends down to the last KEEP rows."""
+    rows = tts_measure_rows_unlocked()
+    tmp = TTS_MEASURE_LOG + "." + str(os.getpid()) + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        for r in rows[-TTS_MEASURE_KEEP:]:
+            f.write(json.dumps(r) + "\n")
+    os.replace(tmp, TTS_MEASURE_LOG)
+    if os.path.isfile(TTS_MEASURE_LEGACY):
+        try:
+            os.remove(TTS_MEASURE_LEGACY)   # folded in; one store, not two
+        except OSError:
+            pass
+
+
+def tts_measure_rows_unlocked():
+    rows = load_json(TTS_MEASURE_LEGACY, None)
+    rows = rows if isinstance(rows, list) else []
+    try:
+        with open(TTS_MEASURE_LOG, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln:
+                    try:
+                        rows.append(json.loads(ln))
+                    except Exception:
+                        continue          # a torn tail line is not a lost record
+    except OSError:
+        pass
+    return rows
+
+
+# The record, kept warm: the per-line cap used to re-read and re-parse the whole
+# file for EVERY spoken line. One in-memory copy, refreshed only when a line was
+# actually appended (the generation counter says so), makes the per-line cost a
+# list reference. The file stays the truth across restarts; this is a mirror.
+MEASURE_GEN = [0]
+_MEASURE_CACHE = {"gen": -1, "rows": []}
+
+
+def tts_measure_rows():
+    with MEASURE_LOCK:
+        if _MEASURE_CACHE["gen"] != MEASURE_GEN[0]:
+            _MEASURE_CACHE["rows"] = tts_measure_rows_unlocked()
+            _MEASURE_CACHE["gen"] = MEASURE_GEN[0]
+        return list(_MEASURE_CACHE["rows"])
+
+
+def tts_measure_summary(rows=None):
+    """The record in one line: how fast this machine actually speaks."""
+    rows = tts_measure_rows() if rows is None else rows
+    good = []
+    for r in rows:
+        try:
+            ch, sp = int(r.get("chars") or 0), float(r.get("secs") or 0)
+            talk = sp - float(r.get("pause_s") or 0)
+            if ch >= 4 and talk >= 0.25:
+                good.append(ch / talk)
+        except Exception:
+            continue
+    if not good:
+        return {"n": 0}
+    good.sort()
+    med = good[len(good) // 2] if len(good) % 2 else (good[len(good) // 2 - 1]
+                                                      + good[len(good) // 2]) / 2.0
+    return {"n": len(good), "cps": round(med, 1),
+            "first": str(rows[0].get("at") or ""), "last": str(rows[-1].get("at") or "")}
+
+def tts_job_think(st, job):
+    """Whether that job's model may think. Off by default: these are short questions
+    with a strict answer shape, and a reasoning block in front of the JSON is the
+    commonest way one of them comes back unusable."""
+    key = "ttsCalibThink"
+    return str((st or {}).get(key, "off")).strip().lower() == "on"
+
+
+def autocal_mode(st):
+    """off / proxy / llm, understanding the names earlier versions wrote.
+
+    `algo` was the proxy arithmetic and `median` was that same arithmetic reading an
+    LLM-derived fit - which is Proxy with "use the fitted values" turned on, not a
+    mode of its own. A config written by patch85..88 therefore keeps doing exactly
+    what it did, under the names the page now shows.
+    """
+    m = str((st or {}).get("ttsAutoCal", "off")).strip().lower()
+    if m in ("proxy", "algo", "median", "llm"):
+        # llm too: LLM Controlled was retired once its per-line ask had already
+        # converged to the proxy arithmetic - a config that says llm keeps doing
+        # exactly what it did, under the one remaining automatic mode
+        return "proxy"
+    return "off"
+
+
+def autocal_use_fit(st):
+    """Whether the proxy arithmetic reads the stored fit. There is no switch any
+    more: the refit itself writes that fit every N lines, so it is used whenever
+    one exists and passes the same bounds every reader applies. Before the first
+    refit - or after a fit is refused - the measured rate carries the line."""
+    return _autocal_parse(str((st or {}).get("ttsAutoCalMedian", ""))) is not None
+
+
+def autocal_every(st):
+    """Lines between automatic fits in LLM mode. The slider's range is the law."""
+    try:
+        return max(5, min(250, int(str((st or {}).get("ttsAutoCalEvery", "25")).strip())))
+    except Exception:
+        return 25
+
+
+def _samp_key(samp):
+    """One configuration, as a single comparable string."""
+    s = samp or {}
+    return "  ".join("%s %s" % (k, _num_str(s[TTS_SAMP_FIELD[k]]))
+                     for k in ("temp", "top_p", "min_p", "rep")
+                     if TTS_SAMP_FIELD[k] in s and str(s[TTS_SAMP_FIELD[k]]) != "")
+
+
+def tts_sampler_board(rows=None, fails=None):
+    """How often each sampler configuration ran past end-of-content.
+
+    The successes and the failures are kept in two files for good reasons - one is
+    a measurement, the other an incident - but the only question worth asking spans
+    both: of the lines spoken under THESE settings, how many did not stop? Only
+    first attempts are counted: a retry runs under the steadier profile by design,
+    and mixing the two would score a setting with results it never produced.
+    """
+    rows = tts_measure_rows() if rows is None else rows
+    fails = eoc_rows() if fails is None else fails
+    board = {}
+    for r in rows:
+        if int(r.get("attempt") or 1) != 1:
+            continue
+        k = _samp_key(r.get("samp"))
+        if k:
+            board.setdefault(k, {"ok": 0, "fail": 0})["ok"] += 1
+    for f in fails:
+        if int(f.get("attempt") or 1) != 1:
+            continue
+        k = _samp_key(f.get("samp"))
+        if k:
+            board.setdefault(k, {"ok": 0, "fail": 0})["fail"] += 1
+    out = []
+    for k, v in board.items():
+        n = v["ok"] + v["fail"]
+        out.append({"samp": k, "lines": n, "fail": v["fail"],
+                    "rate": round(100.0 * v["fail"] / n, 1) if n else 0.0})
+    # worst first: the configuration to stop using is the one worth seeing
+    out.sort(key=lambda r: (-r["rate"], -r["lines"]))
+    return out
+
+
+def tts_measure_ols(rows=None):
+    """The panel's own fit of the measured lines: least squares, no model asked.
+
+    talk = chars / cps + lead. Two things come of it: a hint to give the model, and a
+    baseline to judge the model's answer against - a fit that predicts this machine
+    worse than plain arithmetic does is not worth keeping.
+    """
+    rows = tts_measure_rows() if rows is None else rows
+    xs, ys = [], []
+    for r in rows:
+        try:
+            ch = float(r.get("chars") or 0)
+            talk = float(r.get("secs") or 0) - float(r.get("pause_s") or 0)
+            if ch >= 1 and talk > 0.05:
+                xs.append(ch); ys.append(talk)
+        except Exception:
+            continue
+    n = len(xs)
+    if n < 8:
+        return {"n": n}
+    mx, my = sum(xs) / n, sum(ys) / n
+    var = sum((x - mx) ** 2 for x in xs)
+    if var <= 0:
+        return {"n": n}
+    a = sum((xs[i] - mx) * (ys[i] - my) for i in range(n)) / var      # seconds per char
+    lead = my - a * mx
+    if a <= 0:
+        return {"n": n}
+    return {"n": n, "cps": round(1.0 / a, 2), "lead": round(max(0.0, lead), 2),
+            "mae": round(tts_fit_mae({"cps": 1.0 / a, "lead": max(0.0, lead)}, rows), 3)}
+
+
+def tts_fit_mae(fit, rows):
+    """Mean absolute error, in seconds, of a fit against the lines it must predict."""
+    err, n = 0.0, 0
+    for r in rows:
+        try:
+            ch = float(r.get("chars") or 0)
+            talk = float(r.get("secs") or 0) - float(r.get("pause_s") or 0)
+            if ch < 1 or talk <= 0.05:
+                continue
+            err += abs((ch / float(fit["cps"]) + float(fit["lead"])) - talk)
+            n += 1
+        except Exception:
+            continue
+    return (err / n) if n else 999.0
+
+
+def tts_autocal_fit(rows=None, fails=None):
+    """How the estimator has actually performed, on the lines where it MATTERED.
+
+    A token cap is a STOP-LOSS, not a target: Higgs stops at its own end-of-content
+    token, so a bigger cap does not make a line longer and a smaller one does not
+    make it shorter. The cap only decides what a runaway costs - and, if it is set
+    BELOW what a line genuinely needed, it converts a good line into a failure.
+
+    Two corrections this record needed, both found in the field:
+
+    1. Only lines whose cap the ESTIMATE decided are scored. A short line is covered
+       by the floor whatever the estimate said - "Oh, great." was estimated at 14
+       tokens and used 34, a miss of 2.44 that cost nothing and could never cost
+       anything. Scoring it drove the headroom up on the strength of lines where the
+       estimate was never in charge.
+
+    2. A runaway is a CENSORED observation and is counted as one. The line that hit
+       its cap needed at least that cap, so it enters as cap/est - a lower bound on
+       its true need. Left out, the statistic is computed from survivors only and
+       reads lower than the truth exactly where it matters: the long lines that
+       actually reach the ceiling.
+
+    3. But rule 1 applies to failures TOO, and did not. A runaway on a cap the floor
+       decided entered at cap/est off a line the estimate never touched - 128 over a
+       17-token estimate is 7.4 of arithmetic, not of evidence - and one such line
+       pinned the headroom at its maximum for a whole session, which raised every cap
+       toward the guard, which raised what the NEXT runaway cost. A failure is scored
+       by the same rule as a success: only where the estimate was in charge. There,
+       cap/est is the current headroom by construction, which is exactly the honest
+       reading - "est x headroom was not enough" - and it moves the headroom one pad
+       step at a time instead of pinning it. Rows from before the bound was recorded
+       cannot say who decided them, so they are counted as runaways but not scored.
+    """
+    rows = tts_measure_rows() if rows is None else rows
+    fails = eoc_rows() if fails is None else fails
+    rr, cens = [], 0
+    for r in rows:
+        try:
+            if str(r.get("bound") or "") != "estimate":
+                continue                    # the floor or the guard decided it, not us
+            est, tok = float(r.get("est") or 0), float(r.get("tok") or 0)
+            if est >= 1.0 and tok >= 1.0:
+                rr.append(tok / est)
+        except Exception:
+            continue
+    for f in fails:
+        try:
+            if str(f.get("bound") or "") != "estimate":
+                continue                    # a runaway, but not the estimate's doing -
+                                            # it is the eoc record's to count, not this
+            est, cap = float(f.get("est") or 0), float(f.get("cap") or 0)
+            if est >= 1.0 and cap >= 1.0:
+                rr.append(cap / est)        # it needed AT LEAST this much
+                cens += 1
+        except Exception:
+            continue
+    if not rr:
+        return {"n": 0, "censored": 0}
+    rr.sort()
+
+    def q(p):
+        return rr[min(len(rr) - 1, max(0, int(round(p * (len(rr) - 1)))))]
+
+    return {"n": len(rr), "censored": cens, "med": round(q(0.5), 3),
+            "p95": round(q(0.95), 3), "worst": round(rr[-1], 3)}
+
+
+AUTOCAL_HEAD_MIN = 1.08        # never cap below a rounding error over the estimate
+AUTOCAL_HEAD_MAX = 1.60        # beyond this the guard is the better bound anyway -
+                               # and 2.5 was the pinned-bug era's smell, not a margin
+AUTOCAL_HEAD_PAD = 1.10        # over the worst seen: the next line can be worse
+AUTOCAL_HEAD_SEED = 1.35       # until the fit has lines to speak from
+AUTOCAL_HEAD_MIN_N = 8         # fewer scored lines than this and it is still a seed
+
+
+def tts_headroom_facts(rows=None, fails=None):
+    """The headroom AND every number under it, as numbers rather than a sentence.
+
+    The page draws these as boxes and the record prints the sentence; both come off
+    this one dict, so a reading in the terminal and a reading on the page cannot say
+    different things. `h` is exact - callers multiply by it - and only the wording
+    rounds.
+    """
+    fit = tts_autocal_fit(rows, fails)
+    n = int(fit.get("n", 0) or 0)
+    seed = n < AUTOCAL_HEAD_MIN_N
+    worst = float(fit.get("worst", 0.0) or 0.0)
+    p95 = float(fit.get("p95", 0.0) or 0.0)
+    # p95, not the maximum: a margin set by the single worst observation is set by
+    # your worst outlier - one censored freak inflated every cap for 120 lines.
+    # The 95th percentile with the same pad covers the misses that recur.
+    h = (AUTOCAL_HEAD_SEED if seed
+         else min(AUTOCAL_HEAD_MAX, max(AUTOCAL_HEAD_MIN, p95 * AUTOCAL_HEAD_PAD)))
+    d = {"h": h, "n": n, "need": AUTOCAL_HEAD_MIN_N, "seed": seed, "worst": worst,
+         "p95": p95, "pad": AUTOCAL_HEAD_PAD,
+         "censored": int(fit.get("censored", 0) or 0)}
+    d["why"] = (("headroom %.2f (seed - %d/%d scored lines)"
+                 % (h, n, AUTOCAL_HEAD_MIN_N)) if seed else
+                ("headroom %.2f (p95 %.2f x %.2f pad, worst %.2f, over %d scored lines%s)"
+                 % (h, p95, AUTOCAL_HEAD_PAD, worst, n,
+                    ", %d of them runaways" % d["censored"] if d["censored"] else "")))
+    return d
+
+
+def tts_autocal_headroom(st=None, rows=None, fails=None):
+    """(headroom, why). Learned, always - there is no hand-set value to obey.
+
+    The margin used to be a number the user typed, defaulting to auto. It is auto and
+    only auto now, by request: a figure somebody guesses cannot keep up with a machine
+    whose speech rate the panel is already measuring line by line.
+    """
+    d = tts_headroom_facts(rows, fails)
+    return d["h"], d["why"]
+
+
+def _autocal_parse(text):
+    """The numbers a model returned, inside their bounds, or nothing.
+
+    Parse what models actually write: the JSON is dug out of whatever prose
+    surrounds it, and a rate outside 6..30 chars/s or a lead outside 0..2 s is
+    REFUSED - a fit that bad would mis-cap every line after it.
+    """
+    s = str(text or "")
+    try:
+        j = json.loads(s[s.index("{"):s.rindex("}") + 1])
+        cps, lead = float(j.get("cps")), float(j.get("lead"))
+    except Exception:
+        return None
+    if not (6.0 <= cps <= 30.0 and 0.0 <= lead <= 2.0):
+        return None
+    return {"cps": round(cps, 2), "lead": round(lead, 2)}
+
+
+def tts_auto_cap(text, st, cfg=None, rows=None):
+    """The per-line token cap, by whichever estimator the user chose.
+
+    Returns (cap, note, est). Off returns the runaway guard unchanged - byte-identical
+    to the behaviour before this existed. Every mode stays INSIDE that guard: the
+    estimate refines the cost of an overrun downward, it never raises the ceiling
+    the user already knows, and never sinks below the lead-in floor.
+
+    WHAT THE CAP IS. A stop-loss, not a target. The engine stops at its own
+    end-of-content token; a higher cap does not lengthen a line and a lower one does
+    not shorten it. The cap decides two things only: what a runaway COSTS before the
+    retry, and - if set below what a line genuinely needed - whether a good line is
+    turned into a failure. So the headroom is learned from the estimator's own worst
+    miss rather than guessed, and a tighter number is not a better one.
+    """
+    guard = acpp_token_cap(text, st)
+    mode = autocal_mode(st)
+    if mode == "off":
+        return guard, "", 0.0
+    _t0 = time.time()
+    t = str(text or "")
+    chars, pause = len(t), tts_pause_secs(t)
+    if rows is None:
+        rows = tts_measure_rows()          # read ONCE: the fit and the rate share it
+    head, headwhy = tts_autocal_headroom(rows=rows)
+
+    floor = acpp_tok_floor(chars, st)
+
+    def settle(est, how):
+        """One shape for every mode: bare estimate, headroom, floor, guard."""
+        want = est * head
+        cap = max(floor, min(int(want), guard))
+        bound = ("guard" if int(want) > guard else
+                 "floor" if int(want) < floor else "estimate")
+        note = ("%s  cap %d tok = %.0f est x %.2f%s"
+                % (how, cap, est, head,
+                   "  (held at the %s)" % bound if bound != "estimate" else ""))
+        AUTOCAL_BOUND[0] = bound
+        autocal_log(mode, how, chars, pause, est, head, headwhy, cap, bound,
+                    floor, guard)
+        AUTOCAL_LAST[0] = time.time() - _t0
+        return cap, note, est
+
+    def proxy():
+        """Arithmetic only - no model is asked. Its speech rate comes either from the
+        lines this machine has measured, or from a fit an LLM made of them, which is
+        what "use the fitted values" is for: calibrate once with a model, then run
+        without one."""
+        m = _autocal_parse(str((st or {}).get("ttsAutoCalMedian", ""))) \
+            if autocal_use_fit(st) else None
+        if m:
+            est = (chars / m["cps"] + pause + m["lead"]) * TTS_ACPP_FRAME_RATE
+            return settle(est, "proxy %d ch @ %.1f cps, lead %.1fs (TTS-calibrated)"
+                          % (chars, m["cps"], m["lead"]))
+        s = tts_measure_summary(rows)
+        live = s.get("n", 0) >= 5
+        cps = s["cps"] if live else TTS_AUTOCAL_SEED_CPS
+        est = (chars / cps + pause + TTS_AUTOCAL_LEAD_S) * TTS_ACPP_FRAME_RATE
+        why = ("measured over %d lines" % s["n"]) if live else "(seed rate)"
+        if autocal_use_fit(st):
+            why += " - no TTS calibration derived yet"
+        return settle(est, "proxy %d ch @ %.1f cps %s" % (chars, cps, why))
+
+    # LLM mode differs in ONE thing: where the speech rate comes from. A model is
+    # asked to fit it periodically, never per line - measured on identical input
+    # the per-line answer varied 14% with no new information in it, cost 351 ms
+    # median, and agreed with the fitted rate anyway.
+    return proxy()
+
+
+PAYLOAD_KEEP = 80               # request/reply pairs held for the terminal to open
+PAYLOAD_CLIP = 200000           # characters kept of each half - past this, truncated
+AUTOCAL_LAST = [0.0]            # seconds the last estimate cost, for the TTS terminal
+TTS_METER = {}                  # the last spoken line, broken into what it cost
+TTS_METER_LOCK = threading.Lock()
+
+
+def tts_meter_set(**kw):
+    """One line's costs, replacing the last. Read by the bar on the TTS page."""
+    with TTS_METER_LOCK:
+        TTS_METER.clear()
+        TTS_METER.update(kw)
+
+
+def api_tts_meter(body=None):
+    # the samplers ride the tick that already paints the bars: they are read off the
+    # same request the bars describe, so they cannot sit blank waiting for a
+    # diagnosis to be asked for
+    st = load_config().get("settings", {}) or {}
+    with TTS_METER_LOCK:
+        return {"ok": True, "line": dict(TTS_METER),
+                "samp": {k: str(st.get(TTS_SAMP_KEYS[k], "") or "") for k in TTS_SAMP_KEYS},
+                "sampSent": tts_samp_now(st)}
+AUTOCAL_EST = [0.0]             # and the bare estimate it produced, for the record
+AUTOCAL_CAP = [0]               # and the cap that estimate became
+AUTOCAL_BOUND = [""]            # and which of estimate/floor/guard settled it
+
+
+def calterm_log_path():
+    """One feed for the whole TTS calibration page.
+
+    The per-line calculations, the data block, the diagnosis and what a calibration
+    changed all answer the same question and used to live in two places - a file
+    tail and a buffer inside the browser. A buffer cannot be reread after a reload
+    and cannot be interleaved with a tail in the right order, so everything is
+    written HERE and the page only ever tails it.
+    """
+    return os.path.join(log_dir(), "%s_ttscal.log" % SESSION_STAMP)
+
+
+def calterm_log(lines, blank=True):
+    """Append stamped lines to the calibration feed. Never raises."""
+    rows = [lines] if isinstance(lines, str) else list(lines or [])
+    try:
+        with open(calterm_log_path(), "a", encoding="utf-8") as f:
+            if blank:
+                f.write("\n")
+            for r in rows:
+                for ln in str(r).split("\n"):
+                    f.write("[%s] %s\n" % (_stamp(), ln))
+    except Exception:
+        pass                   # a diagnostic must never break what it describes
+
+
+def autocal_log(mode, how, chars, pause, est, head, headwhy, cap, bound,
+                floor, guard):
+    """Every calculation, in full, in its own feed.
+
+    Written in the shape the terminals already paint: a stamped record line with the
+    mode where a provider title goes, and the working hanging off it as branches.
+    """
+    try:
+        with open(calterm_log_path(), "a", encoding="utf-8") as f:
+            f.write("\n")
+            # the bracket holds where the headroom came from - NOT a port. A number
+            # in brackets is a port everywhere else in these terminals.
+            f.write("[%s] %-13s [%s]  %5d ch  %4.1f s pause  %5.0f est -> %4d cap tok\n"
+                    % (_stamp(), mode, "hand" if headwhy.endswith("hand)") else "auto",
+                       chars, pause, est, cap))
+            f.write("[%s] %s %s\n" % (_stamp(), TREE_PAD + TREE_MID, how))
+            f.write("[%s] %s %s\n" % (_stamp(), TREE_PAD + TREE_MID, headwhy))
+            f.write("[%s] %s sampler %s\n"
+                    % (_stamp(), TREE_PAD + TREE_MID,
+                       tts_samp_note(dict(TTS_SAMP_LAST)) if TTS_SAMP_LAST
+                       else "not sent yet"))
+            f.write("[%s] %s %.0f est x %.2f = %.0f -> %d (%s; floor %d, guard %d)\n"
+                    % (_stamp(), TREE_PAD + TREE_END, est, head, est * head, cap,
+                       bound, floor, guard))
+    except Exception:
+        pass                   # a diagnostic must never break the line it describes
+
+
 TTS_RESULT_WAIT_S = 120.0
+TTS_WAV_HEAD = 44            # RIFF(12) + fmt (24) + data header(8): a canonical WAV
 
 
 # Higgs Audio v3 inline control tags.
@@ -3553,6 +5689,131 @@ TTS_CAPS_RX = re.compile(
     r"\[?\s*(?<![A-Za-z0-9])(EMOTION|PROSODY|STYLE|SFX)((?:[ \t\-_]*[A-Z]+){1,3})(?![A-Za-z])\s*\]?")
 TTS_TAG_ANY_RX = re.compile(r"<\|[^|>]{0,40}\|>")
 
+
+def tts_tags_dropped(text):
+    """Tags this line carried that the engine has no counterpart for.
+
+    SkyrimNet's chatterbox vocabulary is wider than Higgs' in places - [sarcastic],
+    [gasp], [groan], [shush], [narration] have nowhere to go and are removed so they are
+    not read aloud. That is right, and it was silent: a model spending tokens on a tag
+    that never arrives is worth knowing about.
+    """
+    out = []
+    for m in TTS_ALIAS_RX.finditer(str(text or "")):
+        word = " ".join(m.group(1).split()).lower()
+        if word in TTS_ALIAS_DROP:
+            out.append(word)
+    return out
+
+
+EOC_LOG = os.path.join(STACK, "eoc-events.json")
+EOC_KEEP = 500                 # enough to calibrate against, small enough to read
+
+
+def eoc_record(text, cap, secs, attempt, settled, cfg=None):
+    """Append one overrun to a record that survives a restart.
+
+    A single event says nothing - the model missed its end-of-content token, which it
+    does perhaps one line in twenty. A hundred of them, each carrying the settings in
+    force when it happened, is the only thing that can say whether a temperature change
+    helped. Written per event rather than counted, because the interesting question is
+    which lines fail, and a counter cannot answer that.
+    """
+    st = (cfg or load_config()).get("settings", {})
+    row = {
+        "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "chars": len(str(text or "")),
+        "cap": cap,
+        # the estimate this line missed - a runaway needed AT LEAST its cap, and
+        # cap/est is the lower bound the fit counts it as
+        "est": round(float(AUTOCAL_EST[0] or 0), 1),
+        # WHO decided the cap it hit. The fit scores a failure only when the answer
+        # is "estimate" - a runaway held at the floor or the guard says nothing
+        # about the estimator, and 128 over a 17-token estimate is 7.5 of nothing.
+        "bound": str(AUTOCAL_BOUND[0] or ""),
+        "secs": round(float(secs), 2),
+        "attempt": attempt,
+        "settled": bool(settled),
+        "busy_ms": str(st.get("ttsAcppBusyMs", "")),
+        # what the panel can actually vary. Sampling is not here because the engine will
+        # not accept it, and a figure nobody can change makes every group identical.
+        "chunk": tts_chunk_chars(st),
+        # a line ending without punctuation is an invitation to keep talking; both of
+        # these are shapes the panel controls and both are worth counting against
+        # The sampler is the ONLY thing that changes the odds of a miss on a line
+        # that is already well formed - and until patch91 neither record kept it,
+        # so no failure rate per setting could be worked out at all. The comment
+        # that used to sit here said the engine would not accept sampling; it has
+        # accepted it since pass-through.
+        "samp": {k: _num_str(v) for k, v in (TTS_SAMP_LAST or {}).items()
+                 if k != "attempt"},
+        "ends_clean": str(text or "").rstrip()[-1:] in ".!?",
+        "tags": tts_tag_count(text),
+        "line": str(text or "")[:160],
+    }
+    try:
+        with EOC_LOCK:
+            rows = load_json(EOC_LOG, None)
+            if not isinstance(rows, list):
+                rows = []
+            rows.append(row)
+            del rows[:-EOC_KEEP]
+            tmp = EOC_LOG + "." + str(os.getpid()) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(rows, f, indent=1)
+            os.replace(tmp, EOC_LOG)
+    except Exception:
+        pass                       # a diagnostic must never break the line it describes
+    return row
+
+
+def eoc_rows():
+    rows = load_json(EOC_LOG, None)
+    return rows if isinstance(rows, list) else []
+
+
+def eoc_summary():
+    """What the record says, in the terms a calibration would change."""
+    rows = eoc_rows()
+    if not rows:
+        return {"events": 0}
+    by, band, ending = {}, {}, {"ends clean": 0, "ends open": 0}
+    for r in rows:
+        b = by.setdefault(int(r.get("chunk") or 0),
+                          {"events": 0, "secs": 0.0, "chars": 0})
+        b["events"] += 1
+        b["secs"] += float(r.get("secs") or 0)
+        b["chars"] += int(r.get("chars") or 0)
+        lo = (int(r.get("chars") or 0) // 40) * 40
+        band[lo] = band.get(lo, 0) + 1
+        ending["ends clean" if r.get("ends_clean") else "ends open"] += 1
+    return {
+        "events": len(rows),
+        "first": rows[0].get("at"),
+        "last": rows[-1].get("at"),
+        "secs_lost": round(sum(float(r.get("secs") or 0) for r in rows), 1),
+        # by the setting a calibration would sweep
+        "by_chunk": [{"chunk": k, "events": v["events"],
+                      "avg_secs": round(v["secs"] / v["events"], 2),
+                      "avg_chars": round(v["chars"] / v["events"])}
+                     for k, v in sorted(by.items())],
+        # and by the shape of the line, which says whether length or punctuation is what
+        # the failures have in common
+        "by_length": [{"chars": k, "events": band[k]} for k in sorted(band)],
+        "by_ending": ending,
+    }
+
+
+def tts_tag_count(text):
+    """How many performance tags a line arrived carrying.
+
+    Only used to SAY something when they are about to be thrown away. Audio Tags
+    defaults to stripping, and PTI forces it on for the line it tagged itself - so
+    the player was heard with feeling while every NPC line was flattened, and
+    nothing anywhere said why.
+    """
+    return len(TTS_CAPS_RX.findall(str(text or "")))
+
 # SkyrimNet's own tag vocabularies, mapped onto Higgs' where an equivalent exists.
 # Two of them: the fixed list its Chatterbox branch teaches, and the looser set its
 # other branch suggests ([sad], [whispers], [sighs], [pause]...). Accepting both costs
@@ -3591,7 +5852,10 @@ TTS_ALIAS = {
     "dramatic tone": ("prosody", "expressive_high"),
     "monotone": ("prosody", "expressive_low"),
 }
-TTS_ALIAS_RX = re.compile(r"\[\s*([a-z][a-z ]{0,18})\s*\]")
+# case-insensitive: a dialogue model that writes [ANGRY] instead of [angry] would
+# otherwise have the tag SPOKEN ALOUD, brackets and all. An unrecognised bracket is
+# still returned untouched, so ordinary dialogue is unaffected.
+TTS_ALIAS_RX = re.compile(r"\[\s*([a-zA-Z][a-zA-Z_ ]{0,20})\s*\]")
 # SkyrimNet tags with no Higgs counterpart. These are DELETED; anything else in square
 # brackets is left alone, because a line may legitimately contain [something] and eating
 # it loses meaning, while speaking one stray tag aloud does not.
@@ -3624,7 +5888,7 @@ def _tts_drop_edge_pauses(line):
     return TTS_EDGE_PAUSE_RX.sub(keep, line)
 
 
-def _tts_sentence(sentence):
+def _tts_sentence(sentence, blocked=frozenset()):
     """One sentence -> (text with inline tokens in place, sentence-level tags)."""
     out, level, pos = [], [], 0
     while True:
@@ -3644,6 +5908,8 @@ def _tts_sentence(sentence):
         out.append(sentence[pos:m.start()])
         if value is None:
             pass                                 # unknown: dropped, never spoken
+        elif "%s:%s" % (fam, value) in blocked:
+            pass                                 # gated off: no token, no onomatopoeia
         elif fam == "sfx":
             word = TTS_ONOMATOPOEIA[value]
             rest = sentence[end:].lstrip()
@@ -3664,17 +5930,906 @@ def _tts_sentence(sentence):
     return "".join(out), level
 
 
-def _tts_render(tags):
-    """One tag per competing group, in the model card's stacking order."""
+def _tts_render(tags, blocked=frozenset()):
+    """One tag per competing group, in the model card's stacking order.
+
+    Sentence-level tokens are written here; inline ones (sfx and TTS_INLINE) in
+    _tts_sentence - both writers read the same `blocked` set, so a tag the user
+    gated off is stopped before anything is written FOR it, onomatopoeia included.
+    """
     kept = {}
     for fam, value in tags:
+        if fam == "emotion" and value in TTS_EMOTION_BLOCK:
+            continue               # measured to break the voice - see TTS_EMOTION_BLOCK
+        if "%s:%s" % (fam, value) in blocked:
+            continue               # the user's final gate - see ttsTagsFinalOff
         group = (fam, value.split("_")[0] if fam == "prosody" else "")
         kept.setdefault(group, (fam, value))
     ordered = sorted(kept.values(), key=lambda x: (TTS_ORDER.get(x[0], 9), x[1]))
     return "".join("<|%s:%s|>" % (f, v) for f, v in ordered)
 
 
-def tts_apply_tags(text, keep, engine="audiocpp"):
+def tts_is_player(ref_path):
+    """True when this reference is one of the player voicetypes."""
+    leaf = re.split(r"[\\/]", str(ref_path or ""))[-1]
+    return os.path.splitext(leaf)[0].strip().lower() in PLAYER_VOICES
+
+
+# What the model is offered, and what it is allowed to answer, are ONE list. The prompt
+# and the validator reading different tables is how [angry] came to be rejected while
+# [whispering] was accepted.
+#
+# Everything here must be a word tts_apply_tags() accepts - either a TTS_ALIAS key or a
+# name in TTS_TAGS. Prosody (speed, pitch, pause) is deliberately left out: it is not a
+# feeling, and a model asked for emotion should not be reaching for it.
+# Every tag Higgs v3 takes, offered under a heading a model can reason about, and
+# BUILT FROM THE TABLES rather than typed out - a hand-written list drifted immediately,
+# offering eleven words the engine does not accept.
+#
+# For each tag the shortest accepted spelling wins, so "angry" rather than "anger" where
+# both work. Prosody keeps its own names: there is no English word for speed_very_slow,
+# which is why the parser allows underscores.
+#
+# Left out on purpose: pause and long_pause, which are punctuation rather than
+# performance and belong in the line, not in a tag chosen for it.
+# Every canonical name is also an alias for itself. Without this [affection] was left in
+# the line as literal text while [EMOTION-AFFECTION] worked - eleven of the twenty-one
+# emotions had no plain-English spelling at all.
+for _kind, _names in TTS_TAGS.items():
+    for _n in _names:
+        TTS_ALIAS.setdefault(_n, (_kind, _n))
+
+# Nothing is skipped. pause and long_pause were held back as "not a writer's decision";
+# they are exactly that - a beat is placed, not felt - and the engine renders both.
+_TAG_SKIP = frozenset()
+
+# The emotions the panel ASKS FOR. Higgs accepts more; these are the ones SkyrimNet's own
+# Voice Performance Tags prompt lists, so they are the ones its dialogue models are being
+# taught to write and the ones that come back sounding like something.
+#
+# This narrows what PTI and PME are offered and what their answers are held to. It does
+# NOT narrow tts_apply_tags: a tag SkyrimNet writes into an NPC line is still translated
+# from TTS_ALIAS, so nothing an NPC says stops working because the panel stopped asking
+# for it.
+# All twenty-one. patch55 cut this to the fourteen SkyrimNet's template listed at the
+# time; the template now lists every one Higgs has, including anger, fear and disgust -
+# which is what makes an aggressive line labellable at all. Every name here is a real
+# Higgs tag, which the gate checks.
+_EMOTION_OFFER = frozenset(TTS_TAGS.get("emotion", ()))
+
+# TWO kinds, not four. Higgs has four tag families, but sfx, style and prosody are all
+# "something you can hear" from a writer's point of view - splitting them made the model
+# weigh four separate decisions per line, and it answered the first and skipped the rest.
+_TAG_GROUPS = (("Emotion", ("emotion",)), ("Audio", ("sfx", "style", "prosody")))
+
+
+def _build_offer():
+    """The tags PTI and PME are offered, written KIND-NAME as SkyrimNet writes them.
+
+    The panel used to offer its own shorthand - [laugh], [sad] - so a player's line came
+    back marked up in one notation while every NPC line around it used another. Same
+    notation now, and TTS_CAPS_RX already read this form, so one matcher covers both.
+    """
+    out = []
+    for label, kinds in _TAG_GROUPS:
+        words = []
+        for kind in kinds:
+            for nm in TTS_TAGS.get(kind, ()):
+                if nm in _TAG_SKIP or (kind == "emotion" and nm not in _EMOTION_OFFER):
+                    continue
+                # Prosody is written BARE - [speed_slow], [pause] - because that is how
+                # SkyrimNet's template teaches it, and a player line marked up here has
+                # to look like an NPC line marked up there. Both forms translate; only
+                # one of them matches what the dialogue models are being shown.
+                words.append(nm if kind == "prosody"
+                             else "%s-%s" % (kind.upper(), nm.upper()))
+        out.append((label, tuple(words)))
+    return tuple(out)
+
+
+TAG_OFFER = _build_offer()
+
+
+def tags_off(st, key="ttsTagsOff"):
+    """The offered words the user clicked off - unknown words are ignored, so a stale
+    setting cannot quietly narrow the offer to nothing. `key` picks the board: the
+    prompt board (default) or the final wire gate (ttsTagsFinalOff)."""
+    raw = str((st or {}).get(key) or "").replace(",", " ").upper().split()
+    offered = frozenset(w.upper() for _label, words in TAG_OFFER for w in words)
+    return frozenset(w for w in raw if w in offered)
+
+
+def tag_limits(st, key):
+    """WORD:N pairs -> {kind:name -> N}. Unknown words and broken counts are ignored,
+    the same forgiveness tags_off() extends to its list."""
+    offered = {w.upper(): w for _label, words in TAG_OFFER for w in words}
+    out = {}
+    for piece in str((st or {}).get(key) or "").replace(",", " ").split():
+        word, _, n = piece.partition(":")
+        if word.upper() in offered and n.isdigit() and int(n) > 0:
+            out[tag_pair(word)] = min(int(n), 99)
+    return out
+
+
+# One character's tag history: their own turn counter, and the turn each limited tag
+# last SURVIVED to the engine on. In memory only - a cooldown is a conversation-scale
+# thing, and a restart forgiving it is correct, not a loss.
+TAG_TURNS = {}
+TAG_TURNS_LOCK = threading.Lock()
+
+
+def _th_member(nc, nf):
+    """Does this chunk belong to this reply? A sliding WINDOW of the chunk found
+    inside the reply - any clean stretch places it, whatever SkyrimNet injected
+    at the front, and a window is short enough that a tiny chunk still has one
+    that clears its own prefix. The patch172 lesson, finished."""
+    if not nc or not nf:
+        return False
+    k = min(10, len(nc), max(4, len(nf) // 2))
+    if k < 4:
+        return nc in nf or nf in nc
+    return any(nc[i:i + k] in nf for i in range(0, len(nc) - k + 1))
+
+
+def tts_reply_first_chunk(who):
+    """Is the chunk just traced the FIRST of a fresh reply? A turn is one LLM
+    response, not one TTS chunk - the owner's field log showed a 2-chunk reply
+    burning two turns of a limit. Membership is by the chunk's tail inside the
+    fresh reply text (the patch164 rule, immune to injected prefixes); exactly
+    one member means the reply has just begun. No fresh reply - the player, or
+    a race lost - counts every line as its own turn, the safe old meaning."""
+    rf = REPLY_FULL.get(who)
+    if not rf or time.time() - rf[1] > 25.0:
+        return True
+    nf = rf[0]
+    now = time.time()
+    n = sum(1 for r in CHUNK_TRACE.get(who, [])
+            if _th_member(r[2], nf) and now - r[0] < 25.0)
+    return n <= 1
+
+
+def tag_cooldown_pass(key, limits, new_turn=True):
+    """Advance this character's turn when a NEW REPLY begins; return the pairs
+    still cooling for THIS line. Later chunks of the same reply check without
+    advancing, so a limit counts LLM responses - the round the owner asked
+    for - and still holds inside the reply that started it."""
+    if not limits:
+        return frozenset()
+    with TAG_TURNS_LOCK:
+        ent = TAG_TURNS.setdefault(key, {"n": 0, "used": {}})
+        if new_turn:
+            ent["n"] += 1
+        n = ent["n"]
+        return frozenset(p for p, lim in limits.items()
+                         if p in ent["used"] and n - ent["used"][p] <= lim)
+
+
+def tag_cooldown_note(key, limits, processed):
+    """Record which limited tags actually reached the engine on this line."""
+    if not limits:
+        return
+    got = set(re.findall(r"<\|((?:emotion|prosody|style|sfx):[a-z_]+)\|>",
+                         str(processed or "")))
+    hits = got & set(limits)
+    if not hits:
+        return frozenset()
+    with TAG_TURNS_LOCK:
+        ent = TAG_TURNS.setdefault(key, {"n": 0, "used": {}})
+        for p in hits:
+            ent["used"][p] = ent["n"]
+    return frozenset(hits)
+
+
+def tag_cooldown_report(key, limits, exclude=frozenset()):
+    """[(pair, turns of prohibition left INCLUDING this one)] - the countdown the
+    owner asked to SEE, so the limit system is checkable without paying attention.
+    Computed at the line's own turn (pass() has advanced it): lim - (n - used) + 1.
+    Pairs recorded THIS line arrive via exclude and are shown as (+lim) instead."""
+    if not limits:
+        return []
+    with TAG_TURNS_LOCK:
+        ent = TAG_TURNS.get(key) or {"n": 0, "used": {}}
+        n = ent["n"]
+        out = []
+        for p, lim in sorted(limits.items()):
+            if p in exclude:
+                continue
+            u = ent["used"].get(p)
+            if u is None or n - u > lim:
+                continue
+            out.append((p, lim - (n - u) + 1))
+        return out
+
+
+def tag_disp(pair):
+    """sfx:laughter -> Laughter, for the terminal rows."""
+    return str(pair).partition(":")[2].replace("_", " ").title() or str(pair)
+
+
+def tag_pair(word):
+    """An offer word - or an already-formed pair - as the kind:name the Higgs control
+    token carries. EMOTION-ANGER -> emotion:anger; prosody is offered bare
+    (speed_slow, pause), so a word with no known kind prefix IS a prosody name; and
+    a kind:name arriving from the cooldown side passes through unchanged, so the two
+    vocabularies can share one gate without re-mapping each other.
+    """
+    w = str(word or "").strip().lower()
+    if ":" in w:
+        kind, _, name = w.partition(":")
+        if kind in TTS_TAGS:
+            return "%s:%s" % (kind, name)
+    kind, _, name = w.partition("-")
+    if name and kind in TTS_TAGS:
+        return "%s:%s" % (kind, name)
+    return "prosody:%s" % w
+
+# What the tagger is shown. The first version listed the vocabulary and no worked
+# examples, and said "fewer is better" - so it reliably answered with one Feeling and
+# never reached for a Sound. These show two and three tags together, which is the point.
+TAG_EXAMPLES = (
+    # the laugh is loud, the rest is not - so the calmer tag takes over at the next
+    # sentence. One tag over the whole line made every word sound like the laugh. This
+    # is the one that changed the model's behaviour where prose did not; it stays first
+    # among the split cases and is never the one dropped for length.
+    ("Haha, of course you would say that.",
+     "[SFX-LAUGHTER] Haha! [EMOTION-CONTENTMENT] Of course you would say that."),
+    ("Excuse me. Dusty in here.",
+     "Excuse me. [SFX-COUGH] Dusty in here."),
+    ("The bridge is just past the mill.",
+     "The bridge is just past the mill."),
+)
+
+
+def tts_tag_prompt(custom="", off=frozenset()):
+    """What the tagger is shown.
+
+    It asks for the LINE BACK with tags placed in it, not for a list of tags: an audible
+    noise belongs where it happens - "Excuse me. [cough] Dusty in here." - and a tag list
+    can only ever be prepended.
+    """
+    if str(custom or "").strip():
+        return str(custom)              # the user's own text: never edited from here
+    groups = {label: tuple(w for w in words if w.upper() not in off)
+              for label, words in TAG_OFFER}
+    lines = [
+        "Mark up one line of Skyrim dialogue for a voice actor. Return it word for word",
+        "with tags added - add nothing, change nothing.",
+        "",
+        "At most one EMOTION and one AUDIO tag, either optional.",
+        "An EMOTION, STYLE or PROSODY tag goes at the START of the sentence it applies",
+        "to - never at the end of the line. An SFX tag or a pause goes exactly where it",
+        "happens.",
+        "",
+        "EMOTION (felt): " + ", ".join(groups.get("Emotion", ())),
+        "AUDIO (heard): " + ", ".join(groups.get("Audio", ())),
+        "",
+    ]
+    for line, tagged in TAG_EXAMPLES:
+        # an example carrying a tag the user turned off would teach exactly the word
+        # the offer no longer holds
+        if any(("[%s]" % w).lower() in tagged.lower() for w in off):
+            continue
+        lines.append('"%s" -> %s' % (line, tagged))
+    lines += [
+        "",
+        "Reply with the marked-up line and nothing else.",
+    ]
+    return "\n".join(lines)
+
+PTI_LAST = [0.0]        # how long the last tagging call took, for the TTS terminal
+
+
+def _bare(s):
+    """A line reduced to its words, for checking that nothing was rewritten."""
+    s = re.sub(r"\[[^\]]{0,24}\]", " ", str(s or "").lower())
+    s = re.sub(r"[^a-z0-9]+", " ", s)
+    return " ".join(s.split())
+
+
+def _clean_tagged(reply, original, off=frozenset()):
+    """Keep the model's tag PLACEMENT, but only its valid tags, and only if the words
+    are untouched.
+
+    The player typed this line. A model that quietly reworded it would be putting words
+    in their mouth, so a reply whose words do not match is refused outright.
+    """
+    reply = " ".join(str(reply or "").strip().split()).strip('"').strip()
+    if not reply or _bare(reply) != _bare(original):
+        return ""                       # rewritten, shortened or explained
+    group = {}
+    for gi, (_label, words) in enumerate(TAG_OFFER):
+        for w in words:
+            if w.upper() in off:
+                continue                # clicked off: not offered, so not kept either
+            group[w.upper()] = gi       # KIND-NAME, matched whatever case it comes back in
+    seen = set()
+
+    def keep(m):
+        word = " ".join(m.group(1).split()).upper().replace(" ", "")
+        gi = group.get(word)
+        if gi is None or gi in seen:
+            return ""                   # not one we offered, or a second of its kind
+        seen.add(gi)
+        return "[%s]" % word
+    out = re.sub(r"\[([^\]]{0,24})\]", keep, reply)
+    return re.sub(r"\s{2,}", " ", out).strip() if seen else ""
+
+
+PTI_CACHE = collections.OrderedDict()   # (port, line) -> tagged; repeats are free
+PTI_CACHE_MAX = 32
+PTI_CACHE_LOCK = threading.Lock()
+
+
+def _pti_cached(key):
+    with PTI_CACHE_LOCK:
+        if key in PTI_CACHE:
+            PTI_CACHE.move_to_end(key)
+            return PTI_CACHE[key]
+    return None
+
+
+def _pti_remember(key, val):
+    with PTI_CACHE_LOCK:
+        PTI_CACHE[key] = val
+        PTI_CACHE.move_to_end(key)
+        while len(PTI_CACHE) > PTI_CACHE_MAX:
+            PTI_CACHE.popitem(last=False)
+
+
+def tts_player_tag(text, cfg=None, timeout=2.0):
+    """Ask a fleet model to mark the line up. Returns the marked-up line, or "".
+
+    Everything fails to the empty string and the caller then speaks the line as typed -
+    a server that is down, a slow answer, or a reply that reworded it. A line already
+    answered is served from a small cache with PTI_LAST at zero - SkyrimNet's TTS test
+    repeats one line a dozen times, and play repeats short barks; neither should pay
+    the model twice for the same words.
+    """
+    # None means "load it"; a caller's dict is kept (gotcha 37)
+    cfg = load_config() if cfg is None else cfg
+    st = cfg.get("settings", {})
+    if not panel_prov_on("pti", st):
+        return ""
+    rt = panel_route("pti", cfg)
+    if not rt:
+        return ""                   # not wired to a slot in Live Network yet
+    line = str(text or "").strip()
+    if not line or TTS_TAG_ANY_RX.search(line):     # already tagged by hand - leave it
+        return ""
+    _off = tags_off(st)
+    sys_p = tts_tag_prompt(st.get("ttsPtiPrompt"), _off)
+    scene = mood_context()
+    _ck = (rt.get("port"), scene, line)
+    _hit = _pti_cached(_ck)
+    if _hit is not None:
+        PTI_LAST[0] = 0.0               # free: the caller reads this as 'cached'
+        return _hit
+    if scene:
+        # Framed as what the SCENE offers, never as what the player feels - and the last
+        # sentence is what stops a suggestible model tagging the hint instead of the line.
+        sys_p += ("\n\nThe exchange so far might invite one of these:\n" + scene
+                  + "\nThat is background, NOT what the player said. Decide from the "
+                    "line itself; if it carries none of them, return it unchanged.")
+    if _spk_player[0]:
+        # the line under the tagger is the player's own; naming them lets the model
+        # read "I" and "my" as a person, not a blank - the name is the one the proxy
+        # learned from SkyrimNet's own prompts, never typed in here
+        sys_p += "\n\nThe line is spoken by the player, %s." % _spk_player[0]
+    think = bool(rt.get("thinking"))
+    _t0 = time.time()
+    with _GateHeld(route_gate_key(rt)):
+        said, reason, timings, usage = _chat(
+            rt, sys_p, line,
+            cfg_max=(think_budget(st, "ttsPtiBudget", 2000) if think
+                     else max(80, len(line) // 2 + 48)),
+            timeout=(timeout * 12 if think else timeout * 3))
+    _secs = time.time() - _t0
+    PROXY.report(rt, reason, usage, timings, round(_secs * 1000), 0)
+    answer = mood_answer(said) if think else said
+    ptipme_log("PTI", rt["server"], sys_p, line, answer, _secs,
+               cached=(timings or {}) and cached_tokens(timings))
+    if not said:
+        return ""                   # nothing came back: the reading was not consumed
+    out = _clean_tagged(answer, line, _off)
+    tag_output_line("PTI", out or "(left unchanged)", cfg)
+    PTI_LAST[0] = _secs
+    if out:
+        _pti_remember(_ck, out)         # failures are not cached: they retry
+    return out
+
+def mood_count(st):
+    try:
+        return max(1, min(5, int(str(st.get("ttsMoodCount") or 3))))
+    except Exception:
+        return 3
+
+
+def mood_history(st):
+    try:
+        return max(1, min(250, int(str(st.get("ttsMoodHistory") or 25))))
+    except Exception:
+        return 25
+
+
+def mood_every(st):
+    try:
+        return max(1, min(20, int(str(st.get("ttsMoodEvery") or 3))))
+    except Exception:
+        return 3
+
+
+def mood_prompt(n, custom="", off=frozenset()):
+    """What the scene invites, in a named section the parser can find.
+
+    The first version asked for bare lines and got prose around them. Naming the section
+    "Final Answer" gives a reasoning model somewhere to put its working and somewhere
+    separate to put the answer, and gives us something to anchor on.
+    """
+    if str(custom or "").strip():
+        # the user's own text: {words} still expands to the FULL offer - these
+        # buttons edit the built-in prompt only
+        return str(custom).replace("{n}", str(n)).replace(
+            "{words}", ", ".join(dict(TAG_OFFER).get("Emotion", ())))
+    words = ", ".join(w for w in dict(TAG_OFFER).get("Emotion", ())
+                      if w.upper() not in off)
+    return (
+        "You read a conversation from Skyrim and judge how the PLAYER is likely to feel "
+        "as they reply. The last line was said TO the player.\n"
+        "\n"
+        "Choose at most %d feelings from this list, most likely first. Use no other "
+        "words:\n%s\n"
+        "\n"
+        "Score each one 0-100 for how well it fits what just happened, and say why in a "
+        "few words.\n"
+        "\n"
+        "End your reply with this section, in exactly this shape:\n"
+        "\n"
+        "Final Answer (up to %d):\n"
+        "1. [word] (NN%%): brief reasoning\n"
+        "2. [word] (NN%%): brief reasoning\n"
+        "\n"
+        "For example, after a companion mocks the player's plan:\n"
+        "\n"
+        "Final Answer (up to 2):\n"
+        "1. [anger] (65%%): she dismissed the plan in front of the others.\n"
+        "2. [amusement] (25%%): the whole exchange has been light so far.\n"
+        "\n"
+        "Write fewer lines if fewer fit. If the exchange carries no clear feeling, write "
+        "exactly:\n"
+        "Final Answer: NONE" % (n, words, n)
+    )
+
+
+def mood_answer(text):
+    """The Final Answer section, or the whole reply if the model did not label one."""
+    s = str(text or "")
+    m = None
+    for m in re.finditer(r"final\s*answer\s*(?:\([^)]*\))?\s*:?", s, re.I):
+        pass                    # the LAST one: reasoning often quotes the instruction
+    return s[m.end():].strip() if m else s.strip()
+
+
+def _emotion_spellings():
+    """Every spelling that resolves to an emotion, mapped to the one PME is shown.
+
+    Built from the same two tables the tag translator uses, not from the display list -
+    that list carries one preferred spelling per tag, so a model answering `angry` or
+    `elation` had its line dropped even though `tts_apply_tags` renders both perfectly
+    well. One vocabulary, shared.
+    """
+    best = {}
+    for word, (kind, name) in TTS_ALIAS.items():
+        if kind != "emotion":
+            continue
+        cur = best.get(name)
+        if cur is None or (len(word), word) < (len(cur), cur):
+            best[name] = word
+    out = {}
+    for name in TTS_TAGS.get("emotion", ()):
+        if name in _TAG_SKIP or name not in _EMOTION_OFFER:
+            continue
+        shown = "EMOTION-%s" % name.upper()
+        out[name.upper()] = shown                 # the raw Higgs name, however written
+        out[shown] = shown                        # and the form the reader is shown
+        if best.get(name):
+            out[best[name].replace(" ", "").upper()] = shown
+    for word, (kind, name) in TTS_ALIAS.items():
+        if kind == "emotion" and name in _EMOTION_OFFER:
+            out[word.replace(" ", "").upper()] = "EMOTION-%s" % name.upper()
+    return out
+
+
+MOOD_SPELLING = _emotion_spellings()
+
+
+def mood_valid(text, n, dropped=None, off=frozenset()):
+    """Keep the lines naming a FEELING this panel can render, in the shape PTI is shown.
+
+    `dropped` collects the words that were refused, so a reading lost to a word outside
+    the vocabulary can be seen rather than silently vanishing - which is what it did.
+    """
+    keep = []
+    for line in mood_answer(text).splitlines():
+        # An optional "1." from the numbered shape, and OPTIONAL BRACKETS: the prompt
+        # asks for "[word] (NN%)" and shows an example in that form, and models still
+        # answer "1. amusement (85%): ..." often enough that requiring the brackets
+        # threw away perfectly good readings - which then left PTI with no context at all.
+        m = re.match(r"\s*(?:\d+[.)]\s*)?\[?\s*([A-Za-z_\- ]+?)\s*\]?\s*\(\s*(\d{1,3})",
+                     line.strip().lower())
+        if not m:
+            continue
+        word = MOOD_SPELLING.get(m.group(1).strip().replace(" ", "").upper(), "")
+        if word and word in off:
+            continue                    # the user clicked this feeling off: skipped
+                                        # quietly - it is a choice, not model noise
+        if not word and dropped is not None:
+            dropped.append(m.group(1).strip())
+        if word:
+            # stored in one shape whatever shape it arrived in, so the hint PTI is
+            # shown always reads the same way
+            # the reason is whatever follows the score, however it was punctuated -
+            # a colon, a dash, or nothing at all
+            # the match ends on the digits, so the tail still opens with "%):" or "%)"
+            why = re.sub(r"^[\s%)\]:.,\u2013\u2014-]+", "", line.strip()[m.end():]).rstrip()
+            keep.append("[%s] (%s%%)%s" % (word, m.group(2), (": " + why) if why else ""))
+        if len(keep) >= n:
+            break
+    return "\n".join(keep)
+
+
+PANDORUM_MARK = "\u25C8"      # painted as the PandorumLLM mark in a terminal
+
+
+_THINK_RX = re.compile(r"<(think|thinking|reasoning)>([\s\S]*?)</\1>", re.I)
+
+
+def _split_think(content):
+    """Pull an inline <think> block out of the content.
+
+    llama.cpp only separates reasoning into `reasoning_content` when the server was
+    started with --reasoning-format deepseek. Without it the whole lot arrives in
+    `content`, and the answer parser then reads the model's working as its answer.
+    """
+    got = []
+
+    def take(m):
+        got.append(m.group(2))
+        return ""
+    body = _THINK_RX.sub(take, str(content or ""))
+    # an unclosed block: the budget ran out mid-thought, so there is no answer at all
+    if not got and re.search(r"<(think|thinking|reasoning)>", body, re.I):
+        return "", re.split(r"<(?:think|thinking|reasoning)>", body, 1, re.I)[-1]
+    return body.strip(), "\n".join(got).strip()
+
+
+def think_budget(st, key, default):
+    """How many tokens the model may spend, reasoning included."""
+    try:
+        return max(100, min(10000, int(str(st.get(key) or default))))
+    except Exception:
+        return default
+
+
+# What a model is told when its thinking budget runs out. Short and imperative: it is
+# forced into the reasoning block in place of the rest of the thought, so anything
+# longer is words the model then has to read past before answering.
+REASON_BUDGET_MSG = "Answer now."
+
+
+def apply_route_shape(d, rt):
+    """Put a chat request into the shape its route asks for.
+
+    Thinking, then the panel's sampler overrides. The proxy did this inline for
+    SkyrimNet's traffic while _chat did a different half of it for the panel's own, so
+    a provider's overrides reached one caller and not the other. One function now.
+    """
+    ck = d.setdefault("chat_template_kwargs", {})
+    if not rt.get("thinking"):
+        # patch97 held this back when the launcher already said `--reasoning off`, on
+        # the theory that restating it derailed Gemma 4's template. It did not fix the
+        # fault it was written for - the config did - so it is reverted whole and the
+        # OFF arm says it every way again, as it did from patch38 to patch96.
+        # NOT a reasoning budget of 0. That was introduced in patch38 because
+        # llama.cpp calls the chat_template_kwargs route deprecated and points at a
+        # per-request budget instead - but a budget of 0 does not mean "do not think",
+        # it means "stop thinking NOW", and a model that always opens a reasoning block
+        # is forced shut on its first token and answers with a stub. Measured: Vision,
+        # ActionEval and Memory returned a single "." while every provider with Thinking
+        # ON answered normally, because only the OFF arm carried the budget. It also cost
+        # a patch to the grammar providers, which crashed on the forced end token.
+        # The kwarg is deprecated and works; the replacement is current and does not.
+        d.pop("reasoning_budget_tokens", None)
+        ck["enable_thinking"] = False
+        d["enable_thinking"] = False       # some builds read it here instead
+        # and a third: the field SkyrimNet itself sends. Builds differ in which one
+        # they honour and none of them mind an extra, so all three go - a model that
+        # reads only this one was thinking anyway with the other two set.
+        d["reasoning"] = {"enabled": False}
+        # NOT the budget message. It is forced into the reasoning block when the budget
+        # is exhausted, and a budget of 0 is exhausted at once - so one left set here
+        # would put "Answer now." into the output of a provider told not to think.
+        d.pop("reasoning_budget_message", None)
+    else:
+        d.pop("reasoning_budget_tokens", None)
+        # SAID, not merely unsaid. Removing a false is not asserting a true: with the
+        # field absent the server falls back to its own default, and that default is
+        # false on any server started with `--reasoning off` OR carrying the Reasoning
+        # dial's launcher line from patch96 - `--chat-template-kwargs
+        # '{"enable_thinking":false}'`. A dial set to off writes that line and only a
+        # dial set back to on removes it, so a card whose setting was lost (a fresh
+        # config, an imported launcher) leaves the line behind with nothing reading it:
+        # `parse_ps1_reasoning` looks at `--reasoning` alone, so the panel saw a server
+        # that could think, showed no warning, sent nothing, and Thinking ON did
+        # nothing at all. Checked against llama.cpp build 10219: a kwarg on the request
+        # overrides both the command-line default and `--reasoning`, so this is the one
+        # place that can make the switch mean what it says.
+        ck["enable_thinking"] = True
+        d["enable_thinking"] = True        # the same three forms the OFF arm writes
+        d["reasoning"] = {"enabled": True}
+        # Thinking on: give the budget something to say when it runs out. Inert unless a
+        # budget is actually set - on the server card or per request - so it costs
+        # nothing on a provider left unrestricted. setdefault, so a caller that sent its
+        # own wording keeps it.
+        d.setdefault("reasoning_budget_message", REASON_BUDGET_MSG)
+    # A pinned slot is the whole of "caching on" for a provider: its KV stays in that
+    # slot's VRAM between calls and nobody else's prompt evicts it. cache_prompt is what
+    # tells the server to reuse rather than clear, and is the default on recent builds -
+    # sent anyway so an older one behaves the same.
+    if rt.get("slot") is not None:
+        d["id_slot"] = int(rt["slot"])
+        d["cache_prompt"] = True
+    if str(rt.get("sampSource", "server")) == "server":
+        for k, val in (rt.get("overrides") or {}).items():
+            field = PROXY_SAMPLER_FIELDS.get(k)
+            if not field:
+                continue
+            try:
+                d[field] = int(val) if k == "top_k" else float(val)
+            except Exception:
+                continue
+    # max tokens is the FINAL word whatever the sampler source: the owner's card
+    # (or the launcher's --n-predict / -n) overwrites what SkyrimNet sent - the
+    # server was configured for a reason, and a request cannot un-configure it.
+    _np = (rt.get("overrides") or {}).get("n_predict")
+    if _np:
+        try:
+            d["max_tokens"] = int(float(_np))
+            d.pop("max_completion_tokens", None)
+        except Exception:
+            pass
+    return d
+
+
+# llama.cpp has carried this under several names. Nothing here guesses: a build that
+# reports none leaves it None, and the line prints "?" rather than "0" - "the server did
+# not say" and "nothing was reused" are different answers and only one of them is a bug.
+CACHED_N_KEYS = ("prompt_cached_n", "cache_n", "n_cached", "cached_n")
+
+
+def cached_tokens(timings):
+    for k in CACHED_N_KEYS:
+        v = (timings or {}).get(k)
+        if v is not None:
+            try:
+                return int(v)
+            except Exception:
+                return None
+    return None
+
+
+def chat_metrics(timings, usage, secs=0.0):
+    """Tokens and speeds from a llama.cpp reply, in the order they can be trusted.
+
+    `timings` is llama.cpp's own and is the only thing that carries the PROMPT speed -
+    prompt processing cannot be separated from generation by watching the clock from
+    outside, which is why that column read "?" for every call the panel makes on its
+    own behalf. `usage` is the OpenAI field and carries counts only.
+
+    A missing field stays missing. Filling it with a character estimate would print a
+    number the server never said. `secs` is opt-in and only ever supplies the
+    generation rate, from wall time, when the server did not time itself.
+    """
+    timings, usage = timings or {}, usage or {}
+    inp, out = timings.get("prompt_n"), timings.get("predicted_n")
+    pf, dc = timings.get("prompt_per_second"), timings.get("predicted_per_second")
+    if inp is None:
+        inp = usage.get("prompt_tokens")
+    if out is None:
+        out = usage.get("completion_tokens")
+    if not dc and out and secs > 0:
+        dc = out / secs
+    return {"tok_in": inp, "tok_out": out, "pf": pf, "dc": dc,
+            "cached": cached_tokens(timings)}
+
+
+PANEL_THINK_BUDGET = 2000  # think tokens a panel job may spend before "Answer now."
+                           # - the default under the sliders, and the floor of none
+
+
+def _chat(rt, system, user, cfg_max=64, timeout=20.0, think_budget=0):
+    """One chat call to the server a route points at. Never raises.
+
+    No sampler value is invented here. The panel used to force `temperature: 0` on
+    every one of these, silently overruling whatever the launcher was started with; the
+    provider card is where that decision belongs now, and a shipped override carries it
+    so the behaviour is unchanged but visible.
+    """
+    payload = {"messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": user}],
+               "max_tokens": cfg_max, "stream": False}
+    apply_route_shape(payload, rt)
+    if think_budget and rt.get("thinking") and not rt.get("grammar"):
+        # A thinking model given a flat max_tokens spends ALL of it inside the
+        # reasoning block and the visible answer is empty - which is what "the answer
+        # was not a usable fit" was, every time, on a card with Thinking on. The
+        # budget bounds the think, the "Answer now." message apply_route_shape already
+        # set fires when it runs out, and the ceiling has room for both halves.
+        # A budget > 0 is the legitimate form: 0 means "stop NOW" and answers a stub
+        # (patch38/97), and a budget is never sent with a grammar (HTTP 500).
+        payload["reasoning_budget_tokens"] = int(think_budget)
+        payload["max_tokens"] = int(cfg_max) + int(think_budget)
+    try:
+        req = Request("http://127.0.0.1:%s/v1/chat/completions" % rt["server"],
+                      data=json.dumps(payload).encode("utf-8"),
+                      headers={"Content-Type": "application/json"})
+        with urlopen(req, timeout=timeout) as r:
+            got = json.loads(r.read().decode("utf-8", "replace"))
+        msg = ((got.get("choices") or [{}])[0].get("message") or {})
+        out, inline = _split_think(msg.get("content") or "")
+        reason = msg.get("reasoning_content") or inline
+        # left on the route for PROXY.report to pick up: the panel's own calls go
+        # through here, and their terminal line should open like any other's
+        rt["_sent"] = json.dumps(payload, indent=2, ensure_ascii=False)
+        rt["_said"] = out
+        return out, reason, got.get("timings"), got.get("usage")
+    except Exception:
+        return "", "", None, None
+
+
+# What was actually said, in order. Built from what reaches TTS rather than from a
+# dialogue prompt: the lines are already separated and already named, SkyrimNet's own
+# history length does not govern it, and it works for someone using the panel for
+# speech alone with no fleet behind it.
+# What the scene suggests the player's next line MIGHT carry.
+MOOD = {"text": "", "at": 0.0, "busy": False}
+MOOD_TTL = 900.0            # a scene read fifteen minutes ago is not this moment
+_MOOD_LOCK = threading.Lock()
+
+TTS_TURNS = collections.deque(maxlen=250)
+# each speaker's last WORKING reference sample - what a thought is voiced with
+TTS_REF_BY_NAME = {}
+# each speaker's freshest UNVOICED thought: (text, when). Consumed by the auto
+# thought-audio pass so a thought is voiced once, for its own spoken line.
+THOUGHT_FRESH = {}
+MOOD_SETTLE = 1.6           # a reply arrives in several pieces; read after the last
+_MOOD_GEN = [0]
+_MOOD_TICK = [0]            # settled NPC lines since the last read
+
+
+def mood_note_line(speaker, text, is_player):
+    """Record a spoken line, and read the scene once an NPC has finished speaking."""
+    line = str(text or "").strip()
+    if not line:
+        return
+    TTS_TURNS.append((str(speaker or "?"), line, bool(is_player), time.time()))
+    if is_player:
+        return                      # the player speaking ends a turn, it does not open one
+    _MOOD_GEN[0] += 1
+    gen = _MOOD_GEN[0]
+
+    def go():
+        time.sleep(MOOD_SETTLE)
+        if _MOOD_GEN[0] != gen:
+            return                  # more of the reply arrived; that one reads instead
+        try:
+            if mood_due():
+                mood_evaluate()
+        except Exception:
+            pass
+    threading.Thread(target=go, daemon=True).start()
+
+
+def mood_due(cfg=None):
+    """Count this settled NPC line and say whether the scene is read on it.
+
+    Counted HERE rather than in mood_note_line: a reply arrives in several pieces and
+    only the last survives the generation guard, so counting arrivals would run the
+    frequency down several times over one line.
+    """
+    every = mood_every((cfg or load_config()).get("settings", {}))
+    with _MOOD_LOCK:
+        _MOOD_TICK[0] += 1
+        if _MOOD_TICK[0] < every:
+            return False
+        _MOOD_TICK[0] = 0
+        return True
+
+
+def mood_evaluate(cfg=None):
+    """Read the scene and remember what it offers. Runs in its own thread, after the
+    NPC has spoken - which is while the player is still reading, so it costs nothing
+    they can feel."""
+    cfg = cfg or load_config()
+    st = cfg.get("settings", {})
+    if not panel_prov_on("pme", st):
+        return ""
+    rt = panel_route("pme", cfg)
+    if not rt:
+        return ""                   # not wired to a slot in Live Network yet
+    with _MOOD_LOCK:
+        if MOOD["busy"]:
+            return ""                      # one at a time; the newest line wins next turn
+        MOOD["busy"] = True
+    try:
+        # optionally stand aside while speech is being generated - they may share a card
+        if str(st.get("ttsMoodPostpone", "off")).lower() == "on":
+            waited = 0.0
+            while getattr(TTSW, "_inflight", 0) > 0 and waited < 30.0:
+                time.sleep(0.25)
+                waited += 0.25
+        keep = mood_history(st)
+        turns = list(TTS_TURNS)[-keep:]
+        if not turns:
+            return ""
+        n = mood_count(st)
+        body = "\n".join("%s: %s" % (who, line) for who, line, _p, _at in turns)
+        _think = bool(rt.get("thinking"))
+        _offp = tags_off(st)
+        _sys = mood_prompt(n, st.get("ttsPmePrompt"), _offp)
+        if _spk_player[0]:
+            _sys += "\nThe player is %s." % _spk_player[0]
+        _t0 = time.time()
+        with _GateHeld(route_gate_key(rt)):
+            said, reason, timings, usage = _chat(
+                rt, _sys, body,
+                cfg_max=(think_budget(st, "ttsPmeBudget", 3000) if _think
+                         else 48 + 48 * n),
+                timeout=(300.0 if _think else 20.0))
+        _secs = time.time() - _t0
+        PROXY.report(rt, reason, usage, timings, round(_secs * 1000), 0)
+        ptipme_log("PME", rt["server"], _sys, body, mood_answer(said), _secs,
+               cached=(timings or {}) and cached_tokens(timings))
+        tag_output_line("PME", mood_answer(said), cfg)
+        _drop = []
+        found = mood_valid(said, n, _drop, _offp)
+        with _MOOD_LOCK:
+            MOOD["text"], MOOD["at"] = found, time.time()
+        if found:
+            TTSW.log("\U0001F9ED Scene read: %s" % " | ".join(found.splitlines()))
+        if _drop:
+            # a reading lost to a word outside the vocabulary used to disappear without
+            # trace, and looked from the terminal like the reader had answered with one
+            # line when it had answered with two
+            TTSW.log("\U0001F9ED   not a feeling this engine has, so dropped: %s"
+                     % ", ".join(_drop))
+        return found
+    finally:
+        with _MOOD_LOCK:
+            MOOD["busy"] = False
+
+
+def mood_context():
+    """The stored reading, if it is still this moment."""
+    with _MOOD_LOCK:
+        if MOOD["text"] and (time.time() - MOOD["at"]) < MOOD_TTL:
+            return MOOD["text"]
+    return ""
+
+
+# Emotions this build refuses to send to Higgs, whoever asks for them.
+#
+# EMPTY, deliberately. Elation was blocked here after eight takes were judged to be in
+# the wrong voice; a four-voice sweep judged by ear then found every one of them to be
+# the right speaker, simply delivered with more energy. The Pitch Guard that replaced
+# the block was removed for the same reason in patch33 - pitch and low-band energy move
+# with FEELING, not with identity, so nothing measurable separated the two.
+#
+# The mechanism stays: if a tag is ever found to be reliably destructive rather than
+# occasionally, this is where it goes.
+TTS_EMOTION_BLOCK = frozenset()
+
+
+def tts_apply_tags(text, keep, engine="audiocpp", final_off=frozenset()):
     """Turn the mod's ALL-CAPS tags into Higgs control tokens, or remove them.
 
     MOSS understands one marker of its own, [pause 3.2s], and none of Higgs'.
@@ -3703,6 +6858,8 @@ def tts_apply_tags(text, keep, engine="audiocpp"):
         """
         word = " ".join(m.group(1).split()).lower()
         hit = TTS_ALIAS.get(word)
+        if hit and hit[0] == "emotion" and hit[1] in TTS_EMOTION_BLOCK:
+            return ""              # measured to break the voice - see TTS_EMOTION_BLOCK
         if hit and higgs:
             return "[%s-%s]" % (hit[0].upper(), hit[1].upper())
         if hit or word in TTS_ALIAS_DROP:
@@ -3719,25 +6876,31 @@ def tts_apply_tags(text, keep, engine="audiocpp"):
         text = TTS_TAG_ANY_RX.sub("", text)
         return re.sub(r"\s{2,}", " ", text).strip()
 
+    _blocked = frozenset(tag_pair(w) for w in (final_off or ()))
     lines = []
     for line in text.split("\n"):
         carried, done = [], []
         for sentence in TTS_SENT_RX.split(line):
-            body, level = _tts_sentence(sentence)
+            body, level = _tts_sentence(sentence, _blocked)
             body = body.strip()
             tags = carried + level
             if not body:
                 carried = tags          # nothing to colour; hand them onward
                 continue
             carried = []
-            done.append(_tts_render(tags) + body)
+            done.append(_tts_render(tags, _blocked) + body)
         if carried and done:
-            done[-1] = _tts_render(carried) + done[-1]
+            done[-1] = _tts_render(carried, _blocked) + done[-1]
         lines.append(_tts_drop_edge_pauses(" ".join(done)))
     text = "\n".join(lines)
-    text = TTS_TAG_ANY_RX.sub(
-        lambda m: m.group(0) if re.fullmatch(
-            r"<\|(emotion|prosody|style|sfx):[a-z_]+\|>", m.group(0)) else "", text)
+    # the backstop on raw tokens: both writers above already read the gate, so
+    # this only matters for a <|...|> that arrived IN the text itself
+    def _door(m):
+        mm = re.fullmatch(r"<\|((emotion|prosody|style|sfx):[a-z_]+)\|>", m.group(0))
+        if not mm:
+            return ""
+        return "" if mm.group(1) in _blocked else m.group(0)
+    text = TTS_TAG_ANY_RX.sub(_door, text)
     text = re.sub(r"\s+-\s+-\s+", " - ", text)   # a removed tag can leave " - - "
     text = re.sub(r"\s{2,}", " ", text).strip()
     # tts_normalize punctuated the line, but a tag can land after that full stop -
@@ -3809,15 +6972,86 @@ TTS_MOOD_PLAIN = "\U0001F5E3\uFE0F"    # a speaking head - the variation selecto
 TTS_TOKEN_RX = re.compile(r"<\|([a-z]+):([a-z_]+)\|>")
 
 
+# Ordinary speech runs about 2.6 words a second. Higgs occasionally keeps decoding well
+# past the end of a sentence - one measured line produced 56.5s of audio for 24 words -
+# and from the outside that just looks like the panel being slow. Say what happened.
+_hdr_seen = [False]          # the header list is worth saying once, not per line
+TTS_WPS = 2.6
+TTS_RUNAWAY_MIN_S = 8.0      # below this, the ratio is noise on a two-word line
+TTS_RUNAWAY_RATIO = 3.0
+
+
+def tts_runaway_note(text, secs):
+    """A note when the audio is far longer than the words can account for."""
+    words = len(re.sub(r"\*[^*]*\*", " ", str(text or "")).split())
+    if not words or secs <= TTS_RUNAWAY_MIN_S:
+        return ""
+    expect = words / TTS_WPS
+    if secs < expect * TTS_RUNAWAY_RATIO:
+        return ""
+    return ("\u26A0 %.0fs of audio for %d words (about %.0fs expected) - the model kept "
+            "going past the end of the line. Regenerating usually fixes it."
+            % (secs, words, expect))
+
+
+def mood_icon_names():
+    """icon -> what it stands for, built from TTS_MOOD so the two cannot drift.
+
+    Several tags share an icon (a shout and a call are both the megaphone), so the label
+    lists them rather than picking one and being wrong half the time.
+    """
+    out = {}
+    for (kind, name), icon in TTS_MOOD.items():
+        out.setdefault(icon, [])
+        if name not in out[icon]:
+            out[icon].append(name)
+    out = {k: " / ".join(sorted(v)) for k, v in out.items()}
+    # the fallback head is not in TTS_MOOD, and a line with no tag is worth saying so
+    out.setdefault(TTS_MOOD_PLAIN, "no emotion tag on this line")
+    return out
+
+
 def tts_mood_icon(text):
-    """An icon for how the line is meant to sound, from the tags it carries."""
+    """An icon for how the line FEELS, from the tags it carries. An emotion tag
+    always decides the face - even one outside the icon map shows the plain face
+    rather than letting a sound stand in for a feeling. A style (whisper, shout)
+    may front the line when no emotion is named. A sound effect never does: a
+    sigh is something the voice does, not something the character feels."""
     found = TTS_TOKEN_RX.findall(str(text or ""))
-    for want in ("emotion", "style", "sfx"):
-        for fam, val in found:
-            if fam.lower() == want:
-                hit = TTS_MOOD.get((fam.lower(), val.lower()))
-                if hit:
-                    return hit
+    # NPC lines carry *stage directions*, not control tokens - same catalogue,
+    # translated by the tag table, so their faces match the player's (patch165)
+    for w in re.findall(r"\*\s*([A-Za-z]+)", str(text or "")):
+        pair = TTS_ALIAS.get(w.lower())
+        if pair:
+            found.append(pair)
+    # and the ON-WIRE form: the alias pass rewrites SkyrimNet's [enthusiasm] to
+    # Higgs' [EMOTION-ENTHUSIASM] before this runs - the field regression was the
+    # face reading only <|tokens|> while every NPC line carried this form
+    for fam, val in re.findall(r"\[([A-Z]+)-([A-Z_]+)\]", str(text or "")):
+        found.append((fam.lower(), val.lower()))
+    # and the RAW form as the LLM wrote it: with audio.cpp the alias pass STRIPS
+    # recognised [enthusiasm]-style tags before synthesis, so the icon must be
+    # fed the pre-alias text - the caller passes it as mood_src (patch167)
+    for w in re.findall(r"\[\s*([a-zA-Z][a-zA-Z_ ]{0,20})\s*\]", str(text or "")):
+        pair = TTS_ALIAS.get(" ".join(w.split()).lower())
+        if pair:
+            found.append(pair)
+    for fam, val in found:
+        if fam.lower() == "emotion":
+            return TTS_MOOD.get(("emotion", val.lower()), TTS_MOOD_PLAIN)
+    for fam, val in found:
+        if fam.lower() == "style":
+            hit = TTS_MOOD.get(("style", val.lower()))
+            if hit:
+                return hit
+    # the owner's call (patch171): a chunk whose only tag is a SOUND wears the
+    # sound's own icon rather than the plain head - the last-resort tier, after
+    # emotions and styles have had their say
+    for fam, val in found:
+        if fam.lower() == "sfx":
+            hit = TTS_MOOD.get(("sfx", val.lower()))
+            if hit:
+                return hit
     return TTS_MOOD_PLAIN
 
 
@@ -3831,6 +7065,24 @@ def tts_tags_display(text):
     return re.sub(r" {2,}", " ", out).strip()
 
 
+def tts_is_ping(text):
+    """SkyrimNet's startup probe, whatever punctuation it arrives with.
+
+    Stated once. The test used to sit inline, deep in _run_inner and AFTER the tagger
+    had already been asked to mark the line up - so the probe was tagged as though the
+    player had said it, and `[sound_ping] ping.` came back.
+    """
+    return str(text or "").strip().rstrip(".!?").strip().lower() == "ping"
+
+
+TTS_PING_MODES = ("on", "off", "banned")
+
+
+def tts_ping_mode(st):
+    m = str((st or {}).get("ttsAnswerPing", "off")).strip().lower()
+    return m if m in TTS_PING_MODES else "on"
+
+
 def tts_normalize(text):
     """Match the reference wrapper: collapse whitespace, end with punctuation.
 
@@ -3841,86 +7093,22 @@ def tts_normalize(text):
     if text and text[-1] not in ".!?,;\"'":
         text += "."
     return text
+def tts_wav_head_ok(head, size):
+    """True when a 44-byte header describes exactly the bytes that follow it.
 
-
-def tts_chunks(text, maxc=TTS_CHUNK_CHARS):
-    """Split on sentence boundaries, packing greedily up to maxc."""
-    sentences = re.findall(r"[^.!?]+[.!?]+|\S[^.!?]*$", text)
-    sentences = [s.strip() for s in sentences if s.strip()]
-    pieces = []
-    for s in sentences:
-        if len(s) <= maxc:
-            pieces.append(s)
-            continue
-        buf = ""
-        for part in re.split(r"(?<=,)\s+", s):
-            if len(part) > maxc:
-                if buf:
-                    pieces.append(buf.strip()); buf = ""
-                line = ""
-                for w in part.split():
-                    if len(line) + len(w) + 1 > maxc:
-                        pieces.append(line.strip()); line = w
-                    else:
-                        line = (line + " " + w).strip()
-                if line:
-                    pieces.append(line.strip())
-            elif len(buf) + len(part) + 1 > maxc:
-                pieces.append(buf.strip()); buf = part
-            else:
-                buf = (buf + " " + part).strip()
-        if buf:
-            pieces.append(buf.strip())
-    out, cur = [], ""
-    for p in pieces:
-        if not cur:
-            cur = p
-        elif len(cur) + len(p) + 1 <= maxc:
-            cur = cur + " " + p
-        else:
-            out.append(cur); cur = p
-    if cur:
-        out.append(cur)
-    return out or [text]
-
-
-def tts_wav_join(parts, gap_ms=TTS_CHUNK_GAP_MS):
-    """Concatenate WAV blobs with a silence gap. Stdlib `wave` only.
-
-    All parts come from one model, so the format is uniform; the first part's
-    parameters win and any part that disagrees is skipped rather than producing
-    a garbled join.
+    Testing only WHERE the data chunk sits is not enough. 160 of the user's voicetype
+    WAVs carry `data` at the canonical offset 36 and then declare its size as
+    0xFFFFFFFF - a streaming writer that never went back to patch the header once it
+    knew the length. A position-only test called those files canonical and handed them
+    over untouched, and audio.cpp refused them with `failed to read WAV data chunk`.
+    Check the declared lengths, not just the layout.
     """
-    frames, params, gap = [], None, b""
-    for raw in parts:
-        if not raw:
-            continue
-        try:
-            with _wave.open(io.BytesIO(raw), "rb") as w:
-                p = w.getparams()
-                data = w.readframes(w.getnframes())
-        except Exception:
-            continue
-        if params is None:
-            params = p
-            gap = b"\x00" * int(p.framerate * gap_ms / 1000.0) * p.sampwidth * p.nchannels
-        elif (p.framerate, p.sampwidth, p.nchannels) != (
-                params.framerate, params.sampwidth, params.nchannels):
-            continue
-        elif frames:
-            frames.append(gap)
-        frames.append(data)
-    if params is None:
-        return None, 0, 0
-    buf = io.BytesIO()
-    with _wave.open(buf, "wb") as w:
-        w.setnchannels(params.nchannels)
-        w.setsampwidth(params.sampwidth)
-        w.setframerate(params.framerate)
-        w.writeframes(b"".join(frames))
-    body = buf.getvalue()
-    nframes = sum(len(f) for f in frames) // (params.sampwidth * params.nchannels)
-    return body, params.framerate, nframes
+    if len(head) < TTS_WAV_HEAD or head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return False
+    if head[36:40] != b"data":
+        return False
+    return (int.from_bytes(head[4:8], "little") == size - 8
+            and int.from_bytes(head[40:44], "little") == size - TTS_WAV_HEAD)
 
 
 def tts_wav_normalize(raw):
@@ -3972,6 +7160,10 @@ class TtsWrapper:
         self._srv = None
         self._port = None
         self._lock = threading.Lock()
+        # report blocks are multi-line; the thought synthesizer logs from its own
+        # thread, and the owner's 01:55 screenshot showed its rows landing INSIDE
+        # a dialogue block. Whole blocks write under this lock. (patch171)
+        self.blk = threading.Lock()
         self._events = {}          # event_id -> {"done":Event, "path":str, "err":str}
         self._voice = {}           # md5 -> base64 of the reference wav
         self._dir = None
@@ -4023,7 +7215,7 @@ class TtsWrapper:
     def sync(self):
         cfg = load_config()
         st = cfg.get("settings", {})
-        on = str(st.get("ttsWrapMode", "off")).lower() == "on"
+        on = str(st.get("ttsWrapMode", "on")).lower() == "on"
         try:
             port = int(str(st.get("ttsWrapperPort") or "7860").strip())
         except Exception:
@@ -4038,9 +7230,17 @@ class TtsWrapper:
                 except Exception:
                     pass
                 self._srv, self._port = None, None
+            if (on and self._srv
+                    and self._srv.server_address[0] != listen_host(st)):
+                # remoteIp changed under a live listener: rebind for the new world
+                try:
+                    threading.Thread(target=self._srv.shutdown, daemon=True).start()
+                except Exception:
+                    pass
+                self._srv, self._port = None, None
             if on and not self._srv:
                 try:
-                    srv = _QuietServer(("0.0.0.0", port), _mk_tts_handler(self))
+                    srv = _QuietServer((listen_host(st), port), _mk_tts_handler(self))
                     self._srv, self._port = srv, port
                     threading.Thread(target=srv.serve_forever, daemon=True).start()
                     panel_log("[tts] listening :%d -> %s" % (port, self.upstream(cfg)))
@@ -4099,13 +7299,24 @@ class TtsWrapper:
 
     def submit(self, fields):
         eid = uuid.uuid4().hex
+        with self._lock:
+            self._inflight = getattr(self, "_inflight", 0) + 1
+            ahead = self._inflight - 1
         ev = {"done": threading.Event(), "path": "", "err": ""}
         with self._lock:
             self._events[eid] = ev
             for k in list(self._events)[:-40]:      # keep the last 40
                 self._events.pop(k, None)
+        # Written once per request. Two of these fields are read and the rest are not;
+        # any TTS setting SkyrimNet exposes arrives among them, and nothing else in the
+        # panel would ever show it.
+        panel_log("[tts] fields: %s" % tts_fields_note(fields))
+        _seen = sn_tts_params(fields)
+        if _seen:
+            _SN_TTS_SEEN.clear()
+            _SN_TTS_SEEN.update(_seen)
         text, ref = tts_pick_fields(fields)
-        threading.Thread(target=self._run, args=(eid, text, ref), daemon=True).start()
+        threading.Thread(target=self._run, args=(eid, text, ref, ahead), daemon=True).start()
         return eid
 
     def result(self, eid, timeout=TTS_RESULT_WAIT_S):
@@ -4138,68 +7349,182 @@ class TtsWrapper:
                 self._voice.pop(k, None)
         return b64, False
 
-    def _post_chunk(self, url, text, ref_b64):
-        body = {"text": text, "max_new_tokens": TTS_MAX_NEW_TOKENS}
-        if ref_b64:
-            body["reference_wav_b64"] = ref_b64
-        req = _ureq.Request(url, data=json.dumps(body).encode("utf-8"),
-                            headers={"Content-Type": "application/json"}, method="POST")
-        try:
-            r = _ureq.urlopen(req, timeout=120)
-        except _uerr.HTTPError as e:
-            detail = ""
-            try:
-                detail = e.read().decode("utf-8", "replace")[:400].strip()
-            except Exception:
-                pass
-            raise RuntimeError("HTTP %s from %s%s" % (
-                e.code, url, (" - " + detail) if detail else " (no detail returned)"))
-        with r:
-            raw = r.read()
-            g = float(r.headers.get("X-MOSS-Generate-Seconds") or 0)
-            d = float(r.headers.get("X-MOSS-Decode-Seconds") or 0)
-        return raw, g, d
-
-    def say_line(self, ref_path, processed, display=True):
+    def say_line(self, ref_path, processed, display=True, ahead=0, eid="", mood_src=None):
         """The spoken line, once. Each engine arm wrote its own copy of this.
 
         display=False for MOSS: it is handed the text as it stands and has no Higgs
         tokens to turn back into stage directions.
         """
-        self.log("%s %s: \u3030\uFE0F %s \u3030\uFE0F"
-                 % (tts_mood_icon(processed), tts_speaker_label(ref_path),
-                    tts_tags_display(processed) if display else processed))
+        # No queue note here. Measured across a real session, SkyrimNet sends the next
+        # chunk about 0.11s AFTER it has the previous chunk's audio - they never overlap,
+        # so nothing waits on anything. A note that can never fire is worse than none.
+        # the trailing marker names the kept audio file so the page can replay the
+        # line on a click - painters strip it from view, exactly like the proxy's
+        # payload marker
+        self.log("%s %s: \u3030\uFE0F %s \u3030\uFE0F%s"
+                 % (tts_mood_icon(mood_src or processed), tts_speaker_label(ref_path),
+                    tts_tags_display(processed) if display else processed,
+                    (" \u27EA%s\u27EB" % eid) if eid else ""))
 
     def saved_line(self, body, ref_path, cfg, out, local):
         """Keep a named copy and report it. Also written twice before."""
         kept = tts_save_named(body, tts_speaker_label(ref_path), cfg)
-        self.log("\U0001F4BE Saved: %s (%.1f KB)%s"
-                 % (os.path.basename(kept or out), len(body) / 1024.0,
+        # NAME the reference. A line has come back in a voice two octaves off the sample,
+        # wrong from its first frame - which means the wrong reference, not a drift. The
+        # only way to tell a wrong file from a right file badly used is to record which
+        # file went out.
+        ref = re.split(r"[\\/]", str(ref_path or ""))[-1] or "(none)"
+        self.log("\U0001F4BE Saved: %s (%.1f KB)   voice: %s%s"
+                 % (os.path.basename(kept or out), len(body) / 1024.0, ref,
                     "  [local clip]" if local else ""))
 
-    def _run(self, eid, text, ref_path):
+    def _run(self, eid, text, ref_path, ahead=0):
+        try:
+            self._run_inner(eid, text, ref_path, ahead)
+        finally:
+            with self._lock:                 # however it ends, it is no longer in flight
+                self._inflight = max(0, getattr(self, "_inflight", 1) - 1)
+
+    def _run_inner(self, eid, text, ref_path, ahead=0):
         ev = self._events.get(eid)
         t0 = time.time()
-        cfg = load_config()
+        cfg = load_config_cached()      # read-only here; one parse per edit
         st = cfg.get("settings", {})
         local = tts_local_sample(ref_path, cfg)
         if local:
             ref_path = local
-        processed = tts_apply_tags(tts_normalize(text),
-                                   str(st.get("ttsTags", "off")).lower() == "on",
-                                   tts_engine(cfg))
+        # BEFORE the first label of this line: a shared voice sample is named by
+        # the words it is about to speak, not by whichever request came first.
+        tts_pin_speaker(ref_path, text)
+        if ref_path:
+            TTS_REF_BY_NAME[tts_speaker_label(ref_path)] = ref_path
+        raw = tts_normalize(text)
+        # The line EXACTLY as SkyrimNet sent it, before anything here touches it. Whether
+        # a performance tag survived the mod or was never sent is not answerable from the
+        # panel otherwise - the terminal only ever shows the processed line - and the
+        # difference decides whether a fault is here or upstream.
+        panel_log("[tts] in: %s" % raw[:200])
+        # Settled before anything else looks at the line. The probe is not dialogue: it
+        # is never the player speaking, so it never reaches the tagger, the mood reader
+        # or the spoken record whatever this is set to.
         try:
-            # SkyrimNet pings at startup with a silent reference. Answering it here costs
-            # nothing; letting it through spends 600-1100ms of GPU saying "ping".
-            if str(st.get("ttsAnswerPing", "on")).lower() == "on" and \
-                    processed.rstrip(".!?").strip().lower() == "ping":
-                out = self._silence()
-                ev["path"] = out
-                self.log("\U0001F50C Ping answered locally (no GPU)")
+            # everything from here is inside the try: an early return for a ping,
+            # or a raise in the tagger, must still reach `finally` and release the
+            # handler waiting on ev["done"]
+            ping = tts_is_ping(raw)
+            if ping and tts_ping_mode(st) != "off":
+                ev["path"] = self._silence()
+                if tts_ping_mode(st) != "banned":
+                    self.log("\U0001F50C Ping answered locally (no GPU)")
                 return
+            keep_tags = str(st.get("ttsTags", "on")).lower() == "on"
+            # The player types their line, so nothing has tagged it - every NPC around them
+            # gets an expressive delivery and they do not. Ask a fleet model for tags.
+            # Higgs only: the MOSS path has no equivalent vocabulary.
+            _pti_used = False
+            _t_pti = time.time()
+            if not ping and tts_engine(cfg) == "audiocpp" and tts_is_player(ref_path):
+                _tagged = tts_player_tag(raw, cfg)
+                if _tagged:
+                    _pti_used = PTI_LAST[0] > 0.0
+                    raw = _tagged            # the same words, with tags placed among them
+                    # Audio Tags decides whether to trust tags SKYRIMNET wrote. This one is
+                    # ours, asked for deliberately - stripping it because a different setting
+                    # is off would make the feature silently do nothing, and Audio Tags is
+                    # off by default.
+                    keep_tags = True
+                    self.log("   \U0001F3AD %s   (%s)"
+                             % (_tagged, ("%.2fs" % PTI_LAST[0]) if _pti_used else "cached"))
+            _pti_s = time.time() - _t_pti
+            # the conversation as spoken - before tags, so it reads as plain dialogue
+            _t_mood = time.time()
+            if not ping:
+                mood_note_line(tts_speaker_label(ref_path), tts_normalize(text),
+                               tts_is_player(ref_path))
+            _mood_s = time.time() - _t_mood
+            _gone = tts_tags_dropped(raw)
+            if _gone:
+                self.log("   \u2702\uFE0F no Higgs equivalent, removed: %s"
+                         % ", ".join("[%s]" % w for w in _gone))
+            if not keep_tags:
+                _had = tts_tag_count(raw)
+                if _had:
+                    self.log("   \u2702\uFE0F %d performance tag%s removed - Audio Tags is "
+                             "set to strip them (TTS page)"
+                             % (_had, "" if _had == 1 else "s"))
+            # the final gate plus this character's cooldowns: a limited tag that was
+            # spoken within the last N of THEIR turns is held back exactly like a
+            # gated one - and only tags that actually REACH the engine start a
+            # cooldown, so a line that never carried the tag costs nothing
+            _isp = tts_is_player(ref_path)
+            _limits = tag_limits(st, "ttsTagLimitsPlayer" if _isp else "ttsTagLimits")
+            _ckey = "player" if _isp else os.path.splitext(os.path.basename(
+                str(ref_path or "")))[0].lower()
+            _cool = (frozenset() if ping else
+                     tag_cooldown_pass(_ckey, _limits,
+                                       new_turn=tts_reply_first_chunk(
+                                           tts_speaker_label(ref_path))))
+            if tts_engine(cfg) == "audiocpp" and (not _isp) and not ping:
+                # a LIMITED tag must not be armed either: the wire gate would
+                # strip it anyway, but the face and the log would still say it -
+                # exactly the "did the limit even fire?" doubt the owner named
+                raw = tts_npc_mood_arm(tts_speaker_label(ref_path), raw, cool=_cool)
+            _banset = tags_off(st, "ttsTagsFinalOff")
+            processed = tts_apply_tags(raw, keep_tags, tts_engine(cfg),
+                                       _banset | _cool)
+            _fresh = frozenset()
+            if not ping:
+                _fresh = tag_cooldown_note(_ckey, _limits, processed) or frozenset()
+            # NPC thought audio, armed in TTS > Thought Audio: the freshest thought
+            # this character just had is voiced with the echo and broadcast around
+            # the spoken line - BEFORE holds the line's delivery until the thought
+            # has had its playtime (capped), AFTER follows the line's own length.
+            _thWho = tts_speaker_label(ref_path)
+            _thTxt = None
+            if (not tts_is_player(ref_path)) and not ping \
+                    and str(st.get("ttsThoughtAudio", "off")).lower() == "on":
+                _tf = THOUGHT_FRESH.pop(_thWho, None)
+                if _tf is None \
+                        and str(st.get("ttsThoughtSeq", "before")).lower() != "after":
+                    # the chunk beat the completion's tail: the thought is being
+                    # streamed RIGHT NOW. Wait a bounded moment for it so this
+                    # reply is fronted by its own thought, not the next one.
+                    _dl = time.time() + 3.0
+                    while _tf is None and time.time() < _dl:
+                        time.sleep(0.05)
+                        _tf = THOUGHT_FRESH.pop(_thWho, None)
+                if _tf and time.time() - _tf[1] < 180.0:
+                    _thTxt = _tf[0]
+            _thSeq = str(st.get("ttsThoughtSeq", "before")).lower()
+            _thEnd = 0.0
+            _hold_s = 0.0
+            if _thTxt and _thSeq != "after":
+                with TH_AFTER_LOCK:
+                    for _pp in TH_AFTER.pop(_thWho, []) or []:
+                        try:
+                            _pp["timer"].cancel()
+                        except Exception:
+                            pass
+                    _nfB = (REPLY_FULL.get(_thWho) or ("", 0))[0]
+                    _mid = sum(1 for r in CHUNK_TRACE.get(_thWho, [])
+                               if _nfB and _th_member(r[2], _nfB)
+                               and time.time() - r[0] < 60.0) > 1
+                if _mid:
+                    # the completion streamed its thought AFTER this reply's first
+                    # chunks already went out un-held: playing it now would land it
+                    # mid-dialogue. Keep it fresh - the NEXT reply's first chunk
+                    # holds and fronts it. Stale AFTER pendings from a sequence
+                    # switch are flushed above either way. (patch165)
+                    THOUGHT_FRESH[_thWho] = (_thTxt, time.time())
+                    _thTxt = None
+            if _thTxt and _thSeq != "after":
+                _teid, _tsec = tts_thought_make(_thWho, _thTxt, cfg)
+                if _teid:
+                    sse_notify("replay", {"id": _teid})
+                    _thEnd = time.time() + min(float(_tsec or 0.0), 12.0)
             if tts_engine(cfg) == "audiocpp":
-                self.say_line(ref_path, processed)
                 self.log("")
+                self.say_line(ref_path, processed, ahead=ahead, eid=eid, mood_src=raw)
                 mid = st.get("ttsAcppModelId") or "higgs"
                 base = "http://127.0.0.1:%d" % tts_server_port(cfg)
                 _t_post = time.time()
@@ -4212,8 +7537,27 @@ class TtsWrapper:
                 with open(out, "wb") as f:
                     f.write(body)
                 self.prune()
+                if _thEnd:
+                    # the requested rule, verbatim: dialogue playback begins once
+                    # the THOUGHT's realtime length plus half a second has passed
+                    _thw = _thEnd - time.time() + 0.5
+                    if _thw > 0:
+                        _hold_s = min(_thw, 12.0)
+                        time.sleep(_hold_s)
+                        t0 += _hold_s          # the hold is not synthesis - the wall
+                                               # splits at the POST and stays honest
                 ev["path"] = out
                 wall = time.time() - t0
+                # The wall splits at the POST. Everything before it is the panel's own
+                # work - config, normalising, the player tagger's model call - and from
+                # patch1 to patch85 all of it was inside "realtime" and billed to
+                # "overhead (http + wav)": a 0.3s tag call read as the transport
+                # slowing down. Realtime now measures synthesis, and prep is NAMED.
+                prep = max(0.0, _t_post - t0)
+                # the auto-cap estimate runs inside the request builder, so it is
+                # panel work sitting in the synthesis clock. Out, and named.
+                est_s = min(float(AUTOCAL_LAST[0]), max(0.0, wall - prep))
+                synth = max(0.0, wall - prep - est_s)
                 rate, nframes = 0, 0
                 try:
                     with _wave.open(io.BytesIO(body), "rb") as w:
@@ -4221,47 +7565,131 @@ class TtsWrapper:
                 except Exception:
                     pass
                 secs = (nframes / float(rate)) if rate else 0.0
+                # after-mode sees EVERY chunk: the first carries the thought, the
+                # rest extend the burst - the timer lands after the whole reply
+                if (not tts_is_player(ref_path)) and not ping:
+                    tts_chunk_trace(_thWho, secs, processed)
+                if _thSeq == "after" and (not tts_is_player(ref_path)) and not ping \
+                        and str(st.get("ttsThoughtAudio", "off")).lower() == "on":
+                    tts_thought_after_chunk(_thWho, _thTxt, secs, cfg,
+                                            is_last=tts_chunk_is_last(_thWho, processed))
                 gen_s = _num_or(hdrs, ("x-audiocpp-generate-seconds", "x-generate-seconds",
                                        "x-inference-seconds", "x-higgs-generate-seconds"))
                 dec_s = _num_or(hdrs, ("x-audiocpp-decode-seconds", "x-decode-seconds",
                                        "x-codec-seconds"))
                 toks = secs * TTS_ACPP_FRAME_RATE
-                self.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)" % (
-                    (secs / wall) if wall else 0.0, wall, secs))
-                if gen_s or dec_s:      # the server told us; show its own split
-                    self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
-                             % ("generate:", gen_s * 1000.0, toks, (toks / gen_s) if gen_s else 0.0))
-                    self.log("   %-9s%6.0f ms   %7d samples     %7.0f tps"
-                             % ("codec:", dec_s * 1000.0, nframes, (toks / dec_s) if dec_s else 0.0))
-                else:                   # it did not, so split what WE can measure
-                    self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
-                             % ("server:", srv_s * 1000.0, toks, (toks / srv_s) if srv_s else 0.0))
-                    self.log("   %-9s%13d samples @ %d Hz" % ("audio:", nframes, rate))
-                self.log("   %-9s%6.0f ms   (http + wav)"
-                         % ("overhead:", max(0.0, (wall - (gen_s + dec_s or srv_s)) * 1000.0)))
-                _unknown = [k for k in hdrs
-                            if k.startswith("x-") and k not in ("x-request-id",)]
-                if _unknown and not (gen_s or dec_s):
-                    panel_log("[tts] audio.cpp response headers seen: %s" % ", ".join(sorted(_unknown)))
-                self.saved_line(body, ref_path, cfg, out, local)
+                tts_measure_record(processed, secs, AUTOCAL_EST[0],
+                                   wall=synth)                         # right lines
+                autocal_tick(st)      # and one towards the next automatic fit
+                with self.blk:   # the whole report writes as ONE block (patch171)
+                    self.log("")   # and stands apart from the receipt group (patch174)
+                    self.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)" % (
+                        (secs / synth) if synth else 0.0, synth, secs))
+                    # Everything the panel spent before the engine was asked, itemised:
+                    # a feature that costs time should be readable as that feature, not
+                    # as the transport being slow.
+                    if prep >= 0.005 or est_s >= 0.005:
+                        _pti_ms = _pti_s * 1000.0
+                        _mood_ms = _mood_s * 1000.0
+                        _est_ms = est_s * 1000.0
+                        _rest_ms = max(0.0, prep * 1000.0 - _pti_ms - _mood_ms)
+                        _bits = []
+                        if _pti_ms >= 0.5:
+                            _bits.append("player tags %.0f%s"
+                                         % (_pti_ms, "" if _pti_used else " cached"))
+                        if _mood_ms >= 0.5:
+                            _bits.append("mood %.0f" % _mood_ms)
+                        if _est_ms >= 0.5:
+                            _bits.append("token estimate %.0f" % _est_ms)
+                        _bits.append("panel %.0f" % _rest_ms)
+                        self.log("   %-9s%6.0f ms   (%s)"
+                                 % ("prep:", (prep + est_s) * 1000.0, " + ".join(_bits)))
+                    _ran = tts_runaway_note(processed, secs)
+                    if _ran:
+                        self.log("   %s" % _ran)
+                    if gen_s or dec_s:      # the server told us; show its own split
+                        self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
+                                 % ("generate:", gen_s * 1000.0, toks, (toks / gen_s) if gen_s else 0.0))
+                        self.log("   %-9s%6.0f ms   %7d samples     %7.0f tps"
+                                 % ("codec:", dec_s * 1000.0, nframes, (toks / dec_s) if dec_s else 0.0))
+                    else:                   # it did not, so split what WE can measure
+                        self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
+                                 % ("server:", srv_s * 1000.0, toks, (toks / srv_s) if srv_s else 0.0))
+                        self.log("   %-9s%13d samples @ %d Hz" % ("audio:", nframes, rate))
+                    self.log("   %-9s%6.0f ms   (http + wav)"
+                             % ("overhead:", max(0.0, (synth - (gen_s + dec_s or srv_s)) * 1000.0)))
+                    if _hold_s > 0.05:
+                        self.log("   %-9s%6.0f ms   (thought fronted this line)"
+                                 % ("hold:", _hold_s * 1000.0))
+                    if _banset:
+                        self.log("   Banned Tags: %s" % ", ".join(
+                            "[%s]" % tag_disp(p) for p in sorted(_banset)))
+                    _rep77 = tag_cooldown_report(_ckey, _limits, exclude=_fresh)
+                    if _rep77 or _fresh:
+                        self.log("   Tag Limits: %s" % ", ".join(
+                            ["[%s (%d)]" % (tag_disp(p), r) for p, r in _rep77]
+                            + ["[%s (+%d)]" % (tag_disp(p), _limits.get(p, 0))
+                               for p in sorted(_fresh)]))
+                    # the same numbers the report prints, kept for the bar to draw
+                    tts_meter_set(
+                        at=_stamp(), who=tts_speaker_label(ref_path),
+                        chars=len(processed), tags=tts_tag_count(processed),
+                        pause_s=round(tts_pause_secs(processed), 2),
+                        audio_s=round(secs, 2), realtime=round((secs / synth) if synth else 0.0, 2),
+                        ms={"player tags": round(_pti_s * 1000.0),
+                            "mood": round(_mood_s * 1000.0),
+                            "token estimate": round(est_s * 1000.0),
+                            "panel": round(max(0.0, prep - _pti_s - _mood_s) * 1000.0),
+                            "generate": round((gen_s or srv_s) * 1000.0),
+                            "codec": round(dec_s * 1000.0),
+                            "http + wav": round(max(0.0, (synth - (gen_s + dec_s or srv_s))) * 1000.0)},
+                        tok={"used": round(toks), "estimate": round(AUTOCAL_EST[0]),
+                             "cap": AUTOCAL_CAP[0],
+                             "guard": acpp_token_cap(processed, st)},
+                        mode=str((st or {}).get("ttsAutoCal", "off")).lower(),
+                        samp=tts_samp_note(dict(TTS_SAMP_LAST)),
+                        attempt=int(TTS_SAMP_LAST.get("attempt", 1)),
+                        cached=bool(_pti_s > 0 and not _pti_used))
+                    _fit = tts_autocal_fit()
+                    if _fit.get("n", 0) and AUTOCAL_EST[0] >= 1.0:
+                        self.log("   %-9s%6.0f used / %.0f estimated = %.2f   "
+                                 "(worst %.2f over %d lines)"
+                                 % ("fit:", toks, AUTOCAL_EST[0],
+                                    toks / AUTOCAL_EST[0], _fit["worst"], _fit["n"]))
+                    # The server sends x-audiocpp-audio-duration-ms. Comparing it with the
+                    # length of the WAV we actually received separates two very different
+                    # faults: the model generating too much, versus the file arriving padded.
+                    srv_ms = _num_or(hdrs, ("x-audiocpp-audio-duration-ms",
+                                            "x-audio-duration-ms")) or 0.0
+                    if srv_ms:
+                        srv_secs = srv_ms / 1000.0
+                        if secs and abs(srv_secs - secs) > max(0.5, secs * 0.05):
+                            self.log("   %-9s server says %.1fs, the file holds %.1fs - the "
+                                     "difference is padding, not speech"
+                                     % ("length:", srv_secs, secs))
+                    _unknown = [k for k in hdrs
+                                if k.startswith("x-") and k not in ("x-request-id",)]
+                    if _unknown and not (gen_s or dec_s) and not _hdr_seen[0]:
+                        _hdr_seen[0] = True        # once a session, not once a line
+                        panel_log("[tts] audio.cpp response headers seen: %s" % ", ".join(sorted(_unknown)))
+                    self.saved_line(body, ref_path, cfg, out, local)
                 self.log("")
                 return
 
+            # The MOSS arm is INCOMPLETE and has been for some time - it predates this
+            # session, and the undefined-name sweep is what surfaced it. It resolves the
+            # reference and announces the line, then reads `secs`, `gen_s`, `dec_s`,
+            # `over`, `body` and `out`, none of which it ever computes: they belong to
+            # the audio.cpp arm above, which returns before reaching here. The poster
+            # it would have needed was removed with the rest of the dead code in
+            # patch184, so nothing is ever generated. Reconstructing it blind
+            # would be guesswork; failing plainly is honest and says what is missing.
             ref_b64, cached = self._ref_b64(ref_path)
             if ref_b64 is None:
                 self.log("\u26A0\uFE0F No reference voice resolved from %s" % (ref_path or "(none sent)"))
-            else:
-                self.log("\u267B\uFE0F Reused cached voice" if cached else "\U0001F195 Recomputing voice")
-            self.log("")
-            self.say_line(ref_path, processed, display=False)
-            toks = secs * TTS_FRAME_RATE
-            self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
-                     % ("generate:", gen_s * 1000.0, toks, (toks / gen_s) if gen_s else 0.0))
-            self.log("   %-9s%6.0f ms   %7d samples     %7.0f tps"
-                     % ("codec:", dec_s * 1000.0, nframes, (toks / dec_s) if dec_s else 0.0))
-            self.log("   %-9s%6.0f ms   (http + wav)" % ("overhead:", over))
-            self.saved_line(body, ref_path, cfg, out, local)
-            self.log("")
+            raise RuntimeError(
+                "the MOSS-TTS path is not implemented in this build - it never calls the "
+                "server. Switch the TTS engine to audio.cpp on the TTS page.")
         except Exception as e:
             # a crashed server just closes the socket; its own log says why
             hint = tts_diagnose(cfg, TTS_PROC.get("log_at")) if tts_engine(cfg) == "audiocpp" else ""
@@ -4295,49 +7723,142 @@ class TtsWrapper:
 # It then LEARNS the pairing. A TTS call arriving shortly after a dialogue request is
 # almost certainly that character speaking, so voicetype -> name is remembered and used
 # from then on, including out of order.
-SPEAKER_RX = re.compile(rb"You are ([A-Z][A-Za-z' \-]{1,28}?), a ")
+# SkyrimNet writes a role in brackets after the name - "You are Azeeda [hunter], a
+# Female Redguard in Skyrim." The bracket is not in the name class, so the match failed
+# outright and every such character was spoken under its voicetype instead. The tag is
+# matched and discarded; the name alone is captured.
+SPEAKER_RX = re.compile(rb"You are ([A-Z][A-Za-z' \-]{1,28}?)(?:\s*\[[^\]]{1,24}\])?, a ")
 # The player is named by the PARTY, which is always theirs whoever is speaking:
 #   ## Maxxor's Party's Active Quests
 # NOT by "You are speaking to ...", which names the LISTENER - when one NPC addresses
 # another, that line holds the other NPC and the player's own voice took their name.
-PLAYER_RX = re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)'s Party's")
+# patch116: "'s Party's" also matched only that one heading. Anything possessive on the
+# party names the player, whatever follows it - the party is theirs whoever is speaking.
+PLAYER_RX = re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)'s Party\b")
+# patch123: a second, independent naming. SkyrimNet's standalone thought prompt is the
+# PLAYER's - "You are Maxxor ... Think internally as Maxxor" - while an NPC's thought
+# rides inside a dialogue reply as <internal_thought>, never as its own request. Both
+# sessions' field captures show it, and the two names must AGREE: the speaker of that
+# request and the "Think internally as" name are the same person or nothing is learned.
+PLAYER_THINK = b"Think internally as "
+# What the request DID head its sections with, kept only while the name is unknown. A
+# fallback that says "Player" and nothing else cannot be fixed by whoever reads the log:
+# the fix needs the heading this prompt actually uses, and only the prompt has it.
+HEADING_RX = re.compile(rb"(?m)^##\s+([^\r\n]{1,60})")
+_spk_heads = []                # the last request's headings, for one honest message
 # The player's own voice must never learn an NPC's name. Their line is spoken when THEY
 # speak, which is before the next dialogue request, so it would pair with the previous
 # turn's character - which is exactly what happened.
 PLAYER_VOICES = frozenset(("player", "playervoice", "playerdialogue"))
 SPEAKER_SCAN = 4096            # the speaker sits in the first few hundred bytes
-PLAYER_SCAN = 262144           # the party marker is much further in
 SPEAKER_PAIR_S = 15.0          # a TTS call this soon after a request is that character
+SPEAKER_TEXT_S = 25.0          # a reply this fresh can still name the voice speaking it
+SPEAKER_PIN_S = 10.0           # and it names it for the rest of that line's chunks
 _spk_lock = threading.Lock()
 _spk_recent = []               # [(when, name)], newest last
 _spk_voices = {}               # voicetype -> name, learned
+_spk_pin = {}                  # voicetype -> (name, when), named by its own words
 _spk_player = [""]             # the player's own name, from the same line
 
 
 def note_speaker(body):
     """Remember the character named in a dialogue request. Cheap and best-effort."""
     if not body:
-        return
+        return ""
     try:
         m = SPEAKER_RX.search(body[:SPEAKER_SCAN])
         if not m:
-            return
+            return ""
         name = m.group(1).decode("utf-8", "replace").strip()
         if not name or name.lower() in ("speaking", "a", "an"):
-            return
+            return ""
         # the party marker sits ~17 KB in, well past the speaker, so it needs a wider
         # look - but only until it is found once. A regex over 45 KB is microseconds;
         # it is JSON parsing that would have cost something.
-        pm = None
+        pm = heads = None
+        pthink = ""
         if not _spk_player[0]:
-            pm = PLAYER_RX.search(body[:PLAYER_SCAN])
+            # the WHOLE body, not the first 256 KB: the marker sits ~17 KB in on the
+            # stock prompt, but a longer memory block pushes it past any fixed window,
+            # and a name that is never read is a name that is never right. Only until
+            # it is found once, and a regex over a few hundred KB is microseconds.
+            pm = PLAYER_RX.search(body)
+            if not pm and PLAYER_THINK + name.encode("utf-8", "replace") in body:
+                pthink = name          # this request thinks AS its own speaker: player
+            if not pm and not pthink:
+                heads = [h.decode("utf-8", "replace").strip()
+                         for h in HEADING_RX.findall(body)[:14]]
         with _spk_lock:
             _spk_recent.append((time.time(), name))
             del _spk_recent[:-12]
             if pm:
                 _spk_player[0] = pm.group(1).decode("utf-8", "replace").strip()
+            elif pthink:
+                _spk_player[0] = pthink
+            elif heads is not None:
+                _spk_heads[:] = heads
+        return name
     except Exception:
         pass
+    return ""
+
+
+def speaker_for_text(text):
+    """Which character's own reply these words came from.
+
+    One voice sample shared by two characters cannot tell them apart, and the
+    pending-name queue only ORDERS them - so when Faralda and Saadia share a
+    sample and their turns interleave, the oldest-first pairing hands the spoken
+    line the other one's name, while the thought and the action, which carry
+    their own name from the prompt, stay right. That is exactly the report.
+
+    The WORDS are not ambiguous. Every reply is already kept under the name the
+    prompt itself gave, and this line is a piece of one of them. Exactly one
+    match names the voice; none, or several, leaves it to the older rules -
+    a wrong name is worse than a voicetype. (patch183)
+    """
+    nc = _th_norm(text)
+    if len(nc) < 6:
+        return ""
+    now = time.time()
+    hits = []
+    for who, ent in list(REPLY_FULL.items()):
+        try:
+            nf, when = ent
+        except Exception:
+            continue
+        if not who or not nf or now - when > SPEAKER_TEXT_S:
+            continue
+        if _th_member(nc, nf):
+            hits.append(who)
+            if len(hits) > 1:
+                return ""
+    return hits[0] if hits else ""
+
+
+def tts_pin_speaker(path, text):
+    """Name this voice from the line it is about to speak, and hold that name
+    for the rest of the line's chunks. The player's own voice is never learned
+    and never pinned."""
+    if tts_is_player(path):
+        return ""
+    leaf = re.split(r"[\\/]", str(path or ""))[-1]
+    key = os.path.splitext(leaf)[0].strip().lower()
+    if not key:
+        return ""
+    who = speaker_for_text(text)
+    if not who:
+        return ""
+    with _spk_lock:
+        _spk_pin[key] = (who, time.time())
+        if _spk_voices.get(key) != who:
+            _spk_voices[key] = who
+            panel_log("[tts] voice %s is %s - named by the line itself" % (key, who))
+        # the name is spoken for: it must not also pair with somebody else's line
+        for idx in range(len(_spk_recent) - 1, -1, -1):
+            if _spk_recent[idx][1] == who:
+                del _spk_recent[idx]
+    return who
 
 
 def speaker_for_voice(voicetype):
@@ -4347,24 +7868,81 @@ def speaker_for_voice(voicetype):
         return ""
     if key in PLAYER_VOICES:
         # named by the prompt where it says so, otherwise just "Player". Never learned,
-        # and never a name taken from a conversation.
-        return _spk_player[0] or "Player"
+        # and never a name taken from a conversation - the player's own voice speaks
+        # BEFORE the next dialogue request, so pairing it with one hands them the
+        # previous character's name.
+        if _spk_player[0]:
+            return _spk_player[0]
+        player_name_unread()
+        return "Player"
     now = time.time()
     with _spk_lock:
+        # a name the line's own words gave outranks both the queue and the cache
+        pin = _spk_pin.get(key)
+        if pin and now - pin[1] <= SPEAKER_PIN_S:
+            return pin[0]
         known = _spk_voices.get(key)
-        if known:
-            return known                         # already paired; never re-learn
         # CONSUME the request it pairs with. Without that, a second voicetype asked
-        # inside the same window inherited the same name - and the pairing is cached,
-        # so one wrong guess would stick.
-        for idx in range(len(_spk_recent) - 1, -1, -1):
+        # inside the same window inherited the same name.
+        # A FRESH pairing wins over the cached one. Generic voicetypes - femalecommoner,
+        # maleguard - are shared by dozens of characters, and caching for good meant the
+        # first commoner to speak owned that voice for the session and every commoner
+        # after them wore their name. The cache is now the fallback, for a line that
+        # arrives with no dialogue request behind it.
+        # One character has one voice. `femalecommoner is Serana` happened because a
+        # spoken line with no dialogue request behind it took whatever name was pending,
+        # and Serana's was - she already owned `serana`. A name already bound elsewhere
+        # is not available, so the line falls back to its voicetype instead of wearing
+        # somebody else's name.
+        taken = {v: k for k, v in _spk_voices.items()}
+        # OLDEST first. Lines are spoken in the order their dialogue was generated, so the
+        # first line to arrive belongs to the first request that came in. Taking the newest
+        # handed two NPCs speaking in quick succession each other's names - which is what
+        # "the names get mixed up" was.
+        for idx in range(len(_spk_recent)):
             when, name = _spk_recent[idx]
-            if now - when <= SPEAKER_PAIR_S:
-                _spk_voices[key] = name
+            if now - when > SPEAKER_PAIR_S:
+                continue
+            if taken.get(name, key) != key:
+                # Silent until now, which is why "the names are wrong" and "the names
+                # are missing" looked the same from a log. Say which rule fired.
+                panel_log("[tts] voice %s: not naming it %s - that name already belongs "
+                          "to %s" % (key, name, taken.get(name)))
+                continue
+            if True:
                 del _spk_recent[idx]
-                panel_log("[tts] voice %s is %s" % (key, name))
+                if name != known:
+                    _spk_voices[key] = name
+                    panel_log("[tts] voice %s is %s" % (key, name))
+                else:
+                    _spk_voices[key] = name
                 return name
-        return ""
+        if not known:
+            panel_log("[tts] voice %s: no character named it - no dialogue request "
+                      "arrived within %ds" % (key, int(SPEAKER_PAIR_S)))
+        return known or ""
+
+
+_PLAYER_SAID = [False]         # the message below is worth saying once, not per line
+
+
+def player_name_unread():
+    """Say - once - that the player's line is going out unnamed, and what was there.
+
+    Silence here is what made this look like it worked: the thought under a reply is
+    named from that request's own "You are ..." line, so a player thought reads right
+    while every spoken line says "Player". The two names come from different places and
+    only one of them can fail, quietly.
+    """
+    if _PLAYER_SAID[0]:
+        return
+    _PLAYER_SAID[0] = True
+    with _spk_lock:
+        heads = list(_spk_heads)
+    panel_log("[tts] the player's line is going out as \"Player\": no \"## <name>'s "
+              "Party\" heading has been seen in a dialogue request yet."
+              + (("  The last one headed its sections: " + "  |  ".join(heads))
+                 if heads else "  No dialogue request has been carried yet."))
 
 
 def tts_voice_name(path):
@@ -4516,6 +8094,7 @@ TTSW = TtsWrapper()
 
 
 PANEL_START = time.time()      # a log older than this is a previous session
+SESSION_STAMP = time.strftime("%Y%m%d-%H%M%S")   # same shape as the fleet logs
 _tts_models_cache = {"t": 0.0, "dir": "", "items": []}
 
 
@@ -4615,7 +8194,22 @@ ACPP_REPO = "0xShug0/audio.cpp"
 _acpp_find = {"root": "", "t": 0.0, "exe": ""}
 
 
-def find_acpp_exe(root):
+def acpp_profile(st):
+    """Which build the user picked. Unknown values fall back to the safe one."""
+    p = str((st or {}).get("ttsAcppProfile") or "balance").strip().lower()
+    return p if p in ACPP_PROFILES else "balance"
+
+
+def acpp_profiles_present(root):
+    """The build profiles actually unpacked under an engine root, in a fixed order."""
+    root = (root or "").strip()
+    if not root or not os.path.isdir(root):
+        return []
+    return [p for p in ACPP_PROFILES
+            if os.path.isfile(os.path.join(root, p, ACPP_EXE_NAME))]
+
+
+def find_acpp_exe(root, profile=""):
     """Locate audiocpp_server.exe under a root folder.
 
     Same shape as the llama.cpp folder setting: the user names a FOLDER and the panel
@@ -4629,13 +8223,23 @@ def find_acpp_exe(root):
     if not root or not os.path.isdir(root):
         return ""
     now = time.time()
-    if _acpp_find["root"] == root and now - _acpp_find["t"] < 30 and _acpp_find["exe"]:
+    key = "%s|%s" % (root, profile or "")
+    if _acpp_find["root"] == key and now - _acpp_find["t"] < 30 and _acpp_find["exe"]:
         if os.path.isfile(_acpp_find["exe"]):
             return _acpp_find["exe"]
     hit = ""
+    # the profile asked for, then the profiles in a fixed order, then the flat layout an
+    # older install or a hand unzip leaves behind
+    for sub in ([profile] if profile else []) + list(ACPP_PROFILES):
+        cand = os.path.join(root, sub, ACPP_EXE_NAME)
+        if os.path.isfile(cand):
+            hit = cand
+            break
     direct = os.path.join(root, ACPP_EXE_NAME)
-    if os.path.isfile(direct):
+    if not hit and os.path.isfile(direct):
         hit = direct
+    if hit:
+        pass
     else:
         for cur, dirs, files in os.walk(root):
             if cur[len(root):].count(os.sep) > 4:
@@ -4647,7 +8251,7 @@ def find_acpp_exe(root):
                     break
             if hit:
                 break
-    _acpp_find.update(root=root, t=now, exe=hit)
+    _acpp_find.update(root=key, t=now, exe=hit)
     return hit
 
 
@@ -4670,16 +8274,33 @@ def find_acpp_exe(root):
 # "win" not "windows", so win64 matches too. The profile is a PREFERENCE, not a
 # requirement: if the profile names ever change, any Windows CUDA build still beats
 # failing outright.
+# (label, must contain, must NOT contain, preferred in order, required, subfolder)
+#
+# The runtime carries the big shared CUDA DLLs and unpacks FLAT at the engine root. Each
+# build profile is only the two executables, so they go in their own subfolder and the
+# server is started with the root on PATH - that is how the exes find the shared DLLs
+# without keeping a 700 MB copy of them per profile.
+#
+# "fast" is not required: if a release ever ships without it, balance alone still works
+# and the page simply offers one choice.
 HIGGS_ENGINE_ASSETS = (
-    ("runtime", ("win", "cuda", "runtime"), (), (), False),
-    ("CUDA build", ("win", "cuda"), ("runtime", "debug", "symbol", "cpu"),
-     ("balance", "portable", "fast"), True),
+    ("runtime", ("win", "cuda", "runtime"), (), (), False, ""),
+    ("balanced build", ("win", "cuda", "balance"), ("runtime", "debug", "symbol", "cpu"),
+     (), True, "balance"),
+    ("fast build", ("win", "cuda", "fast"), ("runtime", "debug", "symbol", "cpu"),
+     (), False, "fast"),
 )
+ACPP_PROFILES = ("balance", "fast")
 HIGGS_GGUF_REPO = "audio-cpp/audio.cpp-gguf"
 HIGGS_GGUF_PATH = "Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf"
 HIGGS_NEED_BYTES = 8 * 1024 * 1024 * 1024        # ~5.1 GB model plus room to unzip
 HIGGS_INSTALL = {"running": False, "cancel": False, "step": "", "pct": 0.0,
                  "error": "", "done": False, "engine": "", "model": "",
+                 # when the record last moved. The page turns it into "nothing new
+                 # for Ns", which is the one reading that separates a display that
+                 # has stopped asking from an install that has gone quiet - three
+                 # patches went by without a way to tell those two apart.
+                 "at": 0.0,
                  "warn": ""}
 
 
@@ -4691,8 +8312,23 @@ def higgs_paths(cfg=None):
 
 
 def _hi_log(msg):
+    """One step of the install, to the terminal AND to the page.
+
+    `TTSW.log` raises a "tail" event, which refreshes the terminals and nothing
+    else. The bar and the step line above them are drawn from `state.higgsInstall`,
+    which only arrives with a "state" event - so the terminal scrolled through a
+    5 GB download while the bar sat at whatever it read when the page last loaded,
+    and switching tabs or refreshing appeared to "fix" it because both reload the
+    state. Two views of one thing need one announcement each.
+
+    No throttle here: the only caller that repeats is the download loop, which
+    already rate-limits itself to one line a second.
+    """
     HIGGS_INSTALL["step"] = msg
+    HIGGS_INSTALL["at"] = time.time()
     TTSW.log(msg)
+    if HIGGS_INSTALL["running"]:
+        sse_notify("state")
 
 
 def _hi_get(url, headers=None):
@@ -4730,6 +8366,7 @@ def _hi_download(url, dest, label):
             if total and time.time() - last > 1.0:
                 last = time.time()
                 HIGGS_INSTALL["pct"] = 100.0 * done / total
+                HIGGS_INSTALL["at"] = time.time()
                 _hi_log("   %s  %.0f%%  (%.0f of %.0f MB)"
                         % (label, HIGGS_INSTALL["pct"], done / 1e6, total / 1e6))
     if total and done < total:
@@ -4738,15 +8375,28 @@ def _hi_download(url, dest, label):
     return dest
 
 
-def _hi_unzip(src, dest):
+def _hi_unzip(src, dest, label=""):
     """Extract, refusing any entry that would land outside dest.
 
     A zip may name ..\\..\\windows\\system32 and a naive extractall will write it.
+
+    It also SAYS SO while it works. This ran silent, and the CUDA archive takes long
+    enough on a Windows disk with a scanner in the way that the display sat on the
+    "Unpacking ..." line with the bar wherever the download had left it - which read
+    as the panel having died, and cost four patches spent looking at the page. The
+    page was right: nothing had changed. Progress is by uncompressed bytes, and the
+    bar restarts at 0 for this phase because it is a phase, not a continuation.
     """
     import zipfile
     dest = os.path.realpath(dest)
     os.makedirs(dest, exist_ok=True)
     with zipfile.ZipFile(src) as z:
+        _files = [i for i in z.infolist()
+                  if not i.filename.replace("\\", "/").endswith("/")]
+        _total = sum(int(i.file_size or 0) for i in _files) or 1
+        _done, _last, _n = 0, 0.0, 0
+        HIGGS_INSTALL["pct"] = 0.0
+        HIGGS_INSTALL["at"] = time.time()
         for info in z.infolist():
             name = info.filename.replace("\\", "/")
             if name.endswith("/"):
@@ -4764,6 +8414,16 @@ def _hi_unzip(src, dest):
             os.makedirs(os.path.dirname(out), exist_ok=True)
             with z.open(info) as fh, open(out, "wb") as f:
                 shutil.copyfileobj(fh, f)
+            _done += int(info.file_size or 0)
+            _n += 1
+            # same cadence as the download, and the same reason: one line a second
+            # is a heartbeat, one line a file is a wall of text
+            if time.time() - _last > 0.7:
+                _last = time.time()
+                HIGGS_INSTALL["pct"] = 100.0 * _done / _total
+                _hi_log("   unpacking %s  %.0f%%  (%d of %d files, %.0f of %.0f MB)"
+                        % (label or os.path.basename(src), HIGGS_INSTALL["pct"],
+                           _n, len(_files), _done / 1e6, _total / 1e6))
 
 
 def _hi_free_bytes(path):
@@ -4807,10 +8467,10 @@ def higgs_install_worker():
                 return (len(prefer), len(low))
             return sorted(hits, key=rank)[0] if hits else None
         chosen, missing = [], []
-        for label, need, avoid, prefer, required in HIGGS_ENGINE_ASSETS:
+        for label, need, avoid, prefer, required, sub in HIGGS_ENGINE_ASSETS:
             a = pick(need, avoid, prefer)
             if a:
-                chosen.append(a)
+                chosen.append((a, sub))
             elif required:
                 missing.append("%s (needs %s)" % (label, " + ".join(need)))
             else:
@@ -4839,13 +8499,15 @@ def higgs_install_worker():
                 except OSError as e:
                     raise RuntimeError("could not clear %s: %s - close anything using it "
                                        "and try again" % (victim, e))
-        for a in chosen:
+        for a, sub in chosen:
             name = a["name"]
             zp = os.path.join(tmp, name)
+            dest = os.path.join(paths["engine"], sub) if sub else paths["engine"]
             _hi_log("\u2B07 %s (%.0f MB)" % (name, (a.get("size") or 0) / 1e6))
             _hi_download(a["browser_download_url"], zp, name)
-            _hi_log("\U0001F4C2 Unpacking %s" % name)
-            _hi_unzip(zp, paths["engine"])
+            _hi_log("\U0001F4C2 Unpacking %s%s" % (name, (" into %s\\" % sub) if sub else ""))
+            os.makedirs(dest, exist_ok=True)
+            _hi_unzip(zp, dest, name)
             try:
                 os.remove(zp)
             except OSError:
@@ -4949,6 +8611,7 @@ def higgs_present(cfg=None):
     wired = bool((st.get("ttsAcppDir") or "").strip()
                  and (st.get("ttsAcppModel") or "").strip())
     return {"exe": exe, "models": models[:8], "wired": wired,
+            "profiles": acpp_profiles_present(paths["engine"]),
             "adoptable": bool(exe and models and not wired)}
 
 
@@ -4989,7 +8652,7 @@ def api_higgs_install(body):
         HIGGS_INSTALL.update(done=False, error="", step="", warn="")
         return {"ok": True}
     HIGGS_INSTALL.update(running=True, cancel=False, step="", pct=0.0, error="",
-                         done=False, engine="", model="", warn="")
+                         done=False, engine="", model="", warn="", at=time.time())
     threading.Thread(target=higgs_install_worker, daemon=True).start()
     return {"ok": True}
 
@@ -5011,7 +8674,7 @@ def acpp_local_version(cfg=None):
     tag = (st.get("ttsAcppVersion") or "").strip()
     if tag:
         return tag
-    exe = find_acpp_exe(st.get("ttsAcppDir", ""))
+    exe = find_acpp_exe(st.get("ttsAcppDir", ""), acpp_profile(st))
     if not exe:
         return ""
 
@@ -5036,7 +8699,7 @@ def acpp_local_version(cfg=None):
 
     # 3. the server's own startup output, which the panel already captures
     try:
-        with open(os.path.join(log_dir(cfg), TTS_SERVER_LOG_NAME), "rb") as f:
+        with open(tts_server_log_newest(cfg), "rb") as f:
             head = f.read(65536).decode("utf-8", "replace")
         for line in head.splitlines()[:120]:
             if re.search(r"version|build|audio\.cpp", line, re.I):
@@ -5095,7 +8758,7 @@ def api_acpp_update(body=None):
     _cfg = load_config()
     _st = _cfg.get("settings", {})
     out["local"] = acpp_local_version(_cfg)      # recorded at install, or read on disk
-    exe = find_acpp_exe(_st.get("ttsAcppDir", ""))
+    exe = find_acpp_exe(_st.get("ttsAcppDir", ""), acpp_profile(_st))
     if exe:
         out["exe"] = exe
         for flag in ("--version", "-v"):     # not documented; try, do not insist
@@ -5151,7 +8814,7 @@ def tts_diagnose(cfg=None, since=None):
     single-architecture CUDA build, each time unrecognisable from the panel's side.
     """
     try:
-        path = os.path.join(log_dir(cfg or load_config()), TTS_SERVER_LOG_NAME)
+        path = tts_server_log_newest(cfg or load_config())
         with open(path, "rb") as f:
             f.seek(0, 2)
             end = f.tell()
@@ -5166,6 +8829,85 @@ def tts_diagnose(cfg=None, since=None):
         if needle in tail:
             return hint
     return ""
+
+
+# SkyrimNet's Chatterbox page sends its whole slider set with every line. Matched by
+# POSITION against a rendered page - every value below was read off a labelled control:
+# Pace 0.35, Top P 1.00, Min P 0.05, Temperature 0.80, Repetition Penalty 1.20,
+# Expressiveness 0.50, Seed -1. Position is all a Gradio call gives, so each is range
+# checked as well: a list that changes shape produces nothing rather than nonsense.
+SN_TTS_FIELDS = (
+    (19, "pace", 0.0, 4.0),
+    (20, "top_p", 0.0, 1.0),
+    (22, "min_p", 0.0, 1.0),
+    (23, "temperature", 0.0, 4.0),
+    (24, "repetition_penalty", 0.5, 4.0),
+    (25, "expressiveness", 0.0, 4.0),
+    (26, "seed", -1, 1 << 62),
+    (27, "seed_used", -1, 1 << 62),
+)
+# What audio.cpp's speech endpoint takes. The REQUEST ignores a name it does not know -
+# established by patch60 - so a value here is either honoured or dropped, never fatal.
+# pace and expressiveness have no counterpart and are observed but not forwarded.
+SN_TTS_FORWARD = ("temperature", "top_p", "min_p", "repetition_penalty")
+_SN_TTS_SEEN = {}
+
+
+def sn_tts_params(fields):
+    """SkyrimNet's own speech settings, read out of the call it makes."""
+    out = {}
+    for idx, name, lo, hi in SN_TTS_FIELDS:
+        if idx >= len(fields or []):
+            continue
+        v = fields[idx]
+        if isinstance(v, bool) or not isinstance(v, (int, float)):
+            continue
+        if not (lo <= v <= hi):
+            continue
+        if isinstance(v, float):
+            out[name] = round(v, 4)
+        elif abs(v) > (1 << 53):
+            # A seed is an int64 and JavaScript holds 53 bits of integer, so a number
+            # this size arrives in the browser rounded - 701521338218674266 was shown as
+            # ...674300. A wrong seed is worse than none when the point of reading it is
+            # to pin it, so it travels as text.
+            out[name] = str(v)
+        else:
+            out[name] = v
+    return out
+
+
+def sn_tts_observed():
+    return dict(_SN_TTS_SEEN)
+
+
+def tts_fields_note(fields):
+    """Every argument SkyrimNet sent, as one readable line.
+
+    tts_pick_fields reads two of these and discards the rest unread - which is where
+    SkyrimNet's own TTS settings would be, if it sends them. A Gradio call is a
+    positional list, so the only way to find out what is in it is to look.
+
+    The reference dict is summarised rather than printed: it carries a file path and
+    sometimes base64 audio, and neither belongs in a log line.
+    """
+    out = []
+    for i, f in enumerate(fields or []):
+        if isinstance(f, dict):
+            keys = ",".join(sorted(str(k) for k in list(f)[:6]))
+            out.append("[%d] dict{%s}" % (i, keys))
+        elif isinstance(f, str):
+            s = " ".join(f.split())
+            out.append("[%d] %r" % (i, s[:40] + ("..." if len(s) > 40 else "")))
+        elif isinstance(f, bool):
+            out.append("[%d] %s" % (i, "true" if f else "false"))
+        elif isinstance(f, (int, float)):
+            out.append("[%d] %s" % (i, f))          # a slider value looks like this
+        elif f is None:
+            out.append("[%d] null" % i)
+        else:
+            out.append("[%d] %s" % (i, type(f).__name__))
+    return " ".join(out)
 
 
 def tts_pick_fields(fields):
@@ -5252,12 +8994,14 @@ def tts_ref_canonical(path):
     Normalising at save_upload is not enough on its own: SkyrimNet HEADs the path first
     and skips the upload when it gets a 200, so a file cached by an older build is never
     re-sent and never re-normalised. Rewrite it in place the first time it is used.
-    After that the check costs 44 bytes.
+    After that the check costs 44 bytes and a stat.
     """
     try:
         with open(path, "rb") as f:
-            head = f.read(44)
-        if len(head) >= 40 and head[:4] == b"RIFF" and head[36:40] == b"data":
+            head = f.read(TTS_WAV_HEAD)
+        if head[:4] != b"RIFF":
+            return path                      # not a WAV: normalising would return it as-is
+        if tts_wav_head_ok(head, os.path.getsize(path)):
             return path                      # canonical already
         with open(path, "rb") as f:
             data = f.read()
@@ -5320,6 +9064,11 @@ def tts_acpp_config(cfg=None):
         slots = max(1, min(int(str(st.get("ttsAcppRefSlots", "64")).strip() or 64), 1024))
     except Exception:
         slots = 64
+    try:
+        busy_ms = max(2000, min(int(str(st.get("ttsAcppBusyMs", "9000")).strip() or 9000),
+                                60000))
+    except Exception:
+        busy_ms = 9000
     return json.dumps({
         "host": "0.0.0.0",
         "port": tts_server_port(cfg),
@@ -5334,13 +9083,14 @@ def tts_acpp_config(cfg=None):
             "mode": "offline",
             # SkyrimNet gives TTS about 15s. The server queues a second request behind
             # the first, so without a bound a slow line stalls every line after it.
-            "busy_timeout_ms": 20000,
+            "busy_timeout_ms": busy_ms,
             # The engine keeps encoded references in a cache whose default size is ONE.
             # A conversation alternates speakers, so at one slot practically every line
             # re-encodes its reference. One entry per voice you actually meet.
-            "session_options": {
-                "%s.reference_cache_slots" % fam: slots,
-            },
+            # reference_cache_slots is the ONLY option this family accepts. Anything
+            # else and the server exits before it loads - which is why there are no
+            # sampling controls here any more.
+            "session_options": {"%s.reference_cache_slots" % fam: slots},
         }],
     }, indent=2)
 
@@ -5353,7 +9103,82 @@ def tts_acpp_speak(url_base, model_id, text, ref_path, ref_text=""):
     the panel and audio.cpp are on the same machine, which they are by construction: the
     panel starts the process.
     """
-    body = {"model": model_id, "input": text}
+    last = None
+    for _try in range(3):
+        _t0 = time.time()
+        try:
+            data, hdrs = _tts_acpp_once(url_base, model_id, text, ref_path, ref_text,
+                                        attempt=_try + 1)
+        except RuntimeError as e:
+            _spent = time.time() - _t0
+            # "reached max_tokens before EOC" is the model failing to stop, not a bad
+            # request - it is sampled, so the same line usually succeeds next time.
+            _msg = str(e)
+            if _try >= 2 or not ("max_tokens" in _msg or "EOC" in _msg):
+                if "max_tokens" in _msg or "EOC" in _msg:
+                    # the final failure was invisible to the record: attempts one
+                    # and two were written and the third raised past the recorder
+                    _cfgf = load_config()
+                    eoc_record(text,
+                               AUTOCAL_CAP[0]
+                               or acpp_token_cap(text, _cfgf.get("settings", {}) or {}),
+                               _spent, _try + 1, settled=False, cfg=_cfgf)
+                raise
+            _cfg0 = load_config()
+            _st1 = _cfg0.get("settings", {}) or {}
+            eoc_record(text, AUTOCAL_CAP[0] or acpp_token_cap(text, _st1), _spent,
+                       _try + 1, settled=(_try < 2), cfg=_cfg0)
+            # the cap ACTUALLY sent, not the fixed guard: this line used to print the
+            # guard whatever the auto calibration had chosen, and the record kept the
+            # same wrong number - which is the number a calibration then reads
+            TTSW.log("   \u21BA the model ran past the end of the line - %.1fs lost "
+                     "(cap %d tokens, server limit %s) - trying again"
+                     % (_spent, AUTOCAL_CAP[0] or acpp_token_cap(text, _st1),
+                        _st1.get("ttsAcppBusyMs", "?")))
+            _nxt = tts_samplers(_cfg0.get("settings", {}) or {}, _try + 2)
+            if str((_cfg0.get("settings", {}) or {}).get("ttsRetrySafe", "on")).lower() == "on":
+                TTSW.log("      steadier for the retry: %s" % tts_samp_note(_nxt))
+            time.sleep(0.2)
+            continue
+        return data, hdrs
+    return last
+
+
+TTS_SAMP_LAST = {}              # what the last request carried, for the record
+
+
+def _tts_acpp_once(url_base, model_id, text, ref_path, ref_text="", attempt=1):
+    # A build that does not know this field ignores it, and nothing changes; one that
+    # does stops a runaway at roughly twice the length the line actually needs.
+    # Sent under every name the server might read it as. A build that knows none of them
+    # ignores all of them, which is why busy_timeout_ms is the bound that has to work.
+    _st0 = load_config_cached().get("settings", {}) or {}   # read-only here
+    _cap, _capnote, _est = tts_auto_cap(text, _st0)
+    if attempt > 1:
+        # resending the SAME cap can only fail the same way - the owner's 12:12
+        # log: three identical requests, three identical failures. Half again
+        # per attempt, bounded well above any real line. (patch181)
+        _cap = int(min(TTS_CAP_CEILING, _cap * (1.5 ** (attempt - 1))))
+        if _capnote:
+            _capnote += "  \u21BA retry cap \u2192 %d" % _cap
+    AUTOCAL_EST[0] = _est          # the bare estimate this line was judged against
+    AUTOCAL_CAP[0] = _cap
+    if _capnote:
+        try:
+            TTSW.log("   \U0001F3AF " + _capnote)
+        except Exception:
+            pass
+    body = {"model": model_id, "input": text,
+            "max_new_tokens": _cap, "max_tokens": _cap,
+            "session_options": {"higgs_audio_tts.max_new_tokens": _cap}}
+    # SkyrimNet's own sliders, then anything set here, then - on a retry - the
+    # steadier profile. ONE rule, in tts_samplers, so what is recorded is what was
+    # sent.
+    _samp = tts_samplers(_st0, attempt)
+    body.update(_samp)
+    TTS_SAMP_LAST.clear()
+    TTS_SAMP_LAST.update(_samp)
+    TTS_SAMP_LAST["attempt"] = attempt
     if ref_path:
         body["voice_ref"] = ref_path
         if ref_text:
@@ -5383,6 +9208,788 @@ def tts_server_port(cfg=None):
         return 1240
 
 
+def ptipme_log_path():
+    return os.path.join(log_dir(), "%s_ptipme.log" % SESSION_STAMP)
+
+
+def ptipme_log(who, port, prompt, line, answer, secs, cached=None):
+    """What was sent, and what came back. Nothing else.
+
+    Not the reasoning - that has its own terminal. This one exists to answer "what did
+    the model actually see, and what did it actually say", which is the only pair of
+    facts that explains a bad tag.
+    """
+    try:
+        with open(ptipme_log_path(), "a", encoding="utf-8") as f:
+            f.write("%s\n[%s] %s  [%s]  %.3f sec  %s\n%s\n"
+                    % ("=" * 74, _stamp(), who, port, secs,
+                       cache_note(cached, None) if cached is None else
+                       "cache %d of the prompt reused" % cached, "=" * 74))
+            f.write("--- INPUT ---\n%s\n" % str(prompt or "").strip())
+            if line:
+                f.write("\n%s\n" % str(line).strip())
+            f.write("\n--- OUTPUT ---\n%s\n\n" % (str(answer or "").strip() or "(nothing)"))
+    except Exception:
+        pass
+
+def tag_output_line(who, answer, cfg=None):
+    """Write what PTI or PME chose as a branch under its own line.
+
+    Formatted like a spoken line so the terminal paints it with the same tree - it IS
+    the same idea: something the panel produced, hanging off the line above it. That
+    line above is the PTI or PME record the call just wrote, which is what the branch
+    points at.
+    """
+    key = TAG_OUT_KEY.get(str(who).upper())
+    st = (cfg or load_config()).get("settings", {})
+    if not key or str(st.get(key, "off")).lower() != "on":
+        return
+    rows = [" ".join(l.split())[:300] for l in str(answer or "").splitlines()
+            if l.strip()]
+    if not rows:
+        return
+    try:
+        sess = getattr(PROXY, "session", None) or SESSION_STAMP
+        with open(os.path.join(log_dir(), "%s_dashboard.log" % sess), "a",
+                  encoding="utf-8") as f:
+            for i, r in enumerate(rows):
+                branch = TREE_PAD + (TREE_END if i == len(rows) - 1 else TREE_MID)
+                f.write("[%s] %s %s %s: \u3030\uFE0F %s \u3030\uFE0F\n"
+                        % (_stamp(), branch, PANDORUM_MARK, who, r))
+    except Exception:
+        pass
+
+
+def cache_note(cached, tok_in):
+    """How much of this prompt the server did not have to compute.
+
+    Only reached for a provider with Cache switched on - a figure beside one that never
+    asked for a slot reads as a fault rather than as a setting nobody turned on.
+    """
+    if cached is None:
+        return ""
+    if not tok_in:
+        return "cache %d" % cached
+    total = cached + int(tok_in)
+    return "cache %d/%d %d%%" % (cached, total, round(100.0 * cached / total) if total else 0)
+
+
+def proxy_line_text(mark, title, port, tok_in, tok_out, tn, pf, dc, secs, extra="",
+                    cached=None):
+    """One Proxy-terminal record. ONE shape, for provider traffic and for the calls the
+    panel makes itself - it used to be written out twice, and only one of the two ever
+    had anything to put in the prompt-speed column.
+    """
+    return ("[%s] %s %-15s [%s]  %6s / %5s %-8s tok  %5s / %3s tps  %8.3f sec  %s"
+            % (_stamp(), mark, title, port,
+               tok_in if tok_in is not None else "?",
+               tok_out if tok_out is not None else "?",
+               ("(~%d)" % tn) if tn else "",
+               ("%.0f" % float(pf)) if pf else "?",
+               ("%.0f" % float(dc)) if dc else "?",
+               secs, ((extra + "  ") if extra else "")
+                     + (cache_note(cached, tok_in) if cached is not None else ""))
+            ).rstrip()
+
+
+def acpp_report():
+    """Everything a maintainer would want about how audio.cpp has behaved this session.
+
+    Written to be pasted into an issue: what was asked for, what came back, how long it
+    took, and how often. Reads the panel's own logs - no new instrumentation on the hot
+    path, so producing it costs nothing while speech is running.
+    """
+    cfg = load_config()
+    st = cfg.get("settings", {})
+    out = ["PandorumLLM audio.cpp report", "=" * 64, ""]
+    _b = BUILD_ID if isinstance(BUILD_ID, str) else (BUILD_ID or {}).get("sha", "?")
+    out.append("panel        %s   build %s" % (APP_VER_UI, _b))
+    out.append("audio.cpp    %s" % (st.get("ttsAcppVersion") or "(not recorded)"))
+    out.append("build        %s" % acpp_profile(st))
+    out.append("model        %s"
+               % (re.split(r"[\\\\/]", str(st.get("ttsAcppModel") or ""))[-1] or "?"))
+    out.append("device       %s" % tts_gpu_label(cfg))
+    out.append("ref slots    %s" % (st.get("ttsAcppRefSlots") or "?"))
+    out.append("line limit   %s ms" % (st.get("ttsAcppBusyMs") or "?"))
+    out.append("")
+    srv = tts_server_log_newest(cfg)
+    if srv:
+        try:
+            with open(srv, "r", encoding="utf-8", errors="replace") as f:
+                head = f.read(8000)
+            for line in head.split("\n"):
+                if re.search(r"CUDA devices|compute capability|ggml_cuda_init", line):
+                    out.append("  " + line.strip()[:110])
+        except OSError:
+            pass
+        out.append("")
+    lines = fails = runaway = retried = 0
+    gen, audio, detail, say = [], [], [], None
+    try:
+        with open(os.path.join(log_dir(), TTS_LOG_NAME), "r", encoding="utf-8",
+                  errors="replace") as f:
+            body = f.read()
+    except OSError:
+        body = ""
+    for blk in re.split(r"\n(?=\[\d\d:\d\d:\d\d)", body):
+        m = re.search("\u3030\ufe0f (.*?) \u3030\ufe0f", blk)
+        if m:
+            say = m.group(1)
+            lines += 1
+        if "ran past the end of the line" in blk:
+            runaway += 1
+            retried += 1
+        if "not this speaker" in blk:
+            retried += 1
+        if "TTS failed" in blk:
+            fails += 1
+            detail.append(("FAILED", say or "?", blk.strip().split("\n")[0][-120:]))
+        r = re.search("([0-9.]+)x realtime \\(([0-9.]+)s \u2192 ([0-9.]+)s audio\\)", blk)
+        if r and say:
+            gen.append(float(r.group(2)))
+            audio.append(float(r.group(3)))
+            if float(r.group(2)) > 8.0:
+                detail.append(("SLOW", say, "%ss of work for %ss of audio"
+                               % (r.group(2), r.group(3))))
+            say = None
+    out.append("this session")
+    out.append("  lines spoken            %d" % lines)
+    out.append("  outright failures       %d" % fails)
+    out.append("  ran past end of line    %d" % runaway)
+    out.append("  regenerations           %d" % retried)
+    if gen:
+        g = sorted(gen)
+        out.append("  generation time         median %.2fs   worst %.2fs"
+                   % (g[len(g) // 2], g[-1]))
+        out.append("  audio produced          %.1fs in total" % sum(audio))
+    out.append("")
+    if detail:
+        out.append("lines that went wrong")
+        for kind, said, why in detail[:40]:
+            out.append("  [%s] %s" % (kind, said[:96]))
+            out.append("         %s" % why[:110])
+        out.append("")
+    out.append("to reproduce without the panel:")
+    out.append("  audiocpp_cli --task tts --family higgs_audio_tts --model <gguf>")
+    out.append("      --backend cuda --voice-ref <wav> --text \"<a line above>\" --out out.wav")
+    return "\n".join(out)
+
+
+def live_llm_servers(cfg=None):
+    """Server cards that could answer: enabled, with a model chosen.
+
+    NOT "currently serving". A card is a standing choice and a server comes and goes;
+    offering only what happens to be up would empty the list every time the fleet is
+    restarted, and the state is reported beside each one anyway.
+    """
+    # None means "load it"; an empty dict is a CALLER'S answer and is kept -
+    # absent and empty are different answers (gotcha 37)
+    cfg = load_config() if cfg is None else cfg
+    out = []
+    for s in cfg.get("slots", []):
+        if s.get("disabled") or s.get("enabled") is False:
+            continue
+        model = str((s.get("params") or {}).get("model") or "").strip()
+        if not model:
+            continue                       # a card with no model cannot answer anything
+        port = (parse_ps1_port(s.get("script") or "") if s.get("script") else None) \
+            or s.get("port")
+        state = str(slot_status(int(port)).get("state")) if port else "unknown"
+        out.append({"id": s.get("id"), "label": s.get("label") or s.get("id"),
+                    "port": int(port) if port else 0, "state": state,
+                    "model": os.path.basename(model.replace("\\", "/"))})
+    return out
+
+
+# The panel's own model jobs, as they read in the Proxy terminal. Each is a
+# generation like any other - it costs a server exactly what a provider's does - so
+# each wears a title and appears in the same record rather than happening unseen.
+# Titles are 13 characters or fewer: proxy_line_text pads the name to that width and
+# a longer one shifts every column after it.
+PANEL_JOBS = {
+    "diag":  ("Diagnose", "\U0001F50E"),     # reads the failures and says what they show
+    "calib": ("Calibrate", "\U0001F39A"),    # chooses the settings they point at
+}
+
+
+def diag_route(port, cfg=None, thinking=False, job="diag"):
+    """A one-off route for the panel to speak to a server with. Same shape every other
+    caller uses, so it obeys the same thinking and sampler rules.
+
+    `job` names which of the panel's own questions this is, and nothing more: the id
+    keeps the three apart in the statistics, the title and mark put them in the Proxy
+    terminal. An unknown job reads as the diagnosis it used to be.
+    """
+    gpus = {g.get("id") for g in (cfg or {}).get("gpus", []) if g.get("id")}
+    slot = next((s for s in (cfg or {}).get("slots", [])
+                 if str(s.get("port") or "") == str(port)), {})
+    _title, _mark = PANEL_JOBS.get(str(job), PANEL_JOBS["diag"])
+    return {"id": str(job) if str(job) in PANEL_JOBS else "diag",
+            "title": _title, "emoji": _mark,
+            # a server told not to reason overrules the asking, here as anywhere
+            "thinking": bool(thinking) and slot_reasoning(slot) != "off",
+            "serverReasoning": slot_reasoning(slot), "priority": 1, "grammar": False,
+            "gpu": slot_gpu_key(slot, gpus), "overrides": {}, "sampSource": "server",
+            "panelOwned": True, "slot": None,
+            "upstream": "http://127.0.0.1:%d" % int(port), "server": str(port)}
+
+
+def panel_chat(job, port, cfg, thinking, system, user, cfg_max=300, timeout=120.0):
+    """One of the panel's own model jobs: asked, timed, and reported as a generation.
+
+    The fit and the two calibration questions called `_chat` straight and left no
+    trace anywhere a generation is read: a server would go busy for ten seconds with
+    nothing in the Proxy terminal to say who asked it. They go through the same
+    `PROXY.report` the proxy and the PTI/PME providers use, so a panel job cannot be
+    visible in one place and invisible in another - and the server statistics count
+    the work, because the server did it.
+
+    No gate is held. PTI and PME hold one because they sit on the speech path in
+    front of a player waiting to hear a line; these jobs are asked by someone
+    pressing a button and watching for the answer.
+    """
+    rt = diag_route(port, cfg, thinking, job=job)
+    # the budget is the user's, from the slider beside that job's Thinking switch.
+    # Diagnose reads the same record the sampler calibration reads - the docstring
+    # below calls it the same question asked by hand - so it spends the same budget.
+    _bk = "ttsCalibThinkBudget"
+    _tb = think_budget((cfg or {}).get("settings", {}) or {}, _bk, PANEL_THINK_BUDGET)
+    _t0 = time.time()
+    said, reason, timings, usage = _chat(rt, system, user, cfg_max=cfg_max,
+                                         timeout=timeout, think_budget=_tb)
+    PROXY.report(rt, reason, usage, timings, round((time.time() - _t0) * 1000), 0)
+    return said, reason, timings, usage
+
+
+# What a calibration may set, and the bounds it is held to. Nothing outside this table
+# is applied - a model asked for a number is a model that can return any number, and an
+# unbounded value reaching the engine is how the server stopped starting in patch68.
+CAL_KNOBS = (
+    ("chunkChars", "ttsChunkChars", int, 40, 400,
+     "characters of text sent to the engine at once"),
+    ("lineTimeLimitMs", "ttsAcppBusyMs", int, 2000, 60000,
+     "how long one line may generate before the server gives up"),
+    ("temperature", "ttsCalTemp", float, 0.1, 1.5,
+     "overrides SkyrimNet's, on the request"),
+    ("top_p", "ttsCalTopP", float, 0.1, 1.0, "overrides SkyrimNet's, on the request"),
+    ("repetition_penalty", "ttsCalRepPen", float, 1.0, 2.0,
+     "overrides SkyrimNet's, on the request"),
+    ("min_p", "ttsCalMinP", float, 0.0, 0.5, "overrides SkyrimNet's, on the request"),
+)
+CAL_REQUEST_KEYS = {"ttsCalTemp": "temperature", "ttsCalTopP": "top_p",
+                    "ttsCalRepPen": "repetition_penalty", "ttsCalMinP": "min_p"}
+# The chip key the page shows, and the setting behind it. Same four the engine is
+# sent, named the way the provider cards name theirs.
+TTS_SAMP_KEYS = {"temp": "ttsCalTemp", "top_p": "ttsCalTopP",
+                 "min_p": "ttsCalMinP", "rep": "ttsCalRepPen"}
+TTS_SAMP_FIELD = {"temp": "temperature", "top_p": "top_p",
+                  "min_p": "min_p", "rep": "repetition_penalty"}
+
+
+def tts_samplers(st, attempt=1):
+    """The sampler values this request will carry, and why.
+
+    One definition, used by the request that is sent AND by the record of what
+    happened - a scoreboard built from settings the request did not actually use
+    would be worse than no scoreboard.
+
+    On a retry the aim changes. The first attempt performs; a retry only has to
+    FINISH, so it is steered towards the stop token: cooler, no repetition penalty
+    (the wind-down tokens before end-of-content are the most repeated ones in any
+    clip), and a nucleus that is actually truncated. The player hears the retry,
+    not the attempt that failed.
+    """
+    out = {}
+    # whatever arrived with the line goes on to the engine - it is the value in force
+    # until something here replaces it, and dropping it only meant the engine's own
+    # default arrived instead, unseen
+    for k, v in sn_tts_observed().items():
+        if k in SN_TTS_FORWARD:
+            out[k] = v
+    # a calibrated value wins over SkyrimNet's, because it was chosen against this
+    # machine's own record of what went wrong
+    out.update(cal_overrides(st))
+    if attempt > 1 and str((st or {}).get("ttsRetrySafe", "on")).lower() == "on":
+        # each retry steps FURTHER: the owner's 12:12 log showed attempts two and
+        # three carrying byte-identical samplers, which is not a retry but a
+        # repeat. Cooler by 0.8 per step, nucleus tighter by 0.05 per step, the
+        # floor firmer - always toward the stop token.
+        _k = attempt - 1
+        out = dict(out)
+        if "temperature" in out:
+            out["temperature"] = round(max(0.1, float(out["temperature"]) * (0.8 ** _k)), 3)
+        out["repetition_penalty"] = 1.0
+        out["top_p"] = round(max(0.7, min(0.9, float(out.get("top_p", 0.9) or 0.9)) - 0.05 * (_k - 1)), 3)
+        out["min_p"] = round(max(float(out.get("min_p", 0.05) or 0.05), 0.05 + 0.03 * (_k - 1)), 3)
+    return out
+
+
+def tts_samp_note(samp):
+    """The sampler values on one readable line, in the page's own chip order."""
+    bits = []
+    for k in ("temp", "top_p", "min_p", "rep"):
+        v = samp.get(TTS_SAMP_FIELD[k])
+        if v is not None and str(v) != "":
+            bits.append("%s %s" % (k, _num_str(v)))
+    return "  ".join(bits) or "engine defaults"
+
+
+def tts_samp_now(st):
+    """What each sampler is set to right now, in the chips' own key names.
+
+    tts_samplers answers in REQUEST field names - temperature, repetition_penalty -
+    and the chips ask by temp and rep. Two of the four names happen to be the same
+    in both, so half the row filled in and half read "-" while the line under the
+    bars, which goes through TTS_SAMP_FIELD, had all four.
+    """
+    sent = tts_samplers(st)
+    return {k: _num_str(sent[f]) for k, f in TTS_SAMP_FIELD.items() if f in sent}
+
+
+def cal_overrides(st):
+    """The panel's own speech settings, where a calibration has set one."""
+    out = {}
+    for key, name in CAL_REQUEST_KEYS.items():
+        v = str((st or {}).get(key, "")).strip()
+        if not v:
+            continue
+        try:
+            out[name] = float(v)
+        except Exception:
+            pass
+    return out
+
+DIAG_SYSTEM = (
+    "You are reading diagnostics from a Skyrim text-to-speech setup. The speech model "
+    "sometimes fails to emit its end-of-content token and keeps generating until a limit "
+    "stops it; each of those is an 'overrun' and costs the player a pause.\n\n"
+    "What can and cannot move the odds:\n"
+    "- The token limit does NOT change how often this happens. It stops the model at a "
+    "point it had already failed to stop by, so it only decides what the failure COSTS. "
+    "A limit set below what a line genuinely needed turns a good line into a retry.\n"
+    "- SAMPLING is the lever on how often. top_p 1.0 truncates nothing, leaving the whole "
+    "tail available on every draw. repetition_penalty pushes probability away from tokens "
+    "already seen, and the wind-down tokens before the stop token are the most repeated "
+    "ones in a clip. Lower temperature makes the stop token likelier to be picked when it "
+    "is due.\n"
+    "- Shorter chunks mean fewer tokens per generation and so fewer chances to miss.\n"
+    "- Lines ending without terminal punctuation invite the model to continue.\n\n"
+    "The failure rate per sampler configuration is in the data where it exists. Say what "
+    "the numbers show and what to change. Be specific and brief - six sentences at most. "
+    "If a configuration has too few lines behind it to compare, say so rather than "
+    "ranking it. If the data does not support a conclusion, say that instead of guessing.")
+
+
+def cal_facts(cfg):
+    st = cfg.get("settings", {}) or {}
+    return {"observed": sn_tts_observed(),
+            "panelOverrides": cal_overrides(st),
+            "chunkChars": tts_chunk_chars(st),
+            "lineTimeLimitMs": st.get("ttsAcppBusyMs"),
+            "samplerNow": {k: _num_str(v) for k, v in tts_samplers(st).items()},
+            "overrunBySampler": tts_sampler_board(),
+            "overrunRecord": eoc_summary()}
+
+
+
+def api_tts_diagnose(body):
+    """Hand the collected data to a server the user picked and return what it says."""
+    b = body or {}
+    cfg = load_config()
+    try:
+        port = int(str(b.get("port") or "").strip())
+    except Exception:
+        return {"error": "pick a server first"}
+    if not any(s["port"] == port for s in live_llm_servers(cfg)):
+        return {"error": "that server is not up - start it, or pick another"}
+    facts = json.dumps(cal_facts(cfg), indent=1)[:6000]
+    said, _think, _t, _u = panel_chat(
+        "diag", port, cfg, tts_job_think(cfg.get("settings", {}), "calib"),
+        DIAG_SYSTEM, facts, cfg_max=400, timeout=120.0)
+    if not said:
+        return {"error": "the server answered nothing - it may be loading or busy"}
+    text = said.strip()
+    # kept, because calibration acts on it rather than on the raw numbers again
+    calterm_log(["diagnose  [%s]" % diag_route_label(port, cfg)] + text.split("\n"))
+    cfg.setdefault("settings", {})["ttsDiagLast"] = text[:4000]
+    cfg["settings"]["ttsDiagAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    save_config(cfg)
+    return {"text": text, "at": cfg["settings"]["ttsDiagAt"]}
+
+
+def autocal_algorithm_text(st=None):
+    """The arithmetic, written out from the live constants.
+
+    Spelled from the values the code actually uses, so a constant changed in one
+    place cannot leave a stale description behind in the other.
+    """
+    return "\n".join([
+        "WHAT THE CAP IS",
+        "  A stop-loss, not a target. The engine stops when it emits its own",
+        "  end-of-content token, so a larger cap does not make a line longer and a",
+        "  smaller one does not make it shorter. The cap decides two things:",
+        "    - what a runaway costs before the retry, and",
+        "    - whether a line that genuinely needed more is cut off and retried.",
+        "  A tighter cap is therefore not a better one. Below the need it turns good",
+        "  lines into failures, and a failure costs a whole extra generation.",
+        "",
+        "THE ESTIMATE  (seconds of speech, then tokens)",
+        "  seconds = characters / cps + pause_tag_seconds + lead_in",
+        "  tokens  = seconds x %.1f          (Higgs frame rate, tokens per second)"
+        % TTS_ACPP_FRAME_RATE,
+        "  lead_in = %.1f s                   (breath before the first word)"
+        % TTS_AUTOCAL_LEAD_S,
+        "  cps comes from the mode:",
+        "    algorithm - the median chars/second of the measured lines,",
+        "                %.1f until %d lines are measured," % (TTS_AUTOCAL_SEED_CPS, 5),
+        "    llm       - a model is asked for the seconds directly, 3 s budget,",
+        "                falling back to the algorithm on any failure,",
+        "    tts calibration - cps and lead_in fitted ONCE by a model from the",
+        "                measured lines, then applied here by arithmetic alone.",
+        "",
+        "THE HEADROOM  (how far above the estimate the cap sits)",
+        "  auto    = worst seen (used / estimated) x %.2f pad," % AUTOCAL_HEAD_PAD,
+        "            clamped to %.2f .. %.2f, from at least 8 fitted lines;"
+        % (AUTOCAL_HEAD_MIN, AUTOCAL_HEAD_MAX),
+        "            %.2f until then." % AUTOCAL_HEAD_SEED,
+        "  a number = used exactly as given (yours, and obeyed).",
+        "",
+        "THE BOUNDS  (applied last, in this order)",
+        "  cap = estimate x headroom",
+        "  cap = max(cap, floor)              floor: HALF the guard, %d..%d - the"
+        % (TTS_ACPP_TOK_MIN, TTS_ACPP_TOK_FLOOR),
+        "                                     lead-in and warm-up a short line still pays",
+        "  cap = min(cap, characters x %.1f)  guard: the ceiling you already had"
+        % acpp_tok_per_char(st),
+        "",
+        "WHAT ACTUALLY REDUCES END-OF-CONTENT FAILURES",
+        "  Not this. The model missing its stop token is upstream sampling. The",
+        "  levers on the frequency are chunk size (fewer tokens per generation is",
+        "  fewer chances to miss) and lines that end on punctuation - both counted",
+        "  by the manual record above. This system only bounds the cost.",
+    ])
+
+
+def diag_route_label(port, cfg=None):
+    """How a picked server reads in the feed. One spelling, three callers."""
+    for s in live_llm_servers(cfg):
+        if s["port"] == port:
+            return "%s [%d]%s" % (s.get("label") or "?", port,
+                                  "  " + s["model"] if s.get("model") else "")
+    return "[%d]" % port
+
+
+def api_tts_sampler(body):
+    """Set or clear one TTS sampler. The bounds are CAL_KNOBS' - one table."""
+    b = body or {}
+    key = str(b.get("key") or "")
+    if key not in TTS_SAMP_KEYS:
+        return {"error": "unknown sampler"}
+    setting = TTS_SAMP_KEYS[key]
+    cfg = load_config()
+    st = cfg.setdefault("settings", {})
+    val = str(b.get("value") or "").strip()
+    if val == "":
+        st[setting] = ""                 # cleared: SkyrimNet's own value passes through
+        save_config(cfg)
+        return {"ok": True, "cleared": True}
+    try:
+        fv = float(val)
+    except Exception:
+        return {"error": "%s must be a number" % key}
+    for name, skey, _kind, lo, hi, _why in CAL_KNOBS:
+        if skey == setting and not (lo <= fv <= hi):
+            return {"error": "%s must be between %s and %s" % (key, lo, hi)}
+    st[setting] = _num_str(fv)
+    save_config(cfg)
+    return {"ok": True, "value": st[setting]}
+
+
+def api_tts_autocal_info(body=None):
+    """The arithmetic, exactly as the panel runs it. Read-only."""
+    st = load_config().get("settings", {})
+    rows = tts_measure_rows()
+    head, headwhy = tts_autocal_headroom(rows=rows)
+    return {"ok": True,
+            "algorithm": autocal_algorithm_text(st),
+            "fit": tts_autocal_fit(rows), "headroom": round(head, 3),
+            "headroomWhy": headwhy, "measured": tts_measure_summary(rows)}
+
+
+AUTOCAL_DERIVE_MIN = 8          # a fit off fewer lines than this is a coincidence
+AUTOCAL_GEN = [-1]              # lines measured since the last fit ATTEMPT; -1 until
+                                # the first tick seeds it from the stored record
+
+
+def autocal_note(outcome):
+    """Record what the last fit ATTEMPT came to, kept across restarts.
+
+    The page could say only "no TTS calibration derived yet", the same words for a
+    fit that has never been tried, one that cannot find a server, and one that is
+    tried every N lines and refused every time because it does not beat the panel's
+    own arithmetic. Three different problems, one sentence. Written on the attempt,
+    not on the line, so this costs a config write per fit and nothing per line.
+    """
+    try:
+        cfg = load_config()
+        st = cfg.setdefault("settings", {})
+        st["ttsAutoCalTried"] = str(outcome)[:200]
+        st["ttsAutoCalTriedAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        save_config(cfg)
+    except Exception:
+        pass                   # a diagnostic must never break the fit it describes
+
+
+def autocal_derive_arith(cfg=None, why="every-N"):
+    """The Proxy refit: least squares over the measured lines, no model asked.
+
+    Writes the stored fit (`ttsAutoCalMedian`) with the count and the moment it was
+    fitted from, logs one calibration line, and needs no server, no idle wait and no
+    quiet gap - arithmetic cannot contend with speech. The LLM-controlled refit this
+    once shared its store with was retired when its per-line ask had converged to
+    this same arithmetic; a config that still says `llm` runs this. (patch184)
+    """
+    cfg = load_config() if cfg is None else cfg
+    st = cfg.get("settings", {}) or {}
+    rows = tts_measure_rows()
+    if len(rows) < AUTOCAL_DERIVE_MIN:
+        calterm_log(["TTS calibration  [proxy arithmetic]  (%s)" % why,
+                     "   only %d line(s) measured - %d needed"
+                     % (len(rows), AUTOCAL_DERIVE_MIN)])
+        return {"error": "too few lines"}
+    ols = tts_measure_ols(rows)
+    if ols.get("n", 0) < AUTOCAL_DERIVE_MIN or not ols.get("cps"):
+        calterm_log(["TTS calibration  [proxy arithmetic]  (%s)" % why,
+                     "   the lines do not fit a usable rate yet"])
+        return {"error": "no usable fit"}
+    st["ttsAutoCalMedian"] = json.dumps({"cps": ols["cps"], "lead": ols["lead"]})
+    # the page's own tooltip promises both of these - it read them from a config
+    # nothing had ever written, so every fit said "kept from ? lines". (patch184)
+    st["ttsAutoCalMedianN"] = str(len(rows))
+    st["ttsAutoCalMedianAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cfg["settings"] = st
+    save_config(cfg)
+    hd = tts_headroom_facts(rows)
+    calterm_log(["TTS calibration  [proxy arithmetic]  (%s)" % why,
+                 "   %.1f chars/sec, lead %.2fs, mae %.3fs over %d lines - %s"
+                 % (ols["cps"], ols["lead"], ols.get("mae", 0.0), ols["n"], hd["why"])])
+    autocal_note("proxy refit: %.1f cps, lead %.2fs (%s)" % (ols["cps"], ols["lead"], why))
+    return {"ok": True, "cps": ols["cps"], "lead": ols["lead"]}
+
+
+def autocal_sampler_arith(cfg=None):
+    """Sampler auto-optimisation without a model: the failure record IS the diagnosis.
+
+    Runs only when the user has switched sampler calibration on - that switch is the
+    delegation. One bounded step at a time, with the numbers that drove it in the
+    feed, and never more than one step per fresh window of lines (the window must
+    postdate the last change, so a bad patch of lines is acted on once, not forty
+    times).
+    """
+    cfg = load_config() if cfg is None else cfg
+    st = cfg.get("settings", {}) or {}
+    if str(st.get("ttsSampAutoCal", "on")).lower() != "on":
+        return None
+    rows = tts_measure_rows()[-40:]
+    if len(rows) < 12:
+        return None
+    since = str(rows[0].get("at") or "")
+    mark = str(st.get("ttsCalSampAt") or "")
+    if mark and since <= mark:
+        return None                       # this window overlaps the last change
+    failed = {str(e.get("at") or "") for e in eoc_rows()
+              if str(e.get("at") or "") >= since}
+    rate = len(failed) / float(len(rows))
+    obs = sn_tts_observed()
+    cur = cal_overrides(st)
+
+    def _f(name, dflt):
+        if name in cur:
+            return float(cur[name])
+        try:
+            return float(obs.get(name, dflt))
+        except Exception:
+            return dflt
+    t0, p0 = _f("temperature", 0.7), _f("top_p", 0.95)
+    changed = []
+    if rate >= 0.08:
+        t1 = max(0.5, round(t0 - 0.07, 2))
+        p1 = max(0.85, round(min(p0, 0.95) - 0.02, 2))
+        if t1 < t0:
+            st["ttsCalTemp"] = str(t1); changed.append("temperature %.2f\u2192%.2f" % (t0, t1))
+        if p1 < p0:
+            st["ttsCalTopP"] = str(p1); changed.append("top_p %.2f\u2192%.2f" % (p0, p1))
+        if str(st.get("ttsCalRepPen") or "") != "1.0":
+            st["ttsCalRepPen"] = "1.0"; changed.append("repetition_penalty\u21921.0")
+        verdict = "%d of %d lines ran past end-of-content - steadier" \
+                  % (len(failed), len(rows))
+    elif rate == 0.0 and len(rows) >= 40 and cur:
+        # a clean window relaxes ONE notch back towards what SkyrimNet asked for -
+        # the calibrated grip is loosened only by evidence, the same way it was taken
+        tb, pb = _f("temperature", t0), _f("top_p", p0)
+        ot = float(obs.get("temperature", tb) or tb)
+        op = float(obs.get("top_p", pb) or pb)
+        if "temperature" in cur and ot > tb:
+            t1 = min(ot, round(tb + 0.05, 2))
+            if abs(ot - t1) < 0.02:
+                st.pop("ttsCalTemp", None); changed.append("temperature back to %.2f" % ot)
+            else:
+                st["ttsCalTemp"] = str(t1); changed.append("temperature %.2f\u2192%.2f" % (tb, t1))
+        elif "top_p" in cur and op > pb:
+            p1 = min(op, round(pb + 0.01, 2))
+            if abs(op - p1) < 0.005:
+                st.pop("ttsCalTopP", None); changed.append("top_p back to %.2f" % op)
+            else:
+                st["ttsCalTopP"] = str(p1); changed.append("top_p %.2f\u2192%.2f" % (pb, p1))
+        verdict = "0 of %d lines failed - relaxing one notch" % len(rows)
+    else:
+        return None
+    if not changed:
+        return None
+    st["ttsCalSampAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    cfg["settings"] = st
+    save_config(cfg)
+    calterm_log(["sampler calibration  [proxy arithmetic]",
+                 "   " + verdict + ": " + ", ".join(changed)])
+    return {"rate": round(rate, 3), "changed": changed}
+
+
+def autocal_lines_since(st):
+    """How many lines have been measured since the last fit ATTEMPT.
+
+    Read once per panel run, from the two records that already survive a restart:
+    the measurement log and the timestamp of the last attempt. No new per-line write
+    - the store is appended to every line anyway, and this reads it once.
+    """
+    try:
+        at = str((st or {}).get("ttsAutoCalTriedAt") or "").strip()
+        rows = tts_measure_rows()
+        if not at:
+            return len(rows)
+        return sum(1 for r in rows if str(r.get("at") or "") > at)
+    except Exception:
+        return 0
+
+
+def autocal_tick(st):
+    """One spoken line towards the next automatic refit - the proxy arithmetic,
+    which asks nothing of any model and runs right here on the line that made it
+    due. (LLM Controlled retired in patch153: its per-line ask had already
+    converged to this same arithmetic.)"""
+    _mode = autocal_mode(st)
+    if _mode == "off":
+        return
+    # Seeded once from the record that survives a restart. The count used to start
+    # at zero every time the panel came up, so with a long interval and a panel that
+    # is restarted often the fit could be due forever and never arrive - the lines
+    # spoken before the restart had been measured, kept, and then forgotten by the
+    # one thing that was counting them.
+    if AUTOCAL_GEN[0] < 0:
+        AUTOCAL_GEN[0] = autocal_lines_since(st)
+    AUTOCAL_GEN[0] += 1
+    every = autocal_every(st)
+    if AUTOCAL_GEN[0] < every:
+        return
+    if _mode == "proxy":
+        # arithmetic: no server, no idle wait, no quiet gap - it cannot contend with
+        # speech, so it runs right here on the line that made it due
+        AUTOCAL_GEN[0] = 0
+        _cfgp = load_config()
+        autocal_derive_arith(_cfgp, why="every %d lines" % every)
+        autocal_sampler_arith(_cfgp)
+        return
+
+def api_tts_diag(body=None):
+    """Everything known about why speech overruns. Read-only: the Show data button
+    that wrote it into the record was removed with the rest of that section."""
+    return _tts_diag_facts()
+
+
+def tts_perf_summary(n=24):
+    """The realtime factor the engine is actually delivering, over the last lines.
+
+    secs/wall per line, median of the last `n` that carry a wall time; and the lines
+    in that same window that ran past end-of-content, because each retry regenerates
+    the whole line and roughly halves its realtime on the spot.
+    """
+    rows = [r for r in tts_measure_rows()[-n:] if float(r.get("wall") or 0) > 0]
+    if not rows:
+        return {"x": 0.0, "n": 0, "retries": 0}
+    xs = sorted(float(r["secs"]) / float(r["wall"]) for r in rows)
+    since = str(rows[0].get("at") or "")
+    retries = sum(1 for e in eoc_rows()
+                  if str(e.get("at") or "") >= since and int(e.get("attempt") or 1) > 1)
+    return {"x": round(xs[len(xs) // 2], 2), "n": len(rows), "retries": retries}
+
+
+def _tts_diag_facts():
+    """Everything known about why speech overruns, in one answer.
+
+    Two halves that only mean something together: what SkyrimNet is asking for, read off
+    the calls it makes, and what has actually gone wrong, read off a record that outlives
+    the session.
+    """
+    st = load_config().get("settings", {})
+    obs = sn_tts_observed()
+    return {
+        "observed": obs,
+        "forwarded": sorted(k for k in obs if k in SN_TTS_FORWARD),
+        "observedOnly": sorted(k for k in obs if k not in SN_TTS_FORWARD),
+        "chunk": tts_chunk_chars(st),
+        "busyMs": str(st.get("ttsAcppBusyMs", "")),
+        "samp": {k: str(st.get(TTS_SAMP_KEYS[k], "") or "") for k in TTS_SAMP_KEYS},
+        "sampSent": tts_samp_now(st),
+        "retrySafe": str(st.get("ttsRetrySafe", "on")).lower() == "on",
+        "eoc": eoc_summary(),
+        "measured": tts_measure_summary(),
+        "fit": tts_autocal_fit(),
+        "head": tts_headroom_facts(),
+        "perf": tts_perf_summary(),
+        "board": tts_sampler_board(),
+        "servers": live_llm_servers(),
+    }
+
+
+def api_proxy_payload(body=None):
+    """One terminal record, opened: the request as it was sent, the reply as it came.
+    In-memory only - a line older than the ring answers honestly that it is gone."""
+    try:
+        pid = int((body or {}).get("id"))
+    except Exception:
+        return {"error": "no such record"}
+    e = PROXY.pay_get(pid)
+    return e if e else {"error": "that record has left the ring - only the last %d are kept"
+                                 % PAYLOAD_KEEP}
+
+
+def api_acpp_report(body=None):
+    return {"ok": True, "text": acpp_report()}
+
+
+def tts_server_log_path(cfg=None):
+    """This session's audio.cpp log. One file per panel run, like the fleet logs."""
+    ld = log_dir(cfg)
+    name = "%s_tts-server.log" % SESSION_STAMP
+    return os.path.join(ld, name)
+
+
+def tts_server_log_newest(cfg=None):
+    """The newest server log written during THIS session, or nothing."""
+    ld = log_dir(cfg)
+    best, best_t = "", 0.0
+    for p in glob.glob(os.path.join(ld, TTS_SERVER_LOG_GLOB)):
+        try:
+            mt = os.path.getmtime(p)
+        except OSError:
+            continue
+        if mt >= PANEL_START - 2.0 and mt > best_t:
+            best, best_t = p, mt
+    if best:
+        return best
+    legacy = os.path.join(ld, TTS_SERVER_LOG_NAME)      # before this was split up
+    return legacy if os.path.isfile(legacy) else ""
+
+
 def tts_server_status(cfg=None):
     """Cached, resolver-free probe - same one the fleet slots use, so this costs no
     more on a state read than one more server would."""
@@ -5408,6 +10015,52 @@ def tts_server_status(cfg=None):
 
 TTS_PROC = {"pid": None, "proc": None, "stopping": False, "said_ready": False,
             "died": "", "log_at": None}
+
+
+TTS_CLOCK = [""]                 # the GPU uuid whose clocks the panel is holding
+
+
+def tts_clock_hold(uuid_, st):
+    """Lock the TTS card's graphics clock at its maximum, if asked and able."""
+    if (os.name != "nt" or not uuid_
+            or str((st or {}).get("ttsGpuClockHold", "off")).lower() != "on"):
+        return
+    if not is_admin():
+        TTSW.log("\u26A0 GPU Clock Hold is on, but locking clocks needs the panel "
+                 "run as administrator - skipped")
+        return
+    try:
+        q = subprocess.run(["nvidia-smi", "-i", uuid_, "--query-gpu=clocks.max.graphics",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=15, **NOWIN)
+        mx = q.stdout.strip().splitlines()[0].strip() if q.stdout.strip() else ""
+        if not mx.isdigit():
+            TTSW.log("\u26A0 could not read the card's maximum clock - not held")
+            return
+        r = subprocess.run(["nvidia-smi", "-i", uuid_, "-lgc", "%s,%s" % (mx, mx)],
+                           capture_output=True, text=True, timeout=15, **NOWIN)
+        if r.returncode == 0:
+            TTS_CLOCK[0] = uuid_
+            TTSW.log("\U0001F512 GPU clock held at %s MHz for speech - released when "
+                     "the server stops" % mx)
+        else:
+            TTSW.log("\u26A0 clock hold refused: %s"
+                     % (r.stderr or r.stdout or "").strip()[:160])
+    except Exception as e:
+        TTSW.log("\u26A0 clock hold failed: %s" % e)
+
+
+def tts_clock_release(reason=""):
+    """Give the card its power states back. Safe to call when nothing is held."""
+    if not TTS_CLOCK[0]:
+        return
+    uuid_, TTS_CLOCK[0] = TTS_CLOCK[0], ""
+    try:
+        subprocess.run(["nvidia-smi", "-i", uuid_, "-rgc"],
+                       capture_output=True, timeout=15, **NOWIN)
+        TTSW.log("\U0001F513 GPU clock released%s" % ((" - " + reason) if reason else ""))
+    except Exception:
+        pass
 
 
 def stop_tts_server(reason="", wait=True):
@@ -5439,14 +10092,31 @@ def stop_tts_server(reason="", wait=True):
     def _finish():
         try:
             if p and p.poll() is None:
-                p.terminate()
+                if os.name == "nt":
+                    # terminate() reaches the process it names and nothing under it.
+                    # The exe is spawned directly today, but /T costs nothing and a
+                    # profile exe that ever wraps a child stops being immortal.
+                    subprocess.run(["taskkill", "/PID", str(p.pid), "/T", "/F"],
+                                   capture_output=True, **NOWIN)
+                else:
+                    p.terminate()
                 try: p.wait(timeout=6)
                 except Exception: p.kill()
+            elif pid and not p:
+                # a pid with no handle: the server outlived the panel run that
+                # started it (the panel restarted underneath it). Same ownership,
+                # different session - stop it by pid.
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                                   capture_output=True, **NOWIN)
+                else:
+                    os.kill(int(pid), 15)
             panel_log("[tts] stopped the server (pid %s)%s" % (pid, (" - " + reason) if reason else ""))
         except Exception as e:
             log_error("tts", "could not stop the server: %s" % e)
         TTS_PROC["pid"], TTS_PROC["proc"] = None, None
         TTS_PROC["stopping"] = False
+        tts_clock_release(reason)
         TTSW.log("\u2705 TTS server stopped")
         TTSW.log("")
         try:
@@ -5473,7 +10143,7 @@ def api_tts_server(body):
         _TTSSRV_LOCK.release()
 
 
-def _api_tts_server(body):
+def _api_tts_server(body, _retry=False):
     action = str(body.get("action", "")).lower()
     cfg = load_config()
     st = cfg.get("settings", {})
@@ -5496,7 +10166,8 @@ def _api_tts_server(body):
 
     eng = tts_engine(cfg)
     if eng == "audiocpp":
-        exe = find_acpp_exe(st.get("ttsAcppDir", "")) or (st.get("ttsAcppExe") or "").strip()
+        exe = (find_acpp_exe(st.get("ttsAcppDir", ""), acpp_profile(st))
+               or (st.get("ttsAcppExe") or "").strip())
         model = (st.get("ttsAcppModel") or "").strip()
         if not exe or not os.path.isfile(exe):
             return {"error": "no %s found under %s" % (ACPP_EXE_NAME,
@@ -5519,6 +10190,12 @@ def _api_tts_server(body):
     gpu = next((g for g in cfg.get("gpus", []) if g.get("id") == gid), None)
     uuid_ = (gpu or {}).get("uuid") or ""
     env = os.environ.copy()
+    if eng == "audiocpp":
+        # a profile exe lives one level down while the big CUDA DLLs stay shared at the
+        # root, so the root must be on PATH or the exe starts and cannot resolve them
+        _root = (st.get("ttsAcppDir") or "").strip()
+        if _root and os.path.isdir(_root):
+            env["PATH"] = _root + os.pathsep + env.get("PATH", "")
     if uuid_:
         # after masking, the chosen card re-indexes to 0 in-process, so --main-gpu
         # stays 0 rather than the physical index. Same trap as the launcher.
@@ -5533,11 +10210,11 @@ def _api_tts_server(body):
             return {"error": "cannot write the audio.cpp config: %s" % e}
         args = [exe, "--config", cfgp]
     else:
-        args = [exe, "--model", model, "--main-gpu", "0", "--host", "0.0.0.0",
+        args = [exe, "--model", model, "--main-gpu", "0", "--host", "127.0.0.1",
                 "--port", str(port), "--no-webui"]
 
     try:
-        logf = open(os.path.join(log_dir(cfg), TTS_SERVER_LOG_NAME), "ab")
+        logf = open(tts_server_log_path(cfg), "ab")
     except Exception as e:
         return {"error": "cannot open the server log: %s" % e}
     flags = 0
@@ -5555,10 +10232,32 @@ def _api_tts_server(body):
     except Exception:     # handle on every start
         pass
     try:                       # where this run's output begins in the shared log
-        TTS_PROC["log_at"] = os.path.getsize(os.path.join(log_dir(cfg), TTS_SERVER_LOG_NAME))
+        TTS_PROC["log_at"] = os.path.getsize(tts_server_log_path(cfg))
     except OSError:
         TTS_PROC["log_at"] = 0
+    # audio.cpp validates its session options and EXITS on one it does not know. It
+    # names the offender, so a refusal is read back, remembered and the start retried
+    # without it - once. A wrong option name must cost a second, not a working server.
+    _died = None
+    for _ in range(60):                       # ~3s: it refuses long before it loads
+        _died = p.poll()
+        if _died is not None:
+            break
+        time.sleep(0.05)
+    if _died is not None:
+        _tail = ""
+        try:
+            with open(tts_server_log_path(cfg), "r", encoding="utf-8",
+                      errors="replace") as _lf:
+                _lf.seek(max(0, os.path.getsize(tts_server_log_path(cfg)) - 4000))
+                _tail = _lf.read()
+        except Exception:
+            pass
+        return {"error": "the server exited at once - see the TTS server log%s"
+                         % ((": " + _tail.strip().splitlines()[-1][:160]) if _tail.strip()
+                            else "")}
     TTS_PROC["pid"], TTS_PROC["proc"], TTS_PROC["died"] = p.pid, p, ""
+    tts_clock_hold(uuid_, st)
     with _ST_LOCK:
         _ST_CACHE.pop(port, None)
     panel_log("[tts] started %s on :%d (pid %d)" % (os.path.basename(exe), port, p.pid))
@@ -5624,6 +10323,18 @@ def api_tail(body, scope="host"):
         path = os.path.join(ld, TTS_LOG_NAME)
         if not os.path.isfile(path):
             path = None
+    elif kind == "ttscal":
+        path = calterm_log_path()
+        if not os.path.isfile(path):
+            path = None
+    elif kind == "ptipme":
+        path = ptipme_log_path()
+        if not os.path.isfile(path):
+            path = None
+    elif kind == "ttssrv":
+        # what audio.cpp itself printed. Same fixed-name rule as the tts feed, so no
+        # caller-supplied path is involved and it is safe on remote.
+        path = tts_server_log_newest() or None
     elif kind == "file":
         name = os.path.basename(body.get("name", ""))
         path = os.path.join(ld, name)
@@ -5634,6 +10345,12 @@ def api_tail(body, scope="host"):
     if not path:
         if kind == "tts":
             return {"text": "(no %s yet - run the TTS launcher; it writes into the panel log folder)" % TTS_LOG_NAME, "file": ""}
+        if kind == "ttssrv":
+            return {"text": "(no %s yet - it appears once the TTS server has been started "
+                            "at least once)" % TTS_SERVER_LOG_NAME, "file": ""}
+        if kind == "ptipme":
+            return {"text": "(nothing yet - this fills in once the Player Tag Injector or "
+                            "Player Mood Evaluation has run)", "file": ""}
         return {"text": "(no log file yet - hit [Launch] first, or check the log folder in [Setup])", "file": ""}
     try:
         with open(path, "rb") as f:
@@ -5666,33 +10383,203 @@ space  ::= [ \t\n]*
 """
 AGENT_EMOJI = {"Dialogue":"\U0001F4AC","GM":"\U0001F3B2","Combat":"\u2694\uFE0F","Meta":"\U0001F9EA",
                "UT":"\U0001F310","AI-Assistant":"\U0001F916","ActionEval":"\U0001F3C3","Charbio":"\U0001F3AD",
+               "NE-Composer":"\U0001F3BC","NE-Director":"\U0001F3AC",
+               "AE-Impulse":"\U0001F4A5","AE-Resolve":"\u2696\uFE0F",
                "Diary":"\u270D\uFE0F","Memory":"\U0001F9E0","Vision":"\U0001F441\uFE0F",
                "IntelEngine":"\U0001F6F0\uFE0F","SeverActions":"\U0001F4DC"}
-GATE_MAX_WAIT_S = 8.0
+GATE_MAX_WAIT_S = 30.0   # a normal-priority call yields to an ACTIVE high on its
+                         # GPU for as long as the high realistically runs. The old
+                         # 8 s cap was shorter than a real ActionEval (16-17 s in
+                         # the owner's field log), so normals barged onto the card
+                         # mid-high and the high's own drilldown crawled. A running
+                         # normal can never be preempted - llama offers no such
+                         # thing - so refusing to START one against a high is the
+                         # whole of what a gate can honestly do. (patch175)
 PROXY_MAX_BODY = 64 * 1024 * 1024   # far beyond any real prompt, but bounded
+
+def slot_gpu_key(slot, gpu_ids):
+    """Which card a slot counts as, for the priority gate.
+
+    The gate is keyed by card, so this has to be the same key the routing table uses -
+    a high-priority caller marking one key while the waiters watch another would look
+    exactly like the gate doing nothing.
+    """
+    gid = slot.get("gpuId") or ""
+    return gid if gid in gpu_ids else (slot.get("gpu") or slot.get("id"))
+
+class _GateHeld:
+    """Hold the GPU gate for one call the panel makes on its own behalf.
+
+    PTI and PME do not route through the proxy - they talk to the server directly - so
+    the priority a provider carries has nothing to say about them, and a long Dialogue
+    prefill lands on the same card at the same time. This puts them on the footing of a
+    priority-0 provider for the length of one call, through the same gate, so nothing
+    new has to be reasoned about. A provider ALREADY running is not interrupted; only
+    one arriving while the call is in flight waits, and only for GATE_MAX_WAIT_S.
+    """
+
+    def __init__(self, gpu):
+        self.gpu = gpu or ""
+
+    def __enter__(self):
+        if self.gpu:
+            PROXY.gate.enter(self.gpu, True)
+        return self
+
+    def __exit__(self, *exc):
+        if self.gpu:
+            PROXY.gate.leave(self.gpu, True)
+        return False
+
+
+def route_gate_key(rt):
+    """The card to hold while this route runs, or "" when it is not high priority.
+
+    Priority 0 is what a provider card already means by High, so a panel-called
+    provider uses the same dial rather than a second switch of its own.
+    """
+    if not rt or int(rt.get("priority", 1)) != 0:
+        return ""
+    return rt.get("gpu") or ""
+
+
+def cached_slot_map(slot):
+    """provider id -> the KV slot pinned to it, for one server.
+
+    llama-server keeps one KV cache per slot, in VRAM, and picks a slot by longest
+    common prefix. Two callers whose prompts share nothing - the tagger and Meta - each
+    clear the other out of a single slot and prefill from scratch every time. Giving a
+    provider a slot of its own is what makes its prefix survive; there is no cache flag
+    to turn on, because the cache was never off.
+
+    Slot 0 is left for everything unpinned. Ordering is by provider id so the map is the
+    same on every call and across restarts - a slot number that moved would send a
+    request to a cache belonging to someone else.
+    """
+    ids = cache_wanted(slot)
+    room = slot_parallel(slot) - 1          # slot 0 is the shared one
+    return {pid: i + 1 for i, pid in enumerate(ids) if i < room}
+
+
+def cache_wanted(slot):
+    """The providers asking for a slot, in the order they are considered for one."""
+    return sorted(str(p.get("id") or "") for p in (slot.get("providers") or [])
+                  if p.get("cache") and p.get("enabled") is not False and p.get("id"))
+
+
+def slot_parallel(slot):
+    """How many KV slots this server is launched with - the user's own setting."""
+    try:
+        v = (slot.get("params") or {}).get("parallel")
+        return max(1, int(str(v if v not in (None, "") else param_defaults()["parallel"])))
+    except Exception:
+        return 1
+
+def _route_overrides(p, slot):
+    """The provider's own overrides, and the SERVER's word beneath them: when the
+    provider does not set n_predict, the launcher's --n-predict (or -n) is read
+    from the slot's script - the card and the ps1 are the final word (patch182)."""
+    ov = {k: v for k, v in (p.get("samplerOverrides") or {}).items()
+          if (k in PROXY_SAMPLER_FIELDS or k == "n_predict") and str(v).strip() != ""}
+    if "n_predict" not in ov and (slot or {}).get("script"):
+        _ps = parse_ps1_samplers(slot["script"])
+        if _ps.get("n_predict"):
+            ov["n_predict"] = _ps["n_predict"]
+    return ov
+
+
+def provider_route(p, slot, up, gpu_ids):
+    """One provider's route record.
+
+    Built here rather than inline in _desired because PTI and PME need exactly the same
+    record without a listener to hang it on. Two builders would mean a panel-called
+    provider quietly honouring a different set of its own settings.
+    """
+    pid = p.get("id")
+    return {"id": pid, "title": p.get("title") or "?",
+            "emoji": (p.get("emoji") or (PANDORUM_MARK if pid in PANEL_PROV_IDS
+                                         else AGENT_EMOJI.get(p.get("title", ""), "\u2022"))),
+            # a server told not to reason overrules a provider asking to: the flag and
+            # the request must not disagree about the same server
+            "thinking": bool(p.get("thinking")) and slot_reasoning(slot) != "off",
+            "serverReasoning": slot_reasoning(slot),
+            "priority": int(p.get("priority", 1)),
+            "grammar": bool(p.get("diaryGrammar")), "gpu": slot_gpu_key(slot, gpu_ids),
+            "overrides": _route_overrides(p, slot),
+            # panel-called providers are Server Side permanently: there is no other side
+            "sampSource": ("server" if pid in PANEL_PROV_IDS
+                           else (p.get("samplerSource") or "server")),
+            "panelOwned": pid in PANEL_PROV_IDS,
+            "slot": cached_slot_map(slot).get(pid),
+            "upstream": "http://127.0.0.1:%d" % int(up), "server": str(up)}
+
+
+def panel_route(pid, cfg=None):
+    """The route for a panel-called provider, or None when it is not wired to a slot.
+
+    Replaces the server picker the TTS page used to carry. There is one place that says
+    which server answers PTI now - the slot it hangs off in Live Network.
+    """
+    cfg = cfg or load_config()
+    gpu_ids = {g.get("id") for g in cfg.get("gpus", [])}
+    for s in cfg.get("slots", []):
+        up = (parse_ps1_port(s.get("script") or "") if s.get("script") else None) or s.get("port")
+        if not up:
+            continue
+        for p in s.get("providers", []) or []:
+            if p.get("id") == pid:
+                try:
+                    int(up)
+                except Exception:
+                    return None
+                return provider_route(p, s, up, gpu_ids)
+    return None
+
+
+HIGH_LINGER_S = 2.5      # a high call's RESPONSE triggers its follow-up - the
+                         # ActionEval drilldown is a separate LLM call SkyrimNet
+                         # posts only after stage 1 returns. The owner traced the
+                         # inversion exactly: leave() freed the card into that
+                         # gap, a queued normal took it, and the high-priority
+                         # stage 2 arrived to a busy GPU. The card now LINGERS
+                         # held after a high leaves; an arriving high chains the
+                         # hold, and an empty window releases the normals.
+
 
 class GpuGate:
     def __init__(self):
         import threading
         self._cond = threading.Condition()
         self._active_high = {}
+        self._linger = {}          # gpu -> monotonic-ish deadline (patch176)
+    def _held(self, gpu):
+        if self._active_high.get(gpu, 0) > 0:
+            return True
+        return time.time() < self._linger.get(gpu, 0.0)
     def enter(self, gpu, is_high):
         if is_high:
             with self._cond:
                 self._active_high[gpu] = self._active_high.get(gpu, 0) + 1
+                self._linger.pop(gpu, None)      # the follow-up landed: chain
             return 0
         t0 = time.time(); deadline = t0 + GATE_MAX_WAIT_S
         with self._cond:
-            while self._active_high.get(gpu, 0) > 0:
-                rem = deadline - time.time()
+            while self._held(gpu):
+                now = time.time()
+                rem = deadline - now
                 if rem <= 0: break
-                self._cond.wait(timeout=rem)
+                lg = self._linger.get(gpu, 0.0) - now
+                self._cond.wait(timeout=min(rem, lg) if lg > 0 else rem)
         return round((time.time() - t0) * 1000)
     def leave(self, gpu, is_high):
         if not is_high: return
         with self._cond:
             self._active_high[gpu] = max(0, self._active_high.get(gpu, 0) - 1)
-            if self._active_high[gpu] == 0: self._cond.notify_all()
+            if self._active_high[gpu] == 0:
+                # not free yet: the response this call just returned is very
+                # likely spawning its own high follow-up right now
+                self._linger[gpu] = time.time() + HIGH_LINGER_S
+                self._cond.notify_all()
 
 def _stamp():
     return _dt.datetime.now().strftime("%H:%M:%S.%f")[:-4]
@@ -5714,6 +10601,25 @@ def _fold_sum(agg, key, x):
     except Exception: pass
 
 class ProxyManager:
+    def busy(self, port):
+        """Requests open on one upstream right now - working, or queued behind it."""
+        try:
+            with self._infl_lock:
+                return int(self.inflight.get(int(port), 0))
+        except Exception:
+            return 0
+
+    def _infl(self, port, d):
+        try:
+            with self._infl_lock:
+                n = self.inflight.get(int(port), 0) + d
+                if n > 0:
+                    self.inflight[int(port)] = n
+                else:
+                    self.inflight.pop(int(port), None)
+        except Exception:
+            pass
+
     def __init__(self):
         import threading
         self._lock = threading.Lock()
@@ -5725,8 +10631,51 @@ class ProxyManager:
         self.pstats = {}        # provider id -> running perf/usage aggregates (session, in-memory)
         self.stats_on = True    # Monitoring toggle (settings.statsMonitoring)
         self.gate = GpuGate()
+        # upstream port -> requests open right now. The panel forwards every one of
+        # SkyrimNet's calls, so this is not an estimate of whether a server is busy:
+        # it is the count.
+        self.inflight = {}
+        self._infl_lock = threading.Lock()
         self.allow = None
         self.session = time.strftime("%Y%m%d-%H%M%S")
+        # the request and reply behind each Proxy-terminal record, so a line can be
+        # OPENED rather than only read. A ring, in memory only: prompts are the
+        # player's game and do not belong in a file the session leaves behind.
+        self.payloads = collections.deque(maxlen=PAYLOAD_KEEP)
+        self._pay_lock = threading.Lock()
+        self._pay_seq = [0]
+
+    def pay_add(self, rt, req, resp, think, ms, inp, out, streaming):
+        """Keep one request/reply pair and answer the id its terminal line wears."""
+        try:
+            if isinstance(req, (bytes, bytearray)):
+                req = req.decode("utf-8", "replace")
+            req = str(req or "")
+            try:
+                req = json.dumps(json.loads(req), indent=2, ensure_ascii=False)
+            except Exception:
+                pass                       # not JSON: shown as it went
+            with self._pay_lock:
+                self._pay_seq[0] += 1
+                pid = self._pay_seq[0]
+                self.payloads.append({
+                    "id": pid, "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "title": rt.get("title", "?"), "emoji": rt.get("emoji", ""),
+                    "server": str(rt.get("server", "")), "ms": int(ms or 0),
+                    "in": inp, "out": out, "streaming": bool(streaming),
+                    "req": req[:PAYLOAD_CLIP] + ("\n... (truncated)" if len(req) > PAYLOAD_CLIP else ""),
+                    "resp": str(resp or "")[:PAYLOAD_CLIP],
+                    "think": str(think or "")[:PAYLOAD_CLIP]})
+            return pid
+        except Exception:
+            return None
+
+    def pay_get(self, pid):
+        with self._pay_lock:
+            for e in self.payloads:
+                if e["id"] == pid:
+                    return dict(e)
+        return None
 
     def _desired(self, cfg):
         out = {}
@@ -5736,19 +10685,12 @@ class ProxyManager:
             for p in s.get("providers", []) or []:
                 if p.get("enabled") is False:
                     continue
+                if p.get("id") in PANEL_PROV_IDS:
+                    continue          # called in-process; nothing connects to it
                 try: lp = int(p.get("port"))
                 except Exception: continue
                 if not (1000 <= lp <= 9999) or lp in out or lp == PORT: continue
-                gid = s.get("gpuId") or ""
-                gkey = gid if gid in gpu_ids else (s.get("gpu") or s.get("id"))
-                out[lp] = {"id": p.get("id"), "title": p.get("title") or "?",
-                           "emoji": (p.get("emoji") or AGENT_EMOJI.get(p.get("title", ""), "\u2022")),
-                           "thinking": bool(p.get("thinking")), "priority": int(p.get("priority", 1)),
-                           "grammar": bool(p.get("diaryGrammar")), "gpu": gkey,
-                           "overrides": {k: v for k, v in (p.get("samplerOverrides") or {}).items()
-                                         if k in PROXY_SAMPLER_FIELDS and str(v).strip() != ""},
-                           "sampSource": (p.get("samplerSource") or "server"),
-                           "upstream": "http://127.0.0.1:%d" % int(up), "server": str(up)}
+                out[lp] = provider_route(p, s, up, gpu_ids)
         return out
 
     def sync(self):
@@ -5770,37 +10712,62 @@ class ProxyManager:
                     threading.Thread(target=srv.shutdown, daemon=True).start()
                     panel_log("[proxy] closed listener :%d" % lp)
                 except Exception: pass
+            _lh = listen_host(st)
+            # a listener bound for the wrong world (remoteIp changed) is recreated
+            for lp in [p for p in list(self._servers)
+                       if p in want and self._servers[p].server_address[0] != _lh]:
+                try:
+                    srv = self._servers.pop(lp)
+                    import threading
+                    threading.Thread(target=srv.shutdown, daemon=True).start()
+                    panel_log("[proxy] rebinding listener :%d for %s" % (lp, _lh))
+                except Exception: pass
             for lp in [p for p in want if p not in self._servers]:
                 try:
-                    srv = _QuietServer(("0.0.0.0", lp), _mk_handler(self, lp))
+                    srv = _QuietServer((_lh, lp), _mk_handler(self, lp))
                     self._servers[lp] = srv
                     import threading
                     threading.Thread(target=srv.serve_forever, daemon=True).start()
-                    panel_log("[proxy] listening :%d -> %s" % (lp, want[lp]["title"]))
+                    panel_log("[proxy] listening :%d -> %s%s"
+                              % (lp, want[lp]["title"],
+                                 "  (reasoning off on the server: requests carry "
+                                 "enable_thinking=false)"
+                                 if want[lp].get("serverReasoning") == "off" else ""))
                 except OSError as e:
                     panel_log("[proxy] FAILED to bind :%d (%s)" % (lp, e))
                     log_error("proxy", "failed to bind :%d (%s)" % (lp, e))
         return {"listening": sorted(self._servers)}
 
-    def report(self, rt, think, usage, timings, ms, wait_ms):
-        inp = out = pf = dc = None
-        if timings:
-            inp, out = timings.get("prompt_n"), timings.get("predicted_n")
-            pf, dc = timings.get("prompt_per_second"), timings.get("predicted_per_second")
-        if inp is None and usage: inp = usage.get("prompt_tokens")
-        if out is None and usage: out = usage.get("completion_tokens")
+    def report(self, rt, think, usage, timings, ms, wait_ms, said="", speaker="",
+               actor="", drill=False, req_body=None, streaming=False):
+        met = chat_metrics(timings, usage)      # no secs: a provider line never guessed
+        inp, out = met["tok_in"], met["tok_out"]
+        pf, dc = met["pf"], met["dc"]
         tn = round(len(think) / 4) if think else 0
         emoji = rt.get("emoji") or "\u2022"
-        line = ("[%s] %s %-13s [%s]  %6s / %5s %-8s tok  %5s / %3s tps  %8.3f sec  %s" % (
-            _stamp(), emoji, rt["title"], rt["server"],
-            inp if inp is not None else "?", out if out is not None else "?",
-            ("(~%d)" % tn) if tn else "", ("%.0f" % float(pf)) if pf else "?",
-            ("%.0f" % float(dc)) if dc else "?", ms / 1000.0,
-            ("+%d ms" % wait_ms) if wait_ms > 0 else ""))
+        # a drilldown record wears its provider's title with the drill mark, so the
+        # provider filter still owns it and the eye still knows whose traffic it is
+        line = proxy_line_text(emoji, rt["title"] + (DRILL_MARK if drill else ""),
+                               rt["server"], inp, out, tn, pf, dc,
+                               ms / 1000.0,
+                               ("+%d ms" % wait_ms) if wait_ms > 0 else "",
+                               cached=(met["cached"] if rt.get("slot") is not None
+                                       else None))
+        # a route that carried its request through _chat left it here for the record
+        _req = req_body if req_body is not None else rt.pop("_sent", None)
+        _resp = said or rt.pop("_said", "")
+        if _req is not None:
+            pid = self.pay_add(rt, _req, _resp, think, ms, inp, out, streaming)
+            if pid is not None:
+                # the id the painter turns into a click target and strips from view
+                line += "  \u27e6%d\u27e7" % pid
         ld = log_dir()
         try:
             with open(os.path.join(ld, "%s_dashboard.log" % self.session), "a", encoding="utf-8") as f:
-                f.write(line.rstrip() + "\n")
+                f.write(line + "\n")
+            if said:
+                thought_lines(said, speaker)
+                action_line(said, actor, drill=drill)
             if think and think.strip():
                 with open(os.path.join(ld, "%s_thinking.log" % self.session), "a", encoding="utf-8") as f:
                     f.write("\n%s\n[%s] %s [%s]  (~%d tok est)\n%s\n%s\n" % (
@@ -5923,7 +10890,12 @@ def _mk_handler(mgr, listen_port):
                 log_error("proxy", "refused a %d byte body on :%d" % (length, listen_port))
                 return
             body = self.rfile.read(length) if length else None
-            note_speaker(body)          # reads a name, keeps nothing else
+            # the name comes back so the thought in the REPLY can be attributed to the
+            # character this request was for. Reading it off the shared queue instead
+            # was a race: a spoken line arriving in between takes the entry.
+            speaker = note_speaker(body)
+            actor = note_actor(body)    # a different prompt shape, a different name
+            drill = is_action_drill(body)   # the second stage of an action pick
             is_chat = wants_stream = False
             if self.command == "POST" and self.path.startswith("/v1/chat/completions") and body:
                 is_chat = True
@@ -5932,13 +10904,6 @@ def _mk_handler(mgr, listen_port):
             if is_chat and body:
                 try:
                     d = json.loads(body)
-                    ck = d.setdefault("chat_template_kwargs", {})
-                    if not rt.get("thinking"):
-                        ck["enable_thinking"] = False
-                    else:
-                        ck.pop("enable_thinking", None)
-                        if not ck:
-                            d.pop("chat_template_kwargs", None)
                     # observe the sampler params SkyrimNet sent for THIS provider (by its port)
                     seen = {}
                     for _k, _field in PROXY_SAMPLER_FIELDS.items():
@@ -5950,16 +10915,9 @@ def _mk_handler(mgr, listen_port):
                             sse_notify("state")      # tell the page: these are new numbers
                         except Exception:
                             pass
-                    # Server Side: the panel's values are final. SkyrimNet Side: pass through.
-                    ov = (rt.get("overrides") or {}) if rt.get("sampSource", "server") == "server" else {}
-                    for _k, _val in ov.items():
-                        _field = PROXY_SAMPLER_FIELDS.get(_k)
-                        if not _field:
-                            continue
-                        try:
-                            d[_field] = int(_val) if _k == "top_k" else float(_val)
-                        except Exception:
-                            continue
+                    # Thinking, then Server Side overrides - the same function the panel's
+                    # own calls go through, so a provider cannot honour one and not the other
+                    apply_route_shape(d, rt)
                     body = json.dumps(d).encode("utf-8")
                 except Exception:
                     pass
@@ -5974,6 +10932,7 @@ def _mk_handler(mgr, listen_port):
             gate_held = is_chat
             wait_ms = mgr.gate.enter(rt["gpu"], is_high) if gate_held else 0
             t0 = time.time()
+            mgr._infl(rt.get("port") or 0, 1)
             try:
                 try:
                     resp = self._forward(rt, body)
@@ -5997,7 +10956,7 @@ def _mk_handler(mgr, listen_port):
                     self.wfile.write(data); return
                 if wants_stream:
                     self._send_head(resp, streaming=True)
-                    think, usage, timings = [], None, None
+                    think, said, usage, timings = [], [], None, None
                     while True:
                         line = resp.readline()
                         if not line: break
@@ -6011,10 +10970,15 @@ def _mk_handler(mgr, listen_port):
                         if "timings" in obj: timings = obj["timings"]
                         if obj.get("usage"): usage = obj["usage"]
                         ch = obj.get("choices") or []
-                        if ch and rt["thinking"]:
+                        if ch:
                             d = ch[0].get("delta", {})
-                            if d.get("reasoning_content"): think.append(d["reasoning_content"])
-                    mgr.report(rt, "".join(think), usage, timings, round((time.time() - t0) * 1000), wait_ms)
+                            if d.get("content"): said.append(d["content"])
+                            if rt["thinking"] and d.get("reasoning_content"):
+                                think.append(d["reasoning_content"])
+                    mgr.report(rt, "".join(think), usage, timings,
+                               round((time.time() - t0) * 1000), wait_ms,
+                               said="".join(said), speaker=speaker, actor=actor,
+                               drill=drill, req_body=body, streaming=True)
                     return
                 data = resp.read(); ms = round((time.time() - t0) * 1000)
                 self._send_head(resp, streaming=False)
@@ -6023,12 +10987,15 @@ def _mk_handler(mgr, listen_port):
                 try:
                     j = json.loads(data); msg = j["choices"][0]["message"]
                     mgr.report(rt, (msg.get("reasoning_content") or "") if rt["thinking"] else "",
-                               j.get("usage"), j.get("timings"), ms, wait_ms)
+                               j.get("usage"), j.get("timings"), ms, wait_ms,
+                               said=(msg.get("content") or ""), speaker=speaker,
+                               actor=actor, drill=drill, req_body=body)
                 except Exception:
                     panel_log("[proxy] %s unparseable - passed through" % rt["title"])
                     log_error("proxy " + rt["title"], "unparseable non-stream body")
                     mgr.note_error(rt, "parse")
             finally:
+                mgr._infl(rt.get("port") or 0, -1)
                 if gate_held:
                     mgr.gate.leave(rt["gpu"], is_high)
     return _P
@@ -6112,12 +11079,19 @@ def api_provider_edit(body):
     hit = next(((s, p) for s, p in allp if p.get("id") == body.get("id")), None)
     if not hit: return {"error": "unknown provider"}
     s, p = hit
-    if "samplerSource" in body:
+    panel_owned = p.get("id") in PANEL_PROV_IDS
+    if "samplerSource" in body and not panel_owned:
         p["samplerSource"] = "skyrimnet" if str(body["samplerSource"]) == "skyrimnet" else "server"
-    if "detectSN" in body:
+    if "detectSN" in body and not panel_owned:
         p["detectSN"] = bool(body["detectSN"])
+    if "cache" in body:
+        p["cache"] = bool(body["cache"]) if not isinstance(body["cache"], str) \
+            else body["cache"].lower() in ("1", "true", "on")
     if "title" in body:
         p["title"] = str(body["title"]).strip()[:40] or p["title"]
+    if "port" in body and panel_owned:
+        return {"error": "%s is called by the panel, so it has no provider port"
+                         % (p.get("title") or p.get("id"))}
     if "port" in body:
         ps = str(body["port"]).strip()
         if not re.fullmatch(r"\d{4}", ps):
@@ -6127,7 +11101,12 @@ def api_provider_edit(body):
             return {"error": "port %d is already taken" % np}
         p["port"] = np
     if "enabled" in body:
-        p["enabled"] = bool(body["enabled"]) if not isinstance(body["enabled"], str) else body["enabled"].lower() in ("1", "true", "on")
+        _on = bool(body["enabled"]) if not isinstance(body["enabled"], str) else body["enabled"].lower() in ("1", "true", "on")
+        if panel_owned:
+            _spec = panel_prov(p.get("id"))
+            cfg.setdefault("settings", {})[_spec["setting"]] = "on" if _on else "off"
+        else:
+            p["enabled"] = _on
     if "thinking" in body:
         p["thinking"] = bool(body["thinking"]) if not isinstance(body["thinking"], str) else body["thinking"].lower() in ("1", "true", "on")
     if "priority" in body:
@@ -6138,10 +11117,8 @@ def api_provider_edit(body):
         if pv not in (0, 1, 2):
             return {"error": "priority must be 0, 1 or 2"}
         p["priority"] = pv
-    if "emoji" in body:
+    if "emoji" in body and not panel_owned:
         p["emoji"] = str(body["emoji"]).strip()[:8]
-    if "enabled" in body:
-        p["enabled"] = bool(body["enabled"]) if not isinstance(body["enabled"], str) else body["enabled"].lower() in ("1", "true", "on")
     save_config(cfg); PROXY.sync()
     return {"ok": True}
 
@@ -6215,6 +11192,8 @@ def _mem_mib(g):
 DEFAULT_PROVIDER_EMOJI = {
     "Dialogue": "\U0001F4AC", "GM": "\U0001F3B2", "Combat": "\u2694\uFE0F", "Meta": "\U0001F9EA",
     "UT": "\U0001F310", "AI-Assistant": "\U0001F916", "ActionEval": "\U0001F3C3",
+    "NE-Composer": "\U0001F3BC", "NE-Director": "\U0001F3AC",
+    "AE-Impulse": "\U0001F4A5", "AE-Resolve": "\u2696\uFE0F",
     "Charbio": "\U0001F3AD", "Diary": "\u270D\uFE0F", "Memory": "\U0001F9E0",
     "Vision": "\U0001F441\uFE0F", "IntelEngine": "\U0001F6F0\uFE0F", "SeverActions": "\U0001F4DC"}
 PROV_TALK = {"dialogue", "combat", "ut", "ai-assistant"}   # these speak to the player
@@ -6357,14 +11336,30 @@ def client_scope(handler):
         return "host" if dev_mode() else "remote"
     return None                              # external: always denied
 
+def listen_host(st=None):
+    """Where a LAN-facing listener binds: 0.0.0.0 only when a second PC is actually
+    configured (a remote SkyrimNet IP for the proxy and TTS wrapper). With nothing
+    remote configured, every listener stays on 127.0.0.1 - the application-layer
+    allowlists still apply either way, but a socket that is not offered to the LAN
+    cannot be probed from it at all."""
+    st = st or (load_config().get("settings", {}))
+    return "0.0.0.0" if str(st.get("remoteIp") or "").strip() else "127.0.0.1"
+
+
 # Endpoints a read-only remote viewer MAY call. Everything else is host-only.
 REMOTE_READ_OK = {
     "/", "/index", "/index.html",
     "/api/state", "/api/events", "/api/heartbeat", "/api/bye",
     "/api/client-error", "/icon.ico", "/favicon.ico",
+    # replay is read-only by nature: it serves a kept wav by basename. Allowing it
+    # remotely is the whole point of the button on a two-PC setup - open the panel
+    # in a browser on the game PC and the click plays THERE, on those speakers,
+    # which is exactly where the TTS audio normally lands.
+    "/api/tts-audio",
 }
-# /api/tail is allowed for remote for the FIXED feeds only - dashboard, thinking and
-# tts - and never kind=file, which would read an arbitrary path. Checked in the dispatcher.
+# The only tail feeds a remote session may read. Each is a fixed filename inside the log
+# folder, so none of them carries a caller-supplied path the way kind=file does.
+REMOTE_TAIL_KINDS = frozenset(("dashboard", "thinking", "tts", "ttssrv", "ptipme"))
 #
 # Those feeds carry content, not only numbers: thinking holds the model's reasoning and
 # tts holds spoken dialogue, including the player's own lines and character names. That is
@@ -6480,7 +11475,10 @@ def redact_state(st):
     for k in ("panelIp", "remoteIp", "yamlGeneratedIp"):
         if se.get(k):
             se[k] = _mask_ip(se[k])
-    for k in ("llamacppPath", "modelsDir", "outputDir", "templateFile", "logDir", "yamlPath", "yamlDir", "mo2Path"):
+    for k in ("llamacppPath", "modelsDir", "outputDir", "templateFile", "logDir",
+              "yamlPath", "yamlDir", "mo2Path", "launcherDir", "ttsServerExe",
+              "ttsModel", "ttsOutDir", "ttsVoiceDir", "yamlOutDir",
+              "ttsAcppDir", "ttsAcppExe", "ttsAcppModelsDir", "ttsAcppModel"):
         if se.get(k):
             se[k] = _mask_path(se[k])
     if se.get("peerAddr"):
@@ -6497,13 +11495,18 @@ def redact_state(st):
         return _mask_uuid(v) if isinstance(v, str) and v.upper().startswith("GPU-") else v
     def scrub_slot(s):
         if s.get("gpu"): s["gpu"] = _mask_gpu_tag(s["gpu"])
-        for key in ("script",):
+        for key in ("script", "scriptSrc"):
             if s.get(key): s[key] = _mask_path(s[key])
         if s.get("model"): s["model"] = _mask_path(s["model"])
         # The card carries its own copy of the model, projector and draft paths, and
         # Live Network draws the server boxes from those - so masking only the field
         # above left the filenames on screen for a remote viewer to read.
         pr = s.get("params") or {}
+        # the WHOLE hand-written launcher rides in params: absolute paths, log
+        # folders, GPU serials, environment lines. A remote viewer gets none of it -
+        # the field leak that prompted this line was the entire 43 KB script.
+        pr.pop("custom", None)
+        pr.pop("prevCustom", None)
         for key in ("model", "vision", "draft"):
             if pr.get(key) and pr[key] not in ("N/A", "Disabled"):
                 pr[key] = _mask_path(pr[key])
@@ -6511,6 +11514,14 @@ def redact_state(st):
             pass  # provider titles/ports are routing info, kept visible (masked of nothing host-identifying)
     for s in st.get("slots", []) or []:
         scrub_slot(s)
+    for c in st.get("creatorSlots", []) or []:
+        # a Creator template's body is a launcher: paths, env lines, sometimes a
+        # pinned GPU serial. The remote page never edits one, so it gets none.
+        if "content" in c:
+            c["content"] = ""
+        for key in ("model", "vision", "draft", "dest"):
+            if c.get(key) and c[key] not in ("N/A", "Disabled"):
+                c[key] = _mask_path(c[key])
     for s in st.get("routing", []) or []:
         if s.get("model"): s["model"] = _mask_path(s["model"])
         if s.get("gpu"): s["gpu"] = _mask_gpu_tag(s["gpu"])
@@ -6610,12 +11621,23 @@ class Handler(BaseHTTPRequestHandler):
                 SSE_CLIENTS.discard(q)
             return
         if u.path == "/" or u.path.startswith("/index"):
-            self._send(200, "text/html; charset=utf-8", PAGE.replace("__UIV__", APP_VER_UI).replace("__TSKINDS__", json.dumps(list(TERM_SCALE_KINDS))))
+            self._send(200, "text/html; charset=utf-8", PAGE.replace("__UIV__", APP_VER_UI).replace("__APPTAG__", APP_RELEASE_TAG).replace("__TSKINDS__", json.dumps(list(TERM_SCALE_KINDS))).replace("__MOODS__", json.dumps(mood_icon_names())))
         elif u.path == "/api/state":
             _st = api_state()
             if getattr(self, "_scope", "host") == "remote":
                 _st = redact_state(_st)
             self._send(200, "application/json", json.dumps(_st))
+        elif u.path == "/api/higgs-progress":
+            # Deliberately NOT part of /api/state. A progress bar has to move while
+            # the panel is busy, and "is anything busy?" is exactly what gates a
+            # queued reload - so an install, which is busy by definition, could
+            # never get one through. Reads one dict: no config, no disk, no locks.
+            _g = dict(HIGGS_INSTALL)
+            # computed HERE, not from two clocks: the page has no business
+            # subtracting a server timestamp from its own wall time
+            _g["idle"] = (round(max(0.0, time.time() - _g["at"]), 1)
+                          if _g.get("at") else 0.0)
+            self._send(200, "application/json", json.dumps(_g))
         elif u.path == "/api/models":
             self._send(200, "application/json", json.dumps({"models": list_models(load_config())}))
         elif u.path == "/api/templates":
@@ -6635,6 +11657,16 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "application/json", json.dumps(PROXY.stats_snapshot(getattr(self, "_scope", "host") == "remote")))
         elif u.path == "/api/errors":
             self._send(200, "application/json", json.dumps(api_errors_snapshot(getattr(self, "_scope", "host") == "remote")))
+        elif u.path == "/api/tts-audio":
+            # replay a spoken line: the wav say_line named is still in the worker's
+            # own out-dir until prune() rotates it - the click window IS the keep
+            # window, honestly
+            aid = os.path.basename(parse_qs(u.query).get("id", [""])[0])
+            p = os.path.join(TTSW.dir(), "out-%s.wav" % aid) if aid else ""
+            if aid and os.path.isfile(p):
+                self._send(200, "audio/wav", open(p, "rb").read())
+            else:
+                self._send(404, "text/plain", "that line's audio has rotated out")
         elif u.path == "/api/log-download":
             name = os.path.basename(parse_qs(u.query).get("f", [""])[0])
             p = os.path.join(log_dir(), name)
@@ -6681,6 +11713,7 @@ class Handler(BaseHTTPRequestHandler):
             "/api/higgs-install": api_higgs_install,
             "/api/higgs-adopt": api_higgs_adopt,
             "/api/launch-stack": api_launch_stack, "/api/show-terminal": api_show_terminal,
+            "/api/slot-log": api_slot_log, "/api/tts-thought": api_tts_thought,
             "/api/creator-add": api_creator_add, "/api/creator-remove": api_creator_remove,
             "/api/launcher-content": api_launcher_content,
             "/api/provider-add": api_provider_add, "/api/provider-remove": api_provider_remove,
@@ -6714,17 +11747,32 @@ class Handler(BaseHTTPRequestHandler):
             "/api/yaml-space-save": api_yaml_space_save, "/api/yaml-space-remove": api_yaml_space_remove,
             "/api/yaml-open-native": api_yaml_open_native,
             "/api/slot-params": api_slot_params, "/api/slot-launcher": api_slot_launcher,
-            "/api/llama-update": api_llama_update, "/api/app-update": api_app_update, "/api/peer": api_peer,
+            "/api/llama-update": api_llama_update, "/api/app-update": api_app_update, "/api/peer": api_peer, "/api/tts-replay": api_tts_replay,
             "/api/slot-launcher-save": api_slot_launcher_save, "/api/slot-launcher-load": api_slot_launcher_load,
             "/api/slot-launcher-default": api_slot_launcher_default, "/api/slot-launcher-revert": api_slot_launcher_revert,
             "/api/stats-reset": api_stats_reset,
             "/api/errors-clear": api_errors_clear,
+            "/api/acpp-report": api_acpp_report,
+            "/api/tts-diag": api_tts_diag,
+            "/api/proxy-payload": api_proxy_payload,
+            "/api/tts-diagnose": api_tts_diagnose,
+            "/api/tts-autocal-info": api_tts_autocal_info,
+            "/api/tts-meter": api_tts_meter,
+            "/api/tts-sampler": api_tts_sampler,
         }
-        REMOTE_POST_OK = {"/api/tail", "/api/client-error", "/api/heartbeat", "/api/bye"}
+        # tts-thought joins the remote list deliberately: the second PC's viewer may
+        # click a thought and have the host synthesize it - the same LAN trust that
+        # lets that page hear every replay. It writes only a cached wav in the tts
+        # spool and broadcasts a replay id; nothing else on the host moves.
+        REMOTE_POST_OK = {"/api/tail", "/api/client-error", "/api/heartbeat", "/api/bye",
+                          "/api/tts-thought"}
         if getattr(self, "_scope", "host") == "remote":
             if self.path not in REMOTE_POST_OK:
                 self._send(403, "application/json", '{"error":"read-only remote session - this action is host-only"}'); return
-            if self.path == "/api/tail" and str((body or {}).get("kind", "")) == "file":
+            # an ALLOWLIST, not "everything except file". A kind added later that takes
+            # a caller-supplied path would otherwise be reachable from remote by default.
+            if (self.path == "/api/tail"
+                    and str((body or {}).get("kind", "")) not in REMOTE_TAIL_KINDS):
                 self._send(403, "application/json", '{"error":"read-only remote session"}'); return
         # Starting a server takes seconds and touches no config, so holding the lock for
         # it made the OTHER launch button wait on this one. Those two run unlocked.
@@ -6763,7 +11811,8 @@ PAGE = """<!doctype html>
   <link rel="icon" href="/icon.ico?v=210">
   <style>
   :root { --bg:#0d0e10; --card:#151619; --edge:#26282d; --txt:#ececf1; --dim:#9aa0a8;
-          --acc:#b5f320; --ok:#3fdd78; --warn:#eab308; --err:#ef4444; --selglow:#000000; }
+          --acc:#b5f320; --ok:#3fdd78; --warn:#eab308; --err:#ef4444; --selglow:#000000;
+          --line:#2a2d34; }
   * { box-sizing:border-box; }
   @font-face {
     font-family: "EmojiMatched";
@@ -6835,6 +11884,22 @@ PAGE = """<!doctype html>
          border:none; border-radius:12px;
           padding:14px 16px; margin-bottom:14px; }
   .row { display:flex; align-items:center; gap:10px; flex-wrap:wrap; }
+  /* the card's FIRST row holds its shape: title, port, status and the close all
+     stay on one line, and it is the title that gives way - ellipsised, never the
+     close symbol pushed onto a second row */
+  .row.shead { flex-wrap:nowrap; min-width:0; }
+  .row.shead .label { flex:0 1 auto; min-width:0; overflow:hidden;
+                      text-overflow:ellipsis; white-space:nowrap; }
+  .row.shead .mismatch { flex:0 1 auto; min-width:0; overflow:hidden;
+                         text-overflow:ellipsis; white-space:nowrap; }
+  .row.shead .icon, .row.shead .x { flex:0 0 auto; }
+  /* the second row: port capsule and status pill side by side. The port wears the
+     pill's own shape in quiet grey, as asked. */
+  .row.srow2 { margin-top:8px; margin-bottom:6px; }
+  .card .alloclink { display:inline-block; margin-top:2px; }
+  .srvport { font-size:11px; padding:2px 10px; border-radius:999px; cursor:pointer;
+             background:#262b33; border:1px solid var(--edge); color:#b7bec9; }
+  .srvport:hover { border-color:#4a5260; color:#e6ebf2; }
   .label { font-size:18.4px; font-weight:600; }
   .chip { font-size:11px; padding:2px 8px; border-radius:999px;  color:var(--dim); }
   .chip.clickable { cursor:pointer; }
@@ -6915,7 +11980,7 @@ PAGE = """<!doctype html>
   pre.log { background:#0d0f13; border:none;
             box-shadow:0 0 14px -2px rgba(0,0,0,.8); border-radius:8px;
             padding:8px 10px; font-size:11.5px; white-space:pre-wrap; color:var(--dim);
-            max-height:170px; overflow:auto; margin:10px 0 0; display:none; }
+            height:170px; overflow:auto; margin:10px 0 0; display:none; }
   /* ---- Live Network: top-down layout, drop zones, trace glow ---- */
   .netwrap { position:relative; padding:16px 6px 8px; overflow-x:auto; }
   .netwrap.netbusy { pointer-events:none; opacity:.72; }
@@ -7043,6 +12108,7 @@ PAGE = """<!doctype html>
   .ver.uptodate { color:#7ee081; text-shadow:0 0 5px rgba(126,224,129,.45); }
   .ver.behind { color:#e0c23c; text-shadow:0 0 9px rgba(224,194,60,.95);
                 animation:verpulse 1.6s ease-in-out infinite; }
+  @keyframes higgsIdle { 0% { background-position:0 0; } 100% { background-position:28px 0; } }
   @keyframes verpulse { 0%,100% { text-shadow:0 0 5px rgba(224,194,60,.55); }
                         50% { text-shadow:0 0 14px rgba(224,194,60,1); } }
   .peerview [data-hostonly] { display:none !important; }
@@ -7101,7 +12167,10 @@ PAGE = """<!doctype html>
   }
   .sw input:checked + span::before { transform:translate(17px, -50%); }
   .sw input:disabled + span { opacity:.45; cursor:default; }
-  .swlab { display:inline-flex; align-items:center; gap:8px; cursor:pointer; }
+  /* nowrap or a narrow cell breaks the word onto its own line under the switch,
+     which reads as a caption rather than the switch's own label */
+  .swlab { display:inline-flex; align-items:center; gap:8px; cursor:pointer;
+           white-space:nowrap; }
   .tsel { min-width:0 !important; width:auto; padding:5px 26px 5px 9px; background-position:right 8px center; }
   .tfont { max-width:170px; }
   .gputog { flex:none; display:flex; justify-content:flex-start; width:46px; }
@@ -7145,33 +12214,132 @@ PAGE = """<!doctype html>
   }
   .gcode.copied-flash { animation:gcodePulse .42s ease-out 1; }
   /* the TTS page is a long column of settings; without room they read as one blob */
-  #dpane-tts .set > label { display:block; margin:20px 0 7px; font-weight:600; }
+  #dpane-tts .set > label { display:block; margin:26px 0 8px; font-weight:600;
+                            color:#eef2f7; }
   #dpane-tts .set > label:first-of-type { margin-top:4px; }
-  #dpane-tts .set > .row { margin-bottom:2px; }
-  #dpane-tts .set > .hint { margin:7px 0 4px; line-height:1.7; }
+
+  #dpane-tts .set > .hint { margin:8px 0 6px; line-height:1.7; }
+  /* the settings below a heading, spaced so a row reads as one thing */
+  #dpane-tts .set > .row { margin-bottom:6px; }
+  #dpane-tts .set > .row + .hint { margin-top:6px; }
   #dpane-tts .tgnote { margin:7px 0 4px !important; line-height:1.7; }
   #dpane-tts .tgroup { margin:24px 0 4px; padding-top:18px;
                        border-top:1px solid rgba(255,255,255,.07); }
   /* The branch under a spoken line. Drawn rather than typed: a stretched box glyph
      overlapped its neighbour and the glow doubled up at the join. An inline-block
      exactly one row tall meets the next one and no more. */
+  /* one row, one block. An empty row still occupies its height, which a bare <div>
+     would not, so the terminal keeps the spacing the log was written with. */
+  /* GROUND-UP ROWS, second cut: a row grows ONLY by wrapping its own text. Every
+     row's content comes from a split on LF with the CR scrubbed at the door, so no
+     embedded break can exist inside one - the gate feeds a poisoned tail and
+     asserts exactly that. min-height keeps an empty row in place; no fixed height
+     and no overflow clip, so wrapped dialogue hangs under itself again and the
+     glow effects render whole instead of being sliced at the row's edge. */
+  .tail .tl { display:block; min-height:1.5em; line-height:1.5em;
+              white-space:pre-wrap; overflow-wrap:normal; word-break:normal; }
+  /* the cap on record rows: fixed height, no clip - the glow halo stays whole and
+     the rhythm cannot move, whatever the row's insides try */
+  .tail .tl.one { height:1.5em; }
   .tail .tbr, .tail .tbrend { display:inline-block; position:relative;
-                              width:2ch; height:1.6em; vertical-align:top; }
+                              width:2ch; height:100%; min-height:1.3em;
+                              vertical-align:top; }
   .tail .tbr::before, .tail .tbrend::before { content:""; position:absolute;
                               left:.45ch; top:0; border-left:1.6px solid var(--acc);
                               box-shadow:0 0 4px var(--acc), 0 0 10px var(--acc), 0 0 20px var(--acc); }
   .tail .tbr::before    { height:100%; }        /* carries on to the next row */
-  .tail .tbrend::before { height:50%; }         /* stops at the elbow */
+  /* stops at the elbow - a fixed half-row, NOT half of a wrapped row */
+  .tail .tbrend::before { height:.8em; }         /* stops at the elbow */
+  /* .8em, NOT 50%: the branch is now as tall as the whole row, so 50% of a line that
+     wrapped onto two rows put the elbow on the boundary between them - a stray
+     horizontal beside the continuation. A fixed half-row always lands on the first. */
   .tail .tbr::after, .tail .tbrend::after { content:""; position:absolute;
-                              left:.45ch; top:50%; width:1.25ch;
+                              left:.45ch; top:.8em; width:1.25ch;
                               border-top:1.6px solid var(--acc);
                               box-shadow:0 0 4px var(--acc), 0 0 10px var(--acc),
                                           0 0 20px var(--acc); }
-  /* a section heading on the TTS page, with the rule that separates it from the last */
-  #dpane-tts .tsect { margin:26px 0 10px; padding-top:16px; font-size:14px;
-                      font-weight:700; letter-spacing:.4px; color:var(--txt);
-                      border-top:1px solid rgba(255,255,255,.07); }
-  #dpane-tts .tsect:first-child { margin-top:6px; padding-top:0; border-top:none; }
+  /* A section heading on the TTS page. Banded rather than ruled: the page is long
+     enough that a hairline was not enough to tell one group of settings from the next. */
+  #dpane-tts .tsect { margin:34px 0 16px; padding:9px 13px; font-size:13.5px;
+                      font-weight:700; letter-spacing:.5px; color:var(--txt);
+                      text-transform:uppercase;
+                      background:rgba(255,255,255,.045); border-radius:7px;
+                      border-left:3px solid var(--acc);
+                      box-shadow:0 1px 0 rgba(255,255,255,.03) inset; }
+  #dpane-tts .tsect:first-child { margin-top:4px; }
+
+  /* A title that carries its own explanation. Hovering lifts it and shows the tooltip,
+     which keeps the descriptions off the page until they are wanted. */
+  /* white and two steps up from the 12px field label: these name a feature, and at
+     the dim field size they read as one more caption in a long column. */
+  #dpane-tts label.ttl { cursor:help; color:#fff; font-size:14px; font-weight:700;
+                         transition:color .12s, text-shadow .12s; }
+  #dpane-tts label.ttl:hover { color:#fff; text-shadow:0 0 8px rgba(255,255,255,.75),
+                                                       0 0 18px rgba(255,255,255,.35); }
+  #dpane-tts label.ttl .qm,
+  #dpane-tts button .qm { display:inline-block; margin-left:7px; width:15px;
+                             height:15px; line-height:15px; text-align:center;
+                             font-size:10.5px; font-weight:800; border-radius:50%;
+                             color:var(--acc); background:rgba(181,243,32,.13);
+                             vertical-align:1px; }
+  #dpane-tts label.ttl:hover .qm,
+  #dpane-tts button:hover .qm { color:#fff; background:rgba(255,255,255,.18); }
+  /* patch112: the two calibration rows. A class, not per-call inline style, so
+     there is ONE copy of the row rules and the height rule below can reach every
+     control in it. flex-start: each cell stacks a title over its control, and
+     the controls share a top edge only if the cells do. The global .row
+     centering never applies here - this row is not a .row. */
+  #dpane-tts .calrow { display:flex; flex-wrap:nowrap; gap:12px;
+                       align-items:flex-start; margin-bottom:6px; }
+  #dpane-tts .calrow .calcell { min-width:0; }
+  /* the spring between the last setting and the Prompt button: it collapses
+     first when the card narrows, so the fixed cells never push one another
+     out of the card */
+  #dpane-tts .calrow .calgap { flex:1 1 0; min-width:0; }
+  /* patch113: every select on this page is REPLACED at runtime by a .selwrap
+     stand-in (enhanceSelects), which carries the select's classes and nothing
+     else - so a width set on `select`, or inline on it, never reaches the box
+     that is actually on screen, and the stand-in falls back to the width of its
+     own longest line. That is what handed the server menu 546px of model name.
+     These name the class BOTH wear, the way .pctl already does.
+     One height for menu and button: a select and a button do not share one by
+     default (the button carries borders the select does not), and two controls
+     line up only if nothing about their boxes is left free to differ. */
+  #dpane-tts .calrow .calsel, #dpane-tts .calrow button.stop {
+    height:32px; box-sizing:border-box; }
+  #dpane-tts .calrow .calsel { min-width:0; }
+  #dpane-tts .calrow .setsel { width:100%; }
+  #dpane-tts .calrow .srvsel { width:300px; max-width:100%; }
+  /* patch114: the row's height is SET, not discovered. Anything in a cell that
+     comes out taller than the control re-centres that control inside it, and
+     the two menus stop sharing a top edge - the switch label's line box did
+     exactly that, by 9px, which is what read as "still not aligned". 32px in
+     both cells, whatever the cell turns out to hold. */
+  #dpane-tts .calrow .row { height:32px; align-items:center; }
+  /* and the word stands clear of the switch by a MARGIN, which does not care
+     what the label's display computes to. A flex gap does, and it read as zero
+     here through two patches: 10px asked for, 0px on the glass, measured. */
+  #dpane-tts .calrow .swlab { height:32px; gap:0; }
+  #dpane-tts .calrow .swlab .sw { margin-right:14px; }
+  /* a terminal record that can be OPENED: the emoji and title wear this. At rest it
+     is the text it always was - the button shows itself under the hand, as a pill,
+     never by restyling the glyphs */
+  .plpay { cursor:pointer; }
+  .plpay:hover { text-shadow:0 0 7px var(--acc),
+                             0 0 16px color-mix(in srgb, var(--acc) 55%, transparent);
+                 filter:drop-shadow(0 0 5px color-mix(in srgb, var(--acc) 75%, transparent)); }
+  /* styled EXACTLY like the moodic cell on the spoken rows - the one mark cell
+     every field screenshot proves tight (spoken rows 27px against record rows 44px
+     on the same screen, current page). Two theoretical fixes - a height cap, then
+     top alignment - each measured TALLER in the field than this plain box, so the
+     field wins the argument: no height, no line-height, no vertical-align. */
+  .tail .pcell { display:inline-block; width:2ch; text-align:center; }
+  .payhead { font-size:11px; font-weight:700; letter-spacing:.06em; color:var(--warn);
+             margin:0 0 6px; }
+  .paypre { margin:0; padding:10px; white-space:pre-wrap; word-break:break-word;
+            font-size:12px; line-height:1.5; border:1px solid var(--line);
+            border-radius:8px; flex:1; min-height:0; overflow:auto;
+            font-family:ui-monospace,Consolas,monospace; }
   /* the one step nothing can detect. Pulsing so it reads as waiting on you, not broken */
   .gmanual { margin-top:6px; font-size:11px; font-weight:700; letter-spacing:.04em;
              text-transform:uppercase; color:var(--ok); text-align:center;
@@ -7182,6 +12350,49 @@ PAGE = """<!doctype html>
                                         0 0 18px rgba(181,243,32,.5); }
   }
   @media (prefers-reduced-motion: reduce) { .gmanual { animation:none; opacity:1; } }
+  /* the mood icon says what it means on hover - the dotted underline is the only hint
+     that it is worth pointing at */
+  .moodic[title] { cursor:help; }
+  .moodic[title]:hover { filter:drop-shadow(0 0 6px var(--acc)); }
+  /* a second path through the welcome, lit blue so it does not compete with the accent
+     button that is still the main way in */
+  .bluebtn { color:#8cc6ff; text-shadow:0 0 8px rgba(77,163,255,.95); }
+  .bluebtn:hover { text-shadow:0 0 6px rgba(77,163,255,1), 0 0 16px rgba(77,163,255,.8),
+                               0 0 30px rgba(77,163,255,.5); }
+  /* a control that cannot work yet - dimmed, and it says why on hover */
+  .needllm { opacity:.45; cursor:help; margin-bottom:12px; }
+  .needllm select { cursor:help; }
+  .needllm:hover { opacity:.62; }
+  /* the panel's own mark, and the names beside it, lit like the accent */
+  .tail .pmark { vertical-align:-4px; border-radius:4px;
+                 filter:drop-shadow(0 0 5px var(--acc)) drop-shadow(0 0 12px var(--acc)); }
+  .tail .pown { color:var(--acc); font-weight:700;
+                text-shadow:0 0 7px var(--acc), 0 0 16px rgba(181,243,32,.55); }
+  /* The headroom reading. It is what the whole section exists to produce, and it was
+     one long sentence with four numbers and two outcomes buried in it. One box per
+     figure instead, lit the way the Live Network boxes are, centred and wrapping to a
+     second row rather than running off the card. */
+  #dpane-tts .headnow { display:flex; flex-wrap:wrap; justify-content:center;
+                        align-items:stretch; gap:8px; margin:2px 0 10px; }
+  #dpane-tts .hbox { background:#12161d; border-radius:9px; padding:5px 11px;
+                     min-width:74px; text-align:center; box-sizing:border-box;
+                     border:1px solid color-mix(in srgb, var(--acc) 45%, transparent);
+                     box-shadow:0 0 12px -3px color-mix(in srgb, var(--acc) 70%, transparent); }
+  #dpane-tts .hbox .hb-v { color:#fff; font-size:14px; font-weight:600; line-height:1.25;
+                           text-shadow:0 0 7px rgba(255,255,255,.5),
+                                       0 0 15px rgba(255,255,255,.2); }
+  #dpane-tts .hbox .hb-l { color:var(--dim); font-size:10.5px; line-height:1.3;
+                           margin-top:1px; letter-spacing:.02em; }
+  /* the one box whose value is a sentence a model wrote: it may wrap, the rest may not */
+  #dpane-tts .hbox.wide { max-width:340px; }
+  #dpane-tts .hbox.wide .hb-v { font-size:12.5px; font-weight:500; white-space:normal; }
+  /* a rule between a setting and the server it uses */
+  #dpane-tts .tsplit { height:1px; margin:22px 0 4px;
+                       background:linear-gradient(to right, rgba(255,255,255,.14),
+                                                  rgba(255,255,255,.02) 70%, transparent); }
+  /* the INPUT and OUTPUT headings in the PTI/PME terminal */
+  .tail .iohead { color:var(--acc); font-weight:700;
+                  text-shadow:0 0 7px var(--acc), 0 0 18px rgba(181,243,32,.5); }
   /* the one action on the page that does something big */
   .bigbtn { padding:9px 18px; font-size:14px; font-weight:700; letter-spacing:.3px;
             color:var(--acc); text-shadow:0 0 8px var(--acc), 0 0 18px var(--acc); }
@@ -7333,6 +12544,77 @@ PAGE = """<!doctype html>
   .alloclink:hover { text-shadow:0 0 9px currentColor; }
   .gs-hlink { color: var(--acc); cursor: pointer; text-decoration: underline; text-underline-offset: 2px; white-space: nowrap; font-weight: 600; }
   .mand { display:inline-block; margin-left:8px; font-size:10px; font-weight:700; letter-spacing:.05em; color:var(--acc); background:rgba(181,243,32,.12);  border-radius:5px; padding:1px 6px; vertical-align:middle; text-transform:uppercase; }
+  /* the same chip in warning yellow: a custom prompt is active, these buttons edit
+     only the built-in one */
+  .mandy { display:inline-block; margin-left:8px; font-size:10px; font-weight:700; letter-spacing:.05em; color:var(--warn); background:rgba(234,179,8,.12); border-radius:5px; padding:1px 6px; vertical-align:middle; text-transform:uppercase; cursor:help; }
+  /* a read-only wording with a copy corner - the field look of an input, none of
+     the editing */
+  .copybox { position:relative; margin:0 0 12px; }
+  .copypre { margin:0; padding:9px 34px 9px 11px; white-space:pre-wrap;
+             max-height:150px; overflow:auto; line-height:1.55; font-size:12px;
+             color:var(--dim); background:#0d0f13; border:1px solid var(--line);
+             border-radius:8px; font-family:Consolas,monospace; }
+  .copybtn { position:absolute; top:6px; right:6px; width:24px; height:24px;
+             padding:0; font-size:13px; line-height:1; color:var(--dim);
+             background:#151920; border:1px solid var(--line); border-radius:6px;
+             cursor:pointer; }
+  .copybtn:hover { color:var(--acc);
+                   border-color:color-mix(in srgb, var(--acc) 45%, transparent); }
+  /* an audio tag as a button: lit while offered, dimmed once clicked off */
+  .tagbtn { position:relative; display:inline-block; font-size:10.5px; font-weight:600; letter-spacing:.02em;
+            color:#e8ecf2; background:#12161d; border-radius:6px; padding:2px 8px;
+            cursor:pointer; user-select:none;
+            border:1px solid color-mix(in srgb, var(--acc) 45%, transparent);
+            box-shadow:0 0 9px -3px color-mix(in srgb, var(--acc) 70%, transparent); }
+  .tagbtn.off { opacity:.35; border-color:#3a3f47; box-shadow:none; }
+  /* the count riding a limited tag: how many of that character's own turns must
+     pass before it may speak again */
+  .tlim { position:absolute; top:-7px; right:-6px; font-size:9px; font-weight:800;
+          line-height:1; padding:2px 4px; border-radius:7px; color:#0c0e12;
+          background:var(--acc); }
+  /* the stepper: the main navigation buttons in miniature - accent at rest, more
+     glow under the pointer, and the arrows stand as tall as the number they move */
+  #taglim-pop { position:absolute; z-index:40; display:flex; align-items:center;
+                gap:6px; padding:4px 7px; background:#12161d; border-radius:8px;
+                border:1px solid color-mix(in srgb, var(--acc) 45%, transparent);
+                box-shadow:0 4px 14px -4px rgba(0,0,0,.7),
+                           0 0 9px -3px color-mix(in srgb, var(--acc) 70%, transparent); }
+  #taglim-pop .pnv { padding:3px 11px; font-size:16px; line-height:1.3; min-width:0;
+                     color:var(--acc);
+                     border-color:color-mix(in srgb, var(--acc) 55%, transparent);
+                     box-shadow:0 0 7px -2px color-mix(in srgb, var(--acc) 70%, transparent); }
+  #taglim-pop .pnv:hover { color:#eaf6ff;
+                     border-color:color-mix(in srgb, var(--acc) 85%, transparent);
+                     box-shadow:0 0 12px -1px var(--acc),
+                                0 0 24px -6px var(--acc); }
+  #taglim-pop .tlimn { min-width:2ch; text-align:center; font-size:16px;
+                       color:#e8ecf2; }
+  .tlimbtn.on { color:var(--acc);
+                border-color:color-mix(in srgb, var(--acc) 55%, transparent);
+                box-shadow:0 0 9px -2px color-mix(in srgb, var(--acc) 75%, transparent); }
+  /* the ?-click bubble: quiet card, readable width, above everything */
+  #qm-pop { position:absolute; z-index:60; max-width:380px; padding:10px 12px;
+            background:#12161d; border-radius:10px; font-size:12px; line-height:1.45;
+            color:#dfe6ef; border:1px solid color-mix(in srgb, var(--acc) 40%, transparent);
+            box-shadow:0 6px 18px -6px rgba(0,0,0,.8),
+                       0 0 10px -4px color-mix(in srgb, var(--acc) 60%, transparent); }
+  /* the page's own version, always in the corner - a tab with no badge is old */
+  #uibadge { position:fixed; right:10px; bottom:8px; z-index:30; font-size:10.5px;
+             color:var(--dim); background:rgba(10,13,18,.72); padding:2px 8px;
+             border-radius:999px; border:1px solid var(--line); pointer-events:none; }
+  /* a spoken line is a button: a breath of glow on hover, a pulse while replaying */
+  .spk { cursor:pointer; border-radius:4px; }
+  .spk:hover { text-shadow:0 0 7px color-mix(in srgb, var(--acc) 60%, transparent); }
+  @keyframes spkPulse { 0% { text-shadow:0 0 4px var(--acc); }
+                        50% { text-shadow:0 0 14px var(--acc), 0 0 26px var(--acc); }
+                        100% { text-shadow:0 0 4px var(--acc); } }
+  .spk.playing { animation:spkPulse 1.1s ease-in-out infinite; }
+  /* a quiet rule across the pane, where one block ends and the next begins */
+  .tdiv { height:1px; background:var(--line); margin:12px 0 10px; }
+  /* a field that holds buttons instead of text */
+  .tagbox { display:flex; flex-wrap:wrap; gap:6px; padding:9px 11px;
+            background:#0d0f13; border:1px solid var(--line); border-radius:8px;
+            margin:0 0 8px; }
   .gs-copy { color:var(--acc); cursor:pointer; text-decoration:underline; text-underline-offset:2px; font-weight:600; }
   /* the guide blocks pulse instead; an outline on top of that is two effects at once */
   .copied-flash:not(.gcode) { outline:2px solid var(--acc); outline-offset:2px; border-radius:6px; }
@@ -7427,7 +12709,7 @@ PAGE = """<!doctype html>
   .vsc-wrap { resize:both; }
   pre.tail.blackbg { background:#000 !important; }
   pre.tail { background:#0d0f13; border:none; box-shadow:0 0 14px -2px rgba(0,0,0,.8); border-radius:10px; padding:28px 12px 12px;
-             font-family:Consolas,monospace; font-size:13px; line-height:1.5; white-space:pre-wrap; color:var(--txt);
+             font-family:Consolas,monospace; font-size:13px; line-height:1.3; white-space:pre-wrap; color:var(--txt);
              height:calc(100vh - 162px); overflow:auto; margin:0; }
   /* log-source line: overlays the top of the terminal so it never shifts the terminal box
      (split panes stay aligned whether or not a source line is present) */
@@ -7467,7 +12749,9 @@ PAGE = """<!doctype html>
   white-space: pre; color: #d4d4d4; background: transparent; padding: 8px 10px; box-sizing: border-box; }
 .pswrap.wrap textarea { white-space: pre-wrap; overflow-wrap: anywhere; overflow-x: hidden; }
 .pswrap.wrap .pshl { white-space: pre-wrap; overflow-wrap: anywhere; }
-pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
+  /* a log viewer should wrap. This was opt-in via a class the tail is never given,
+     so a long line simply left the window on the right. */
+  pre.tail { white-space: pre-wrap; overflow-wrap: anywhere; }
   .card { border-radius:12px; }
   button { border-radius:8px; }
   .go { background:var(--acc) !important; color:#111 !important; font-weight:600; border:none !important; }
@@ -7494,9 +12778,44 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
           background: rgba(13,16,22,.72); backdrop-filter: blur(2px);
           box-shadow: 0 0 14px -2px rgba(0,0,0,.85); border-radius: 10px; padding: 10px 12px 4px; }
 .tchrome.adjopen .tpanel { display: block; }
+/* the panel hangs over the terminal, so what is behind it is text - a flat fill hid it
+   and read as a hole. Translucent with a 2px blur: the log stays legible as depth rather
+   than as competition, which is what the Adjust popovers already do at 4px. The fill has
+   to carry alpha or backdrop-filter has nothing to work through. */
+.topanel { display: none; position: absolute; top: 100%; left: auto; right: 0; z-index: 9;
+           background: rgba(4, 6, 9, .55);
+           backdrop-filter: blur(2px) saturate(1.15);
+           -webkit-backdrop-filter: blur(2px) saturate(1.15);
+           border: 1px solid var(--line); border-radius: 0 0 8px 8px;
+           padding: 10px 12px; box-shadow: 0 10px 26px -12px #000c; }
+.tchrome.optopen .topanel { display: block; }
+.tppanel { display: none; position: absolute; top: 100%; left: auto; right: 0; z-index: 9;
+           background: rgba(4, 6, 9, .55);
+           backdrop-filter: blur(2px) saturate(1.15);
+           -webkit-backdrop-filter: blur(2px) saturate(1.15);
+           border: 1px solid var(--line); border-radius: 0 0 8px 8px;
+           padding: 10px 12px; box-shadow: 0 10px 26px -12px #000c; }
+.tchrome.provopen .tppanel { display: block; }
+/* a provider reads as on by being LIT, not by a label saying so */
+.provpick { cursor: pointer; font-size: 19px; line-height: 1; padding: 5px 7px;
+            border: 1px solid var(--line); border-radius: 8px; background: transparent;
+            opacity: .35; filter: grayscale(1); transition: opacity .12s, filter .12s; }
+.provpick.on { opacity: 1; filter: none; border-color: var(--acc);
+               box-shadow: 0 0 6px var(--acc), 0 0 16px var(--acc); }
+/* a heading spans the whole grid so the group below it reads as one block */
+.pgrp { grid-column: 1 / -1; margin: 16px 0 2px; padding-top: 16px; font-size: 11px;
+        letter-spacing: .06em; text-transform: uppercase; color: #fff;
+        border-top: none; position: relative; }
+/* the same rule the TTS page draws between its blocks, rather than a flat border */
+.pgrp::before { content: ""; position: absolute; left: 0; right: 0; top: 0; height: 1px;
+        background: linear-gradient(to right, rgba(255,255,255,.14),
+                                    rgba(255,255,255,.02) 70%, transparent); }
+.pgrp:first-child { margin-top: 0; padding-top: 0; }
+.pgrp:first-child::before { display: none; }
+.topanel .row { gap: 8px; align-items: center; flex-wrap: wrap; }
 .tmax .tchrome { position: absolute; top: 0; left: 0; right: 0; z-index: 9; padding: 6px 8px; pointer-events: none; }
 .tmax .tchrome .tbar { margin-bottom: 0; }
-.tmax .tbar > * , .tmax .tpanel { pointer-events: auto; }
+.tmax .tbar > * , .tmax .tpanel, .tmax .topanel, .tmax .tppanel { pointer-events: auto; }
 .tmax .tchrome:not(.adjopen) .tbar .tail-src { visibility: hidden; }
 .tmax .splitgrid > div { position: relative; }
 .tmax .splitgrid .tchrome { z-index: 8; }
@@ -7511,7 +12830,7 @@ pre.tail.wrap { white-space: pre-wrap; overflow-wrap: anywhere; }
 body.tmaxidle #navfly { display: none; }
 .tmax .tail { border-radius: 0; }
 .tmax .tailbox { flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.tmax .tail { flex: 1; height: auto; max-height: none; line-height: 1.6; }
+.tmax .tail { flex: 1; height: auto; max-height: none; }
   .tscale-btn { display: none; }
   .tmax .tscale-btn { display: inline-block; }
   .pg-intro { color:var(--dim); font-size:13px; line-height:1.6; margin:2px 0 14px; }
@@ -7742,34 +13061,38 @@ body.tmaxidle #navfly { display: none; }
       <div class="row" style="gap:8px;margin-bottom:10px">
         <button id="tsub-proxy" class="stop on" onclick="showTsub('proxy')">Proxy Terminal</button>
         <button id="tsub-think" class="stop" onclick="showTsub('think')">Thinking Content Terminal</button>
-        <button id="tsub-split" class="stop" onclick="showTsub('split')">Split View Terminal</button>
         <button id="tsub-tts" class="stop" onclick="showTsub('tts')">TTS Terminal</button>
+        <button id="tsub-ptipme" class="stop" onclick="showTsub('ptipme')">PTI / PME Terminal</button>
+        <button id="tsub-split" class="stop" onclick="showTsub('split')">Split View Terminal</button>
         <span style="margin-left:auto"></span>
         <span class="bgwrap" id="bgwrap"><button class="stop" data-act="bgToggle" title="choose the terminal background">Terminal background color</button><span class="bgpop"><button class="stop bgopt" data-act="bgPick" data-v="0">Midnight</button><button class="stop bgopt" data-act="bgPick" data-v="1">Black</button></span></span>
       </div>
       <div id="tpane-proxy">
-      <div id="twrap-dashboard"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="dash-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="dashboard" title="show or hide the time on every line">Timestamps</button><button class="stop" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="dashboard" id="tmaxbtn-dashboard">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="auto" id="termscale-auto-dashboard">Auto</button><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="manual" id="termscale-manual-dashboard">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="dashboard" id="tscalebtn-dashboard">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-dashboard" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-dashboard" data-fskind="dashboard" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-dashboard" data-fontkind="dashboard" class="tsel tfont"></select><span class="hint" id="termscale-msg-dashboard" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-dashboard"></pre></div></div>
+      <div id="twrap-dashboard"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="dash-src"></div><span style="margin-left:auto"></span><button class="stop provbtn" data-act="termProviders" title="choose which providers this terminal shows">Providers</button><button class="stop optbtn" data-act="termOptions" title="show what this terminal puts in, and what it leaves out">Options</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="dashboard" id="tmaxbtn-dashboard">⛶ Full window</button></div><div class="tppanel"><div class="row" style="margin-bottom:6px"><span class="hint" style="width:auto">Providers shown - lit is on:</span></div><div class="row" id="provfilter"></div></div><div class="topanel"><div class="row" style="margin-bottom:6px"><span class="hint" style="width:auto">Show in this terminal:</span></div><div class="row"><button class="stop" data-act="termStamps" data-kind="dashboard" title="show or hide the time on every line">Timestamps</button><button class="stop" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Dialogue Text</button><button class="stop" data-act="termTagOutPti" title="show what the tag injector made of your line">PTI Output</button><button class="stop" data-act="termTagOutPme" title="show what the mood reader made of the scene">PME Output</button><button class="stop" data-act="termThoughts" title="show an NPC's private reasoning on a line above what they said">Thoughts</button><button class="stop" data-act="termActions" title="show the action the action evaluator chose for a character">Actions</button></div></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="auto" id="termscale-auto-dashboard">Auto</button><button class="stop" data-act="termScaleMode" data-kind="dashboard" data-mode="manual" id="termscale-manual-dashboard">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="dashboard" id="tscalebtn-dashboard">Default text size</button><button class="stop" data-act="copyRawTail" title="copy this terminal&#39;s feed exactly as the file holds it - for a bug report, before any client-side shaping">Copy raw tail</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-dashboard" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-dashboard" data-fskind="dashboard" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-dashboard" data-fontkind="dashboard" class="tsel tfont"></select><span class="hint" id="termscale-msg-dashboard" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-dashboard"></pre></div></div>
       </div>
       <div id="tpane-think" style="display:none">
     <div id="twrap-thinking"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="think-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="thinking" title="show or hide the time on every line">Timestamps</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="thinking" id="tmaxbtn-thinking">⛶ Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="auto" id="termscale-auto-thinking">Auto</button><button class="stop" data-act="termScaleMode" data-kind="thinking" data-mode="manual" id="termscale-manual-thinking">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="thinking" id="tscalebtn-thinking">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-thinking" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-thinking" data-fskind="thinking" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-thinking" data-fontkind="thinking" class="tsel tfont"></select><span class="hint" id="termscale-msg-thinking" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-thinking"></pre></div></div>
       </div>
       <div id="tpane-split" style="display:none">
     <div id="twrap-split">
-      <div class="tchrome"><div class="tbar" style="justify-content:flex-end"><button class="stop tmaxonly" data-act="termStamps" data-kind="splitt" title="show or hide the time on every line in the right terminal">Timestamps</button><button class="stop tmaxonly" id="splitins-t-max" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn tmaxonly" data-act="tmaxAdjust" data-tc="tchrome-splitt" title="font and size controls for the right terminal">Adjust</button><button class="stop" data-act="tailMax" data-kind="split" id="tmaxbtn-split">⛶ Full window</button></div></div>
+      <div class="tchrome"><div class="tbar" style="justify-content:flex-end"><button class="stop tmaxonly" data-act="termStamps" data-kind="splitt" title="show or hide the time on every line in the right terminal">Timestamps</button><button class="stop tmaxonly" id="splitins-t-max" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Dialogue Text</button><button class="stop adjbtn tmaxonly" data-act="tmaxAdjust" data-tc="tchrome-splitt" title="font and size controls for the right terminal">Adjust</button><button class="stop" data-act="tailMax" data-kind="split" id="tmaxbtn-split">⛶ Full window</button></div></div>
       <div class="splitgrid" style="display:flex;gap:10px;align-items:stretch">
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome"><div class="tbar"><select class="tsel" id="splitsel-d" data-act="splitFeed" data-side="d" title="which log this pane shows"></select><div class="hint tail-src" id="split-src-d"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="splitd" title="show or hide the time on every line">Timestamps</button><button class="stop" id="splitins-d" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="auto" id="termscale-auto-splitd">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="manual" id="termscale-manual-splitd">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitd" id="tscalebtn-splitd">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitd" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitd" data-fskind="splitd" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitd" data-fontkind="splitd" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitd" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitd"></pre></div></div>
-        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome" id="tchrome-splitt"><div class="tbar"><select class="tsel" id="splitsel-t" data-act="splitFeed" data-side="t" title="which log this pane shows"></select><div class="hint tail-src" id="split-src-t"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="splitt" title="show or hide the time on every line">Timestamps</button><button class="stop" id="splitins-t" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Insert TTS</button><button class="stop adjbtn" id="adjbtn-splitt" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="auto" id="termscale-auto-splitt">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="manual" id="termscale-manual-splitt">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitt" id="tscalebtn-splitt">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitt" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitt" data-fskind="splitt" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitt" data-fontkind="splitt" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitt" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitt"></pre></div></div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome"><div class="tbar"><select class="tsel" id="splitsel-d" data-act="splitFeed" data-side="d" title="which log this pane shows"></select><div class="hint tail-src" id="split-src-d"></div><span style="margin-left:auto"></span><button class="stop optbtn" id="splitopt-d" data-act="termOptions" title="show what this terminal puts in, and what it leaves out">Options</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="topanel"><div class="row" style="margin-bottom:6px"><span class="hint" style="width:auto">Show in this terminal:</span></div><div class="row"><button class="stop" data-act="termStamps" data-kind="splitd" title="show or hide the time on every line">Timestamps</button><button class="stop" id="splitins-d" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Dialogue Text</button><button class="stop" data-act="termTagOutPti" title="show what the tag injector made of your line">PTI Output</button><button class="stop" data-act="termTagOutPme" title="show what the mood reader made of the scene">PME Output</button><button class="stop" data-act="termThoughts" title="show an NPC's private reasoning on a line above what they said">Thoughts</button><button class="stop" data-act="termActions" title="show the action the action evaluator chose for a character">Actions</button></div></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="auto" id="termscale-auto-splitd">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitd" data-mode="manual" id="termscale-manual-splitd">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitd" id="tscalebtn-splitd">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitd" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitd" data-fskind="splitd" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitd" data-fontkind="splitd" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitd" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitd"></pre></div></div>
+        <div style="flex:1;min-width:0;display:flex;flex-direction:column"><div class="tchrome" id="tchrome-splitt"><div class="tbar"><select class="tsel" id="splitsel-t" data-act="splitFeed" data-side="t" title="which log this pane shows"></select><div class="hint tail-src" id="split-src-t"></div><span style="margin-left:auto"></span><button class="stop optbtn" id="splitopt-t" data-act="termOptions" title="show what this terminal puts in, and what it leaves out">Options</button><button class="stop adjbtn" id="adjbtn-splitt" data-act="tmaxAdjust" title="show the font and size controls">Adjust</button></div><div class="topanel"><div class="row" style="margin-bottom:6px"><span class="hint" style="width:auto">Show in this terminal:</span></div><div class="row"><button class="stop" data-act="termStamps" data-kind="splitt" title="show or hide the time on every line">Timestamps</button><button class="stop" id="splitins-t" data-act="termInsTts" title="show the spoken line under the newest dialogue completion">Dialogue Text</button><button class="stop" data-act="termTagOutPti" title="show what the tag injector made of your line">PTI Output</button><button class="stop" data-act="termTagOutPme" title="show what the mood reader made of the scene">PME Output</button><button class="stop" data-act="termThoughts" title="show an NPC's private reasoning on a line above what they said">Thoughts</button><button class="stop" data-act="termActions" title="show the action the action evaluator chose for a character">Actions</button></div></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="auto" id="termscale-auto-splitt">Auto</button><button class="stop" data-act="termScaleMode" data-kind="splitt" data-mode="manual" id="termscale-manual-splitt">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="splitt" id="tscalebtn-splitt">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-splitt" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-splitt" data-fskind="splitt" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-splitt" data-fontkind="splitt" class="tsel tfont"></select><span class="hint" id="termscale-msg-splitt" style="margin-left:4px"></span></div></div></div><div class="tailbox" style="flex:1;min-height:0"><pre class="tail tail-cap" id="tail-splitt"></pre></div></div>
       </div>
     </div>
       </div>
       <div id="tpane-tts" style="display:none">
     <div id="twrap-tts"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="tts-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="tts" title="show or hide the time on every line">Timestamps</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="tts" id="tmaxbtn-tts">&#9210; Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="auto" id="termscale-auto-tts">Auto</button><button class="stop" data-act="termScaleMode" data-kind="tts" data-mode="manual" id="termscale-manual-tts">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="tts" id="tscalebtn-tts">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-tts" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-tts" data-fskind="tts" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-tts" data-fontkind="tts" class="tsel tfont"></select><span class="hint" id="termscale-msg-tts" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-tts"></pre></div></div>
       </div>
+<div id="tpane-ptipme" style="display:none">
+    <div id="twrap-ptipme"><div class="tchrome"><div class="tbar"><div class="hint tail-src" id="ptipme-src"></div><span style="margin-left:auto"></span><button class="stop" data-act="termStamps" data-kind="ptipme" title="show or hide the time on every line">Timestamps</button><button class="stop adjbtn" data-act="tmaxAdjust" title="show the font, size and source controls">Adjust</button><button class="stop" data-act="tailMax" data-kind="ptipme" id="tmaxbtn-ptipme">&#9210; Full window</button></div><div class="tpanel"><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span class="hint" style="width:auto">Text Scaling:</span><button class="stop" data-act="termScaleMode" data-kind="ptipme" data-mode="auto" id="termscale-auto-ptipme">Auto</button><button class="stop" data-act="termScaleMode" data-kind="ptipme" data-mode="manual" id="termscale-manual-ptipme">Manual</button><button class="stop tscale-btn" data-act="termSizeReset" data-kind="ptipme" id="tscalebtn-ptipme">Default text size</button></div><div class="row" style="gap:8px;margin-bottom:6px;align-items:center;flex-wrap:wrap"><span id="termfs-wrap-ptipme" style="display:none;gap:8px;align-items:center"><span class="hint" style="width:auto">Size</span><select id="termfs-sel-ptipme" data-fskind="ptipme" class="tsel"></select></span><span class="hint" style="width:auto">Font</span><select id="termfont-sel-ptipme" data-fontkind="ptipme" class="tsel tfont"></select><span class="hint" id="termscale-msg-ptipme" style="margin-left:4px"></span></div></div></div><div class="tailbox"><pre class="tail" id="tail-ptipme"></pre></div></div>
+      </div>
     </div>
     <div id="dpane-setup" style="display:none"></div>
     <div id="dpane-yaml" style="display:none"></div>
   </div>
-  <div id="tab-tts" style="display:none">
+<div id="tab-tts" style="display:none">
     <div id="dpane-tts"></div>
   </div>
   <div id="tab-setup" style="display:none"></div>
@@ -7902,7 +13225,7 @@ function permTreeHtml() {
                      "One-click Higgs install: fetches audio.cpp and a model from the internet",
                      "Checking for a newer audio.cpp (asks github.com only when pressed)",
                      "Main Guide setup flow"];
-  const remoteItems = ["View all terminals (Proxy / Thinking / Split / TTS)",
+  const remoteItems = ["View all terminals (Proxy / Thinking / Split / TTS / PTI-PME)",
                        "Full-window, wrap, background colour",
                        "Live Network graph & fleet status",
                        "Providers and their allocation, read-only",
@@ -7979,7 +13302,7 @@ async function setNetMode(on) {
   if (on) {
     if (!await uiConfirm("Allow other PCs on your network to open the read-only view?" + String.fromCharCode(10) + String.fromCharCode(10)
       + "They will be able to watch the terminals and fleet status, but cannot change anything on this PC and cannot see your IPs, paths, or GPU IDs." + String.fromCharCode(10) + String.fromCharCode(10)
-      + "This takes effect immediately - no restart needed.")) { await loadNetInfo(); return; }
+      + "Providers and TTS follow immediately; the panel page itself starts answering the LAN after the panel is restarted.")) { await loadNetInfo(); return; }
   }
   const r = await post("/api/settings", { networkMode: on ? "lan" : "localhost" });
   if (r && r.error) { uiAlert(r.error); return; }
@@ -8295,7 +13618,7 @@ function provStatLine() {
     ? (tokens / (ms / 1000)).toFixed(1) + " tok/s" : "";
   return '<div style="margin-top:8px;padding:8px 10px;background:var(--bg);border:none;'
     + 'box-shadow:0 0 12px -2px rgba(0,0,0,.85);border-radius:8px;font-size:12px">'
-    + '<span style="margin-right:14px">' + esc((p.emoji || "\u2022") + " " + (p.title || p.id)) + '</span>'
+    + '<span style="margin-right:14px">' + provMark(p, 14) + esc(p.title || p.id) + '</span>'
     + cell("generation", p.gen || 0, "")
     + cell("prefill", p.pfMs || 0, tps(p["in"] || 0, p.pfMs || 0))
     + cell("decode", p.dcMs || 0, tps(p.out || 0, p.dcMs || 0)) + '</div>';
@@ -8443,13 +13766,17 @@ function renderSlots(force) {
     const term = running
       ? '<button class="stop" onclick="act(\\''+s.id+'\\',\\'show-terminal\\',this)">&#128421;&#65039; Terminal</button>' : "";
     return '<div class="card svr-row">'
-      + '<div class="row"><span class="label" id="label-'+s.id+'">'+esc(s.label)+'</span>'
+      + '<div class="row shead"><span class="label" id="label-'+s.id+'">'+esc(s.label)+'</span>'
       + '<button class="icon" title="rename" onclick="startEdit(\\''+s.id+'\\',\\'label\\')">&#9998;</button>'
-      + '<span class="chip clickable" id="port-'+s.id+'" title="expected port - click to edit" '+(portProblem(s)?'style="color:var(--err);border-color:var(--err);font-weight:700" ':'')+' '
+      + rm + '</div>'
+      // port and status live UNDER the title: the first row can no longer be
+      // pushed around by a long pill, and the port wears the same capsule as the
+      // HTTP status, in quiet grey
+      + '<div class="row srow2"><span class="srvport clickable" id="port-'+s.id+'" title="expected port - click to edit" '+(portProblem(s)?'style="color:var(--err);border-color:var(--err);font-weight:700" ':'')+' '
       + 'onclick="startEdit(\\''+s.id+'\\',\\'port\\')">Port '+esc(s.port)+'</span>'
+      + (running ? pill(s.status) : "")
       + (portProblem(s) ? '<span class="mismatch">&#9888; '+portProblem(s)+'</span>' : "")
-      + (running ? pill(s.status) : "") + spd
-      + mm + missing + rm + '</div>'
+      + spd + mm + missing + '</div>'
       + '<div class="path">' + allocLine(s) + '</div>'
       + (slotMsg[s.id] ? '<div class="path" style="color:var(--warn)">' + esc(slotMsg[s.id]) + '</div>' : '')
       + paramEditor(s)
@@ -8544,6 +13871,13 @@ function renderSetup() {
     + '<div id="set-feedback" style="margin-top:12px;font-weight:600;min-height:1.2em"></div></div>'
     + '<div class="hint" style="max-width:820px;margin-top:10px">Installed at '
     + esc((state && state.stack) || "") + '</div>';
+  // a re-render must not blink the living terminal away: any slot mid-launch or
+  // mid-stop gets its pane re-shown and re-filled the moment the cards rebuild
+  Object.keys(slotBusy).forEach(sid => {
+    const lg = $("log-" + sid);
+    if (lg) { lg.textContent = slotLogText[sid] || ""; lg.style.display = "block";
+              lg.scrollTop = lg.scrollHeight; }
+  });
   // restore unsaved edits the user had typed/pasted before this re-render
   SET_FIELDS.forEach(([k]) => {
     const el = $("set-"+k);
@@ -8616,6 +13950,8 @@ const LOG_CATS = [
   ["thinking",  "\U0001F9E0 Thinking",   "captured reasoning content per request"],
   ["dashboard", "\U0001F4DF Dashboard",  "the proxy request/response feed"],
   ["panel",     "\U0001F4CB Panel",      "panel lifecycle and proxy listener events"],
+  ["tts",       "\U0001F50A TTS",        "speech pipeline (ttscal, tts-server)"],
+  ["ptipme",    "\U0001F9E9 PTI / PME",  "what the injectors were asked, and answered"],
   ["other",     "\U0001F4C4 Other",      "anything else in the log folder"]
 ];
 function logCat(name) {
@@ -8625,6 +13961,9 @@ function logCat(name) {
   if (n.slice(-13) === "_thinking.log" || n === "thinking.log") return "thinking";
   if (n.slice(-14) === "_dashboard.log" || n === "dashboard.log") return "dashboard";
   if (n.indexOf("panel") === 0) return "panel";
+  if (n.slice(-11) === "_ttscal.log" || n.slice(-15) === "_tts-server.log"
+      || n === "tts-server.log" || n === "tts.log") return "tts";
+  if (n.slice(-11) === "_ptipme.log") return "ptipme";
   return "other";
 }
 function logCard(f) {
@@ -8645,11 +13984,31 @@ async function renderLog() {
   files.forEach(function(f) { (byCat[logCat(f.name)] = byCat[logCat(f.name)] || []).push(f); });
   let body = "";
   LOG_CATS.forEach(function(c) {
-    const list = byCat[c[0]] || [];
+    let list = byCat[c[0]] || [];
     if (!list.length) return;
+    let slotRow = "";
+    if (c[0] === "server") {
+      // one button per slot that HAS files; clicking filters, clicking again clears
+      const sids = [];
+      list.forEach(function(f) {
+        const m = /^srv_([a-z0-9]+)_/i.exec(f.name);
+        if (m && sids.indexOf(m[1]) < 0) sids.push(m[1]);
+      });
+      sids.sort();
+      slotRow = sids.map(function(s) {
+        const on = window.__logSrvSlot === s;
+        return '<button class="' + (on ? "" : "stop") + '" data-act="logSrvSlot" data-sid="'
+          + esc(s) + '">\U0001F5A5 Server ' + esc(s.replace(/^slot/i, "")) + '</button>';
+      }).join(" ");
+      if (window.__logSrvSlot)
+        list = list.filter(function(f) {
+          return f.name.toLowerCase().indexOf("srv_" + window.__logSrvSlot + "_") === 0;
+        });
+    }
     body += '<div style="margin-top:14px"><div class="row" style="gap:8px;align-items:baseline">'
       + '<b>' + c[1] + '</b><span class="chip">' + list.length + '</span>'
-      + '<span class="hint" style="width:auto">' + esc(c[2]) + '</span></div>'
+      + '<span class="hint" style="width:auto">' + esc(c[2]) + '</span>'
+      + (slotRow ? '<span style="margin-left:auto">' + slotRow + '</span>' : "") + '</div>'
       + '<div class="logcardgrid">' + list.map(logCard).join("") + '</div></div>';
   });
   if (!files.length) body = '<div class="hint">no log files yet</div>';
@@ -8781,28 +14140,40 @@ const DASH_PAL = ["#ff5dc8", "#f0883e", "#3fdd78", "#4da3ff", "#e0c23c", "#e05fd
 // fixed colors matched to the chips SkyrimNet itself shows for these roles, so both UIs
 // speak the same color language; every other title falls through to the vivid hash palette
 const PROV_COL = { "Dialogue":"#10b981", "GM":"#f59e0b", "Combat":"#dc2626", "Meta":"#64748b",
+  "NE-Composer":"#cbd5e1", "NE-Director":"#cbd5e1",
+  "AE-Impulse":"#b7410e", "AE-Resolve":"#b7410e",
   "Vision":"#06b6d4", "Memory":"#d946ef", "Diary":"#f97316", "Charbio":"#14b8a6", "Bio":"#14b8a6",
   "ActionEval":"#7c3aed", "Action":"#7c3aed", "AI-Assistant":"#9333ea", "Agent":"#9333ea",
   "Vanilla":"#a8a29e" };
 function dashColor(name) {
+  // a drilldown record wears its provider's colour
+  if (name.slice(-1) === String.fromCodePoint(0x2937)) name = name.slice(0, -1);
   if (PROV_COL[name]) return PROV_COL[name];
   let h = 0; for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
   return DASH_PAL[h % DASH_PAL.length];
 }
+// One definition for the speaker magenta and tag cyan. They were locals of two
+// different painters, and the action row in paintTail reached for names outside
+// its scope - the ReferenceError that froze the Proxy terminal since patch73.
+const SPK_MAG = "#ff5dc8", SPK_CY = "#2ef2ff";
 function paintThink(el, text) {
   const NL = String.fromCharCode(10);
   const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
   const keep = el.scrollTop;
-  const CY = "#4dd8e6", MG = "#ff5dc8", GOLD = "#f0c674";
+  const CY = "#4dd8e6", MG = SPK_MAG, GOLD = "#f0c674";
   const DQ = String.fromCharCode(34), SQ = String.fromCharCode(39);
   const provs = {};
   (state && state.routing || []).forEach(s => (s.providers || []).forEach(p => { if (p.title) provs[p.title] = p.emoji || ""; }));
   const sepRx = new RegExp("^[=]{6,}");
-  const timeRx = new RegExp("^[[][0-9]{2}:[0-9]{2}:[0-9]{2}[^\\]]*[]]");
-  const portRx = new RegExp("^[[][0-9]{4}[]]$");
+  const timeRx = new RegExp("^[[][0-9]{2}:[0-9]{2}:[0-9]{2}.*?]");
+  const portRx = new RegExp("^[[][0-9]{4}]$");
   const tokEstRx = new RegExp("^[(]~[0-9]+ tok est[)]$");
   function paintLine(line) {
     if (sepRx.test(line.trim())) return '<span style="color:' + CY + '">' + esc(line) + '</span>';
+    // the two headings that separate what was sent from what came back, lit like the
+    // accent so the eye finds them in a wall of prompt
+    if (/^--- (INPUT|OUTPUT) ---$/.test(line.trim()))
+      return '<span class="iohead">' + esc(line) + '</span>';
     // build colored segments over the RAW line, escaping each piece exactly once
     const segs = [];  // {t:text, c:color|null}
     let rest = line;
@@ -8867,9 +14238,9 @@ function paintThink(el, text) {
 }
 
 // terminal fonts - all locally installed families, so nothing is fetched over the network
-const // The third value says whether every character is the same width. The terminals line
+// The third value says whether every character is the same width. The terminals line
 // their columns up with spaces, so only a fixed-width font can hold them straight.
-TERM_FONTS = [
+const TERM_FONTS = [
   ["Cascadia Code", '"Cascadia Code", Consolas, monospace', true],
   ["Cascadia Mono", '"Cascadia Mono", Consolas, monospace', true],
   ["Consolas", 'Consolas, monospace', true],
@@ -8893,6 +14264,8 @@ function termFontStack(label) {
   return TERM_FONTS[0][1];
 }
 const TS_KINDS = __TSKINDS__;   // injected from TERM_SCALE_KINDS - one list, not two
+// icon -> emotion, injected from TTS_MOOD so the panel cannot disagree with the log
+const MOOD_NAMES = __MOODS__;
 let termScales = {};
 TS_KINDS.forEach(function(k) { termScales[k] = { mode: "manual", size: 12, on: true, font: TERM_FONT_DEFAULT }; });
 let tailNormalW = { dashboard: 0, thinking: 0, split: 0, tts: 0 };   // keyed by Full Window wrapper
@@ -9056,9 +14429,13 @@ async function termStampsToggle(which) {
 // ": On" in blue, ": Off" plain - the same reading as Remote Access and Fullscreen in
 // the header, so a state you can toggle looks the same wherever it appears.
 function onOffLabel(name, on) {
-  return esc(name) + ": " + (on ? '<span class="blueglow">On</span>' : "Off");
+  // NBSP, not a space: the button is a flex row, and a flex item drops the whitespace
+  // at its own end - so "Insert TTS: " lost its gap the moment the value became a span
+  // while "Timestamps: Off", one text node, kept it.
+  return esc(name) + ":\u00a0" + (on ? '<span class="blueglow">On</span>' : "Off");
 }
 function syncTermToggleUI() {
+  if (document.querySelector(".tchrome.provopen")) paintProvFilter();
   document.querySelectorAll('[data-act="termStamps"]').forEach(b => {
     const on = termStampsOn(b.dataset.kind || "");
     b.classList.toggle("on", on);
@@ -9067,7 +14444,14 @@ function syncTermToggleUI() {
   document.querySelectorAll('[data-act="termInsTts"]').forEach(b => {
     const on = termInsTtsOn();
     b.classList.toggle("on", on);
-    b.innerHTML = onOffLabel("Insert TTS", on);
+    b.innerHTML = onOffLabel("Dialogue Text", on);
+  });
+  TAG_OUT_BTNS.forEach(t => {
+    document.querySelectorAll('[data-act="' + t[0] + '"]').forEach(b => {
+      const on = String(((state && state.settings) || {})[t[1]] || "off") === "on";
+      b.classList.toggle("on", on);
+      b.innerHTML = onOffLabel(t[2], on);
+    });
   });
 }
 // [20:45:12.86] at the start of a line, and nowhere else
@@ -9078,6 +14462,16 @@ function stripStamps(text) {
 }
 // A spoken line is identified by the WAVE markers around what was said, not by the
 // leading icon - that now varies with the mood the line asks for.
+// button action -> the setting it switches -> what it is called. One table, so a
+// button cannot end up lit from one setting and toggling another.
+const TAG_OUT_BTNS = [["termTagOutPti", "ttsTagOutputPti", "PTI Output"],
+                      ["termTagOutPme", "ttsTagOutputPme", "PME Output"],
+                      ["termThoughts", "ttsThoughtOut", "Thoughts"],
+                      ["termActions", "ttsActionOut", "Actions"]];
+function tagOutSetting(act) {
+  const t = TAG_OUT_BTNS.filter(x => x[0] === act)[0];
+  return t ? t[1] : "";
+}
 const SAID = String.fromCharCode(12336) + String.fromCharCode(65039);
 const BOLT = String.fromCodePoint(9889);
 // a channel tree hanging off the completion above, as Discord draws one
@@ -9102,25 +14496,23 @@ function ttsSpokenLines() {
   for (let i = 0; i < lines.length; i++) {
     if (lines[i].indexOf(SAID) < 0) continue;
     const at = stampSecs(lines[i]);
-    let rt = "";
-    for (let j = i + 1; j < lines.length && j < i + 12; j++) {
+    let rt = "", holdS = 0;
+    for (let j = i + 1; j < lines.length && j < i + 14; j++) {
       if (lines[j].indexOf(SAID) >= 0) break;         // the next request started
+      const hm = lines[j].match(/hold:\\s*([0-9]+) ms/);
+      if (hm) holdS = parseInt(hm[1], 10) / 1000.0;
       const m = lines[j].match(/([0-9.]+)x realtime/);
-      if (m) { rt = m[1]; break; }
+      if (m && !rt) rt = m[1];
     }
     const raw = lines[i].trim();
     const sm = raw.match(TSTAMP_RX);
-    out.push({ at: at,
+    out.push({ at: at, hold: holdS,
                stamp: sm ? sm[0].trim() : "",
                who: ((raw.match(/[^ ]+:/g) || []).slice(-1)[0] || "").replace(":", ""),
                body: (sm ? raw.slice(sm[0].length) : raw).replace(/^\\s+/, "")
                      + (rt ? ("  (" + BOLT + " " + rt + "x)") : "") });
   }
   return out;
-}
-// A completion line: it carries token and rate columns and ends in seconds.
-function isCompletion(l) {
-  return l.indexOf(" tok ") > 0 && l.indexOf(" tps ") > 0 && l.indexOf("sec") > 0;
 }
 // Place each spoken line beside the completion it belongs to.
 //
@@ -9141,7 +14533,10 @@ function ttsBursts() {
   const out = [];
   said.forEach(s => {
     const last = out.length ? out[out.length - 1] : null;
-    const near = last && s.at - last.at[last.at.length - 1] <= TTS_BURST_GAP;
+    // a held chunk answers late by design: the NEXT receipt trails by the hold,
+    // so the gap that keeps one reply together must absorb it (patch168)
+    const near = last && s.at - last.at[last.at.length - 1]
+                   <= TTS_BURST_GAP + (last.said[last.said.length - 1].hold || 0);
     if (near && last.who === s.who) {
       last.said.push(s);
       last.at.push(s.at);
@@ -9188,8 +14583,15 @@ function spliceTts(text) {
     });
     groups.get(target).push(...drawn);
   });
-  [...groups.keys()].sort((a, b) => b - a).forEach(at =>
-    lines.splice(at + 1, 0, ...groups.get(at)));
+  // A thought is written the moment the reply lands, so it is already sitting under the
+  // dialogue line when the spoken lines are spliced in. Skip past it: the character
+  // thought it before they opened their mouth, and it reads that way round.
+  const THOUGHT = String.fromCodePoint(0x1F4AD);
+  [...groups.keys()].sort((a, b) => b - a).forEach(at => {
+    let put = at + 1;
+    while (put < lines.length && lines[put].indexOf(THOUGHT) >= 0) put++;
+    lines.splice(put, 0, ...groups.get(at));
+  });
   return lines.join(NL);
 }
 
@@ -9200,34 +14602,102 @@ function spliceTts(text) {
 // two cells wide, so counting JS characters would under-measure the indent.
 // A spoken line is rendered as a block so it can hang-indent when it wraps, and a block
 // ends its own line - adding a newline after it too would leave a blank row.
+// the exact opening a spoken line is built with, so joinLines can recognise one
+const SPOKEN_TAG = '<span class="spokenline"';
+// After a repaint, the rows past the last count slide in rather than snapping -
+// the whole element is rebuilt each tick, so "new" is known by the count before.
 function joinLines(lines, fn) {
-  const NL = String.fromCharCode(10);
-  const out = [];
-  lines.forEach(function(line, i) {
-    const html = fn(line);
-    out.push(html);
-    const isBlock = html.slice(0, 20).indexOf("display:block") >= 0;
-    if (!isBlock && i < lines.length - 1) out.push(NL);
-  });
-  return out.join("");
+  // EVERY row is its own block, and there are no newlines between them.
+  //
+  // This used to decide per row: a spoken line was emitted without a newline after it
+  // because the element it produces is block-level and breaks the row itself. When that
+  // held it was invisible, and when it did not the row never broke - so the spoken line
+  // and everything after it ran together into one endless row that scrolled off to the
+  // right, which reads as "the terminal stopped". Sniffing the HTML to decide was the
+  // fragile part; a wrapper that is always a block removes the decision.
+  // a spoken, thought or branch line may wrap - those are the long ones, and the
+  // field has proven their rows tight for weeks. A RECORD has no business being
+  // more than one line tall, so it wears .one: a hard 1.5em, glow unclipped, and
+  // whatever a browser might invent inside it cannot move the rhythm
+  const wavy = String.fromCharCode(0x3030);
+  const mayWrap = l => l.indexOf(wavy) >= 0
+      || l.indexOf(String.fromCharCode(0x251C)) >= 0
+      || l.indexOf(String.fromCharCode(0x2514)) >= 0
+      || l.indexOf(String.fromCharCode(0x27A4)) >= 0;
+  return lines.map(line =>
+    '<div class="tl' + (mayWrap(line) ? "" : " one") + '">' + fn(line) + "</div>")
+    .join("");
 }
 
-function termCols(s) {
-  let n = 0;
-  for (const ch of String(s)) n += (ch.codePointAt(0) > 0xFFFF ? 2 : 1);
-  return n;
+function paintTtsMeta(line) {
+  const CYm = "#4dd8e6", GOLDm = "#f0c674", GRAPEm = "#c07ffb";
+  const tintm = (c, s, b) => '<span style="color:' + c + (b ? ";font-weight:600" : "")
+                           + '">' + esc(s) + '</span>';
+  // the thought-delay row reads as interior, whole, like the proxy's thought rows
+  if (line.indexOf(String.fromCodePoint(0x1F4AD) + String.fromCodePoint(0x23F2)) >= 0)
+    return tintm(GRAPEm, line, false);
+  const segs = [];
+  let rest = line;
+  const tm = rest.match(new RegExp("^[[][0-9]{2}:[0-9]{2}:[0-9]{2}[0-9.]*]"));
+  if (tm) { segs.push(tintm(CYm, tm[0], false)); rest = rest.slice(tm[0].length); }
+  // the two thought line shapes: stamp cyan, speaker bold magenta, and the
+  // waves with everything they hold in grape - interior, exactly as the proxy
+  // terminal writes a thought (patch178)
+  const wv177 = String.fromCharCode(12336);
+  if (rest.indexOf(String.fromCodePoint(0x1F4AD)) >= 0 && rest.indexOf(wv177) >= 0) {
+    const w1 = rest.indexOf(wv177);
+    const head = rest.slice(0, w1), tail = rest.slice(w1);
+    let hh = null;
+    const mv = head.match(/^(\\s*\\S+ Thought voiced: \\S+ )(.+?)(: *)$/);
+    if (mv) hh = tintm(GRAPEm, mv[1], false) + tintm(SPK_MAG, mv[2], true)
+               + tintm(GRAPEm, mv[3], false);
+    if (hh === null) {
+      const mt = head.match(/^(\\s*\\S+ )(.+?)( \\(thought\\): *)$/);
+      if (mt) hh = tintm(GRAPEm, mt[1], false) + tintm(SPK_MAG, mt[2], true)
+                 + tintm(GRAPEm, mt[3], false);
+    }
+    if (hh === null) hh = tintm(GRAPEm, head, false);
+    return segs.join("") + hh + tintm(GRAPEm, tail, false);
+  }
+  const km = rest.match(new RegExp("^([ ]*)(prep|server|audio|overhead|fit|hold|generate|codec|Banned Tags|Tag Limits):"));
+  if (km) {
+    segs.push(esc(km[1]) + tintm("#ffffff", km[2] + ":", true));
+    rest = rest.slice(km[0].length);
+  }
+  // numbers gold, known unit words cyan, filenames and voices magenta-ish
+  const tokRx = new RegExp("([0-9]+(?:[.,][0-9]+)*)(ms|s|x)?(?=$|[^A-Za-z0-9])"
+      + "|(^|[^A-Za-z0-9_.-])(ms|tok|tps|Hz|KB|samples|ch|cps|est|lines|chunks?|pending|audio)(?=$|[^A-Za-z])"
+      + "|([A-Za-z0-9_.-]+[.]wav)", "g");
+  let last = 0, m;
+  while ((m = tokRx.exec(rest)) !== null) {
+    segs.push(esc(rest.slice(last, m.index)));
+    if (m[1] !== undefined) {
+      segs.push(tintm(GOLDm, m[1], true));
+      if (m[2] !== undefined)
+        segs.push(m[2] === "x" ? tintm(GOLDm, m[2], true) : tintm(CYm, m[2], false));
+    }
+    else if (m[4] !== undefined) segs.push(esc(m[3]) + tintm(CYm, m[4], false));
+    else segs.push(tintm(SPK_MAG, m[5], false));
+    last = m.index + m[0].length;
+  }
+  segs.push(esc(rest.slice(last)));
+  return segs.join("");
 }
+
 function paintSpoken(line) {
   const WAVE = String.fromCharCode(12336) + String.fromCharCode(65039);
   // everything before what was said: stamp, branch, icon, speaker. A wrapped line hangs
   // under that rather than starting back at the tree column and cutting through it.
-  const upto = line.indexOf(WAVE);
-  const indent = upto > 0 ? termCols(line.slice(0, upto)) : 0;
+
   // LITERALS, not new RegExp("..."): the PAGE string and the JS string literal each
   // eat a backslash, so a quoted "\\*" would arrive as a bare quantifier
   const tagRx = /\\*([^*]{1,24})\\*|\\[pause [0-9.]+s\\]/g;
   const MK = String.fromCodePoint(127917);           // the mask starts a spoken line
-  const CY = "#2ef2ff", WH = "#ffffff", MAG = "#ff5dc8", SAY = "#f2c14e";   // gold
+  const CY = SPK_CY, WH = "#ffffff", MAG = SPK_MAG, SAY = "#f2c14e";   // gold
+  // a thought is not speech, so it is not gold: bright grape, with just enough glow to
+  // read as interior rather than spoken
+  const THINKC = "#c07ffb";
+  const isThought = line.indexOf(String.fromCodePoint(0x1F4AD)) >= 0;
   const tint = (c, s, b) => '<span style="color:' + c + (b ? ";font-weight:600" : "") + '">'
                           + esc(s) + '</span>';
   const marked = (s, base) => {
@@ -9266,48 +14736,234 @@ function paintSpoken(line) {
       line = line.slice(gi + 2);
     }
   }
+  // the audio marker: stripped from view, carried as the replay id
+  const aidRx = new RegExp(String.fromCharCode(0x27EA) + "([^" + String.fromCharCode(0x27EB)
+                           + "]+)" + String.fromCharCode(0x27EB));
+  const am = line.match(aidRx);
+  const aid = am ? am[1] : "";
+  if (am) line = line.replace(aidRx, "").replace(new RegExp("[ ]+$"), "");
   const a = line.indexOf(WAVE), b = line.lastIndexOf(WAVE);
-  if (a < 0 || b <= a) return pre + marked(line, null);    // not a spoken line
+  if (a < 0 || b <= a) {
+    // not a spoken line: a report row. The same families of ink as everywhere
+    // else in the panel - thinking's cyan for time and units, its gold for
+    // numbers, the payload viewer's grape for thought rows, magenta for names.
+    return pre + paintTtsMeta(line);                       // (patch174)
+  }
   const head = line.slice(0, a), said = line.slice(a + WAVE.length, b);
   // the speaker is between the mask and the FIRST colon after it. Matching on the last
   // colon instead swallowed the timestamp, which is full of them.
   // The icon now varies with the mood, so the speaker is read structurally instead:
   // the head is "<icon> Name: ", so it is the first token, then the name to the colon.
   let lead = esc(head);
+  let whoName = "";
   const bare = head.replace(/^\\s+/, "");
   const off = head.length - bare.length;
   const sp = bare.indexOf(" "), c = bare.indexOf(":");
   if (sp > 0 && c > sp) {
     // a fixed cell for the icon: emoji widths differ between faces, so without this the
     // names below each other do not line up
+    const ic = bare.slice(0, sp);
+    const nm = MOOD_NAMES[ic] || "";
+    whoName = bare.slice(sp + 1, c).trim();
     lead = esc(head.slice(0, off))
-         + '<span style="display:inline-block;width:2ch;text-align:center">'
-         + esc(bare.slice(0, sp)) + '</span>' + esc(" ")
-         + tint(MAG, bare.slice(sp + 1, c).trim(), true)
+         + '<span class="moodic" style="display:inline-block;width:2ch;text-align:center"'
+         + (nm ? ' title="' + esc(nm) + '"' : "")
+         + '>' + esc(ic) + '</span>' + esc(" ")
+         + tint(MAG, whoName, true)
          + esc(": ");
   }
-  const body = pre + lead + esc(WAVE) + marked(said, SAY) + esc(WAVE)
-             + esc(line.slice(b + WAVE.length));
-  return '<span style="display:block;padding-left:' + indent + 'ch;text-indent:-'
-       + indent + 'ch">' + body + '</span>';
+  // TWO cells, laid out by flexbox. The head keeps its natural width whatever the emoji
+  // measure, and the spoken text wraps inside what is left, aligned under itself. The
+  // previous approach counted terminal columns and applied them as `ch` - but an emoji is
+  // not a whole number of `ch`, so it never lined up and could not be made to.
+  const headHtml = pre + lead;
+  const saidHtml = esc(WAVE)
+                 + (isThought
+                     ? '<span style="color:' + THINKC + ';text-shadow:0 0 6px '
+                       + THINKC + '55,0 0 14px ' + THINKC + '22">' + marked(said, null)
+                       + '</span>'
+                     : marked(said, SAY))
+                 + esc(WAVE)
+                 // the tail after the closing wave carries the realtime reading,
+                 // brackets, bolt and number: one unit, never folded mid-way
+                 + '<span style="white-space:nowrap">'
+                 + esc(line.slice(b + WAVE.length)) + '</span>';
+  // stretch, not flex-start: the branch is height:100% of this cell, and it has to
+  // reach the bottom of a wrapped row or the tree breaks where the text folds
+  const saidWrap = aid
+    ? '<span class="spk" data-act="playSpoken" data-aid="' + esc(aid)
+      + '" title="click to replay this line">' + saidHtml + "</span>"
+    : (isThought && whoName
+        // a thought was never spoken, so a click ASKS for it: synthesized in the
+        // character's own voice with an inner-monologue echo, then broadcast like
+        // any replay - every open page hears the inside of the head
+        ? '<span class="spk thk" data-act="playThought" data-who="' + esc(whoName)
+          + '" title="click to voice this thought (inner-monologue echo)">' + saidHtml + "</span>"
+        : saidHtml);
+  return SPOKEN_TAG + ' style="display:flex;align-items:stretch">'
+       + '<span style="flex:0 0 auto;white-space:pre">' + headHtml + '</span>'
+       + '<span style="flex:1 1 auto;min-width:0">' + saidWrap + '</span>'
+       + '</span>';
 }
 
 // `which` is the FEED being shown; `pane` is the terminal it is shown IN. In split view
 // they differ - the left pane may be showing the proxy feed - and a per-terminal setting
 // has to follow the pane, not the feed, or the button toggles something else.
+// The panel's own mark, for lines the panel itself produced. A provider line carries
+// the provider's emoji; PTI and PME are ours, so they carry this.
+const PANDORUM_MARK = String.fromCharCode(0x25C8);
+// the real icon, not a hand-drawn stand-in
+const PANDORUM_SVG = '<img class="pmark" src="/icon.ico" alt="" width="17" height="17">';
+// The Proxy terminal tails a file, so switching a feature off stopped new lines but
+// left every earlier one on screen. These two are the panel's own; when their switch is
+// off they are hidden from the record as well, which is what "off" reads as.
+// Built ONCE per refresh, like provHiddenRx. This one had the same fault and was worse
+// for it: PTI and PME are off by default, so it compiled two regexes for every line of
+// every terminal on every refresh, whether or not anybody had touched a setting. The
+// cost grows with the log, which is why the Proxy terminal worked for a few minutes and
+// then stopped, and why Split View - painting two panes - never worked at all.
+// Does this line carry that title as a RECORD - "  Meta          [1237]"? Written with
+// indexOf rather than a pattern: a backslash in this file crosses two string layers and
+// arrives as a bare letter, which is how the filter came to throw on every paint.
+function hasRecord(line, title) {
+  // a provider owns its plain records and its drill-marked ones alike
+  for (const t of [title, title + String.fromCodePoint(0x2937)]) {
+    let at = line.indexOf(" " + t + " ");
+    while (at >= 0) {
+      let i = at + t.length + 1;
+      while (line.charAt(i) === " ") i++;       // the run of padding between them
+      if (i > at + t.length + 1 && line.charAt(i) === "[") return true;
+      at = line.indexOf(" " + t + " ", at + 1);
+    }
+  }
+  return false;
+}
+function panelProvMatcher() {
+  const s = (state && state.settings) || {};
+  const off = [];
+  if (String(s.ttsPlayerTags || "off").toLowerCase() !== "on") off.push("PTI");
+  if (String(s.ttsMoodEval || "off").toLowerCase() !== "on") off.push("PME");
+  const thought = String(s.ttsThoughtOut || "off").toLowerCase() !== "on"
+                ? String.fromCodePoint(0x1F4AD) : "";
+  if (!off.length && !thought) return null;
+  return function (line) {
+    if (thought && line.indexOf(thought) >= 0) return true;
+    for (const t of off) {
+      if (line.indexOf(" " + t + ":") >= 0) return true;      // its answer
+      if (hasRecord(line, t)) return true;                    // its record
+    }
+    return false;
+  };
+}
+// Blank rows between records. A provider line and the branches under it read as one
+// group; without a gap the next group starts on the very next row and the eye has to
+// find the boundary by colour alone. Proxy terminal only - the others are prose.
+// A branch joins DOWN to the next branch or it does not: a tee with nothing under
+// it is a wire to nowhere, and a single child drawn as a tee looked broken. Written
+// glyphs cannot know what is spliced beneath them later, so the truth is settled
+// here, after the splice, from what is actually on the next row.
+function fixTree(text) {
+  const NL = String.fromCharCode(10);
+  const T = String.fromCharCode(0x251C), L = String.fromCharCode(0x2514);
+  const has = l => l.indexOf(T) >= 0 || l.indexOf(L) >= 0;
+  const src = String(text).split(NL);
+  return src.map((l, i) => {
+    if (!has(l)) return l;
+    const want = (i + 1 < src.length && has(src[i + 1])) ? T : L;
+    return l.replace(T, want).replace(L, want);
+  }).join(NL);
+}
+function hiddenProvs() {
+  return new Set(String(((state && state.settings) || {}).termHideProv || "")
+                 .split(",").map(s => s.trim()).filter(Boolean));
+}
+function allProvs() {
+  const out = [];
+  ((state && state.routing) || []).forEach(s => (s.providers || []).forEach(p => {
+    if (p.id) out.push(p);
+  }));
+  return out;
+}
+function paintProvFilter() {
+  const box = $("provfilter");
+  if (!box) return;
+  const off = hiddenProvs();
+  box.innerHTML = allProvs().map(p =>
+    '<button class="stop provpick' + (off.has(p.id) ? "" : " on")
+    + '" data-act="provPick" data-id="' + esc(p.id) + '" title="' + esc(p.title || p.id)
+    + '">' + provMark(p, 19) + '</button>').join("");
+}
+// Built ONCE per refresh. It used to build one RegExp per provider per line, so a full
+// tail of a few thousand lines constructed tens of thousands of them and the terminal
+// stopped keeping up - which reads as "the log stopped appearing".
+function provHiddenRx() {
+  const off = hiddenProvs();
+  if (!off.size) return null;
+  const titles = allProvs().filter(p => off.has(p.id) && p.title).map(p => p.title);
+  if (!titles.length) return null;
+  // a title is user text; matching it by hand needs no escaping and cannot be malformed
+  return { test: line => titles.some(t => hasRecord(line, t)) };
+}
+function dropPanelProv(text) {
+  const NL = String.fromCharCode(10);
+  const rx = provHiddenRx(), panel = panelProvMatcher();
+  if (!rx && !panel) return text;              // nothing hidden: no pass at all
+  return String(text).split(NL)
+    .filter(l => !(panel && panel(l)) && !(rx && rx.test(l))).join(NL);
+}
 function paintTail(which, text, elOv, pane) {
   const el = elOv || $("tail-" + which);
   if (!el) return;
   const who = pane || which;
+  // THE fifteen-patch spacing bug, one character wide: the log is written on
+  // Windows, so every file line ends in CR+LF. The split below is on LF, which
+  // leaves a trailing CR on each line; innerHTML parsing turns that CR into a
+  // newline, and inside a pre-wrap row div a trailing newline renders a second,
+  // empty line - so every FILE row stood two lines tall while every SPLICED row
+  // (built here, no CR) stood one. Scrub the CR before anything else looks.
+  text = String(text).split(String.fromCharCode(13)).join("");
+  // and every OTHER break-capable character - line/paragraph separators, vertical
+  // tab, form feed, NEL - plus trailing whitespace per line and the file's final
+  // empty line, so nothing invisible can ask any row for a second line
+  for (const cc of [0x2028, 0x2029, 0x0B, 0x0C, 0x85])
+    text = text.split(String.fromCharCode(cc)).join("");
+  text = text.split(String.fromCharCode(10))
+             .map(l => l.replace(new RegExp("[ " + String.fromCharCode(9) + "]+$"), ""))
+             .join(String.fromCharCode(10));
+  while (text.slice(-1) === String.fromCharCode(10)) text = text.slice(0, -1);
+  // and the SOFT break the CR fix could not touch: record lines end in a run of
+  // column padding (plus the spaces left when the payload marker is stripped),
+  // and under pre-wrap the browser wraps a trailing space run onto an invisible
+  // second line - records grew, spoken lines (built here, unpadded) never did.
+  // Trailing whitespace has no display value in a terminal row: strip it per line.
+  const TWS = new RegExp("[ " + String.fromCharCode(9) + "]+$");
+  text = text.split(String.fromCharCode(10))
+             .map(l => l.replace(TWS, "")).join(String.fromCharCode(10));
+  if (which === "dashboard" || which === "ptipme") text = dropPanelProv(text);
   // splice FIRST: it places lines by timestamp, so stripping them first left it
-  // nothing to match on and the insertions silently vanished
+  // nothing to match on and the insertions silently vanished - and the spacing
+  // reads the spliced rows too, so a record whose only output is spoken still
+  // gets its air
   if (termInsTtsOn() && TERM_INS_KINDS.indexOf(which) >= 0) text = spliceTts(text);
+  if (which === "dashboard") window.__rawTail = text;   // pre-transform, for Copy raw
+  // spacing rules are OVER: five patches of rhythm never survived contact with the
+  // field, and the owner called it. The feed renders as the file stands, every row
+  // in the same uniform measure - fixTree still corrects the branch glyphs, which
+  // is content, not spacing.
+  if (which === "dashboard") text = fixTree(text);
   if (!termStampsOn(who)) text = stripStamps(text);
   sizeTailEl(el, text);
-  if (which === "thinking") { paintThink(el, text); return; }
+  // the same painter as the Thinking Content terminal: separators, stamps and ports
+  // read identically, which is the point - they are the same kind of record
+  if (which === "thinking" || which === "ptipme" || which === "ttscal") {
+    paintThink(el, text); return;
+  }
   if (which === "tts") {
     const NLT = String.fromCharCode(10);
+    const stickT = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
+    const keepT = el.scrollTop;
     el.innerHTML = joinLines(String(text).split(NLT), paintSpoken);
+    el.scrollTop = stickT ? el.scrollHeight : keepT;
     return;
   }
   if (which !== "dashboard") { el.textContent = text; return; }
@@ -9315,16 +14971,66 @@ function paintTail(which, text, elOv, pane) {
   const numRx = new RegExp("^[0-9][0-9.,]*(ms)?$");
   const thinkRx = new RegExp("^[(]~[0-9]+[)]$");
   const holdRx = new RegExp("^[+][0-9]+(ms)?$");   // priority-queue wait, e.g. +2922 (ms follows as its own token)
-  const portRx = new RegExp("^[[][0-9]{4}[]]$");
+  const portRx = new RegExp("^[[][0-9]{4}]$");
+  const cacheRx = new RegExp("^[0-9]+(/[0-9]+)?%?$");
   const errRx = new RegExp("error|fail|timeout|refused", "i");
+  const SPLIT_RUNS = new RegExp("( +)");    // one splitter, not one per line
   const names = new Set((state && state.routing || []).flatMap(s => (s.providers || []).map(p => p.title)).filter(Boolean));
   const stick = el.scrollTop + el.clientHeight >= el.scrollHeight - 40;
   const keep = el.scrollTop;
+  const ACT = String.fromCodePoint(0x26A1);
+  // a record line may end in its payload id - the mark is stripped from view and the
+  // emoji + provider title become the button that opens that request and its reply
+  const pidRx = new RegExp(" *" + String.fromCodePoint(0x27E6)
+                           + "([0-9]+)" + String.fromCodePoint(0x27E7) + " *$");
   el.innerHTML = joinLines(String(text).split(NL), line => {
+    let pid = null;
+    const pm = line.match(pidRx);
+    if (pm) { pid = pm[1]; line = line.slice(0, pm.index); }
     if (line.indexOf(SAID) >= 0) return paintSpoken(line);   // an inserted spoken line
+    // "<who> > <what>" - the name reads like a speaker, the action like a tag, so they
+    // take the colours those already have in this terminal
+    if (line.indexOf(ACT) >= 0 && line.indexOf(" > ") > 0) {
+      const cut = line.indexOf(ACT) + ACT.length;
+      const rest = line.slice(cut), at = rest.indexOf(" > ");
+      return paintSpoken(line.slice(0, cut))
+           + '<span style="color:' + SPK_MAG + ';font-weight:600">' + esc(rest.slice(0, at)) + '</span>'
+           + '<span style="color:#e8ecf2"> > </span>'
+           + '<span style="color:' + SPK_CY + ';font-weight:600">' + esc(rest.slice(at + 3)) + '</span>';
+    }
     if (errRx.test(line)) return '<span style="color:var(--err)">' + esc(line) + '</span>';
-    return line.split(new RegExp("( +)")).map(tk => {
+    // the click target: from the emoji token to the last title word before [port]
+    const tks = line.split(SPLIT_RUNS);
+    const portAt = tks.findIndex(x => portRx.test(x));
+    // the mark is token 2 behind a stamp and token 0 without one - Hide Stamps
+    // strips the stamp, and an index that ASSUMED it put the title in the mark's
+    // 2ch cell, wrapping "Dialogue" two letters to a row. Known by what it is: a
+    // stamp starts "[" and carries ":", which a port token never does.
+    const base = (tks.length && tks[0].charCodeAt(0) === 91
+                  && tks[0].indexOf(":") > 0) ? 2 : 0;
+    // a BRANCH mark (the action bolt, and whatever joins it) gets the same fixed
+    // cell a record mark gets: the bolt is narrow, and its rows started two pixels
+    // left of every spoken row's
+    const treeAt = tks.findIndex(x => x.indexOf(String.fromCharCode(0x251C)) >= 0
+                                   || x.indexOf(String.fromCharCode(0x2514)) >= 0);
+    let openAt = -1, closeAt = -1;
+    if (pid !== null && portAt > base + 1) { openAt = base; closeAt = portAt - 2; }
+    return tks.map((tk, ti) => {
+      let h = paintTok(tk);
+      // every record's mark sits in one fixed-width cell: emoji advance by different
+      // widths in a monospace line, and the whole row after one wandered with it
+      if (ti === base && portAt > base + 1) h = '<span class="pcell">' + h + "</span>";
+      if (treeAt >= 0 && ti === treeAt + 2 && portAt < 0)
+        h = '<span class="pcell">' + h + "</span>";
+      if (ti === openAt) h = '<span class="plpay" data-act="proxyPayload" data-pid="'
+                             + pid + '" title="open this request and its reply">' + h;
+      if (ti === closeAt) h = h + "</span>";
+      return h;
+    }).join("");
+    function paintTok(tk) {
       if (!tk || tk.indexOf(" ") >= 0) return esc(tk);
+      if (tk === PANDORUM_MARK) return PANDORUM_SVG;         // a line the panel made
+      if (tk === "PTI" || tk === "PME") return '<span class="pown">' + esc(tk) + '</span>';
       if (tk[0] === "[" && tk.indexOf(":") > 0) return '<span style="color:#7fd4ff">' + esc(tk) + '</span>';
       if (portRx.test(tk)) return '<span style="color:#8b93a3">' + esc(tk) + '</span>';
       if (thinkRx.test(tk)) return '<span style="color:#ff5dc8">' + esc(tk) + '</span>';
@@ -9333,13 +15039,21 @@ function paintTail(which, text, elOv, pane) {
         if (body.slice(-2) === "ms") { body = body.slice(0, -2); tailMs = ' <span style="color:#e8ecf2">ms</span>'; }
         return '<span style="color:#e8ecf2">+</span><span style="color:var(--ok)">' + esc(body) + '</span>' + tailMs;
       }
+      // cache 258/270 96% - the figures are the reading; the word and the marks are not
+      if (tk === "cache") return '<span style="color:#e8ecf2">' + esc(tk) + '</span>';
+      if (cacheRx.test(tk) && tk.indexOf("/") + tk.indexOf("%") > -2) {
+        return tk.split(new RegExp("([/%])")).map(bit =>
+          (bit === "/" || bit === "%")
+            ? '<span style="color:#e8ecf2">' + esc(bit) + '</span>'
+            : '<span style="color:var(--ok)">' + esc(bit) + '</span>').join("");
+      }
       if (numRx.test(tk)) {
         if (tk.slice(-2) === "ms") return '<span style="color:var(--ok)">' + esc(tk.slice(0, -2)) + '</span> <span style="color:#e8ecf2">ms</span>';
         return '<span style="color:var(--ok)">' + esc(tk) + '</span>';
       }
       if (names.has(tk)) return '<span style="color:' + dashColor(tk) + '">' + esc(tk) + '</span>';
       return '<span style="color:#e8ecf2">' + esc(tk) + '</span>';
-    }).join("");
+    }
   });
   el.classList.toggle("blackbg", !!window.__termBlack);
   el.scrollTop = stick ? el.scrollHeight : keep;
@@ -9826,7 +15540,14 @@ function stackPaint() {
   }).join(NL);
   if (window.__stackOpen) el.style.display = "block";
 }
-function stackSet(txt) { window.__stackTxt = String(txt || ""); stackPaint(); }
+function stackSet(txt) {
+  window.__stackTxt = String(txt || "");
+  // A launch REPLACES this text with the server's own log, throwing away anything the
+  // client had announced - including the TTS server. Forget the last state so the next
+  // pass says where it stands again.
+  window.__prevTts = undefined;
+  stackPaint();
+}
 function stackAdd(line) {
   const NL = String.fromCharCode(10);
   window.__stackTxt = (window.__stackTxt ? window.__stackTxt + NL : "") + nowStamp() + line;
@@ -9861,7 +15582,10 @@ function fleetWatch() {
   }
   const tb = $("termBtn");
   if (tb) {
-    const lit = serving.length > 0;
+    // Terminate stops the TTS server as well as the fleet, so a running TTS lights it
+    // exactly as a running LLM does
+    const ttsLit = String(((state && state.ttsServer) || {}).state || "") === "serving";
+    const lit = serving.length > 0 || ttsLit;
     if (lit !== !!window.__termLit) {
       window.__termLit = lit;
       if (lit) { tb.classList.remove("fadered"); tb.classList.add("livered"); }
@@ -9919,6 +15643,20 @@ function fleetWatch() {
       }
     }
   }
+  // the TTS server belongs here with the rest of the stack - it is a server the panel
+  // started, and this is the terminal that reports servers starting and stopping
+  const _ts = (state && state.ttsServer) || {};
+  const _tsNow = _ts.died ? "died" : (String(_ts.state || "") === "serving" ? "up"
+                 : (_ts.pid ? "starting" : "down"));
+  // undefined means the stack was just replaced, or this is the first pass: say where
+  // the TTS server stands unless it is simply off, which needs no announcement
+  if (window.__prevTts === undefined ? _tsNow !== "down" : _tsNow !== window.__prevTts) {
+    if (_tsNow === "starting") stackAdd("TTS server starting on :" + (_ts.port || "?"));
+    else if (_tsNow === "up") stackAdd("TTS server serving on :" + (_ts.port || "?"));
+    else if (_tsNow === "died") stackAdd("TTS server: " + String(_ts.died || "").slice(0, 140));
+    else if (window.__prevTts !== "down") stackAdd("TTS server stopped");
+  }
+  window.__prevTts = _tsNow;
   if (window.__prevServing) {
     serving.forEach(s => {
       if (!window.__prevServing.has(s.id)) stackAdd("✅ " + (s.label || s.id) + " serving on :" + s.port);
@@ -10090,7 +15828,7 @@ const TTS_FIELDSETS = {
     ["ttsModel", "TTS Model (.gguf)", [".gguf"]],
     ["ttsPython", "Python Executable (the venv that runs the wrapper)", [".exe"]],
     ["ttsWrapper", "Wrapper Script (.py)", [".py"]],
-    ["##", "Voice"],
+    ["##", "Audio Files"],
     ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
     ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
     ["##", "Ports"],
@@ -10098,13 +15836,16 @@ const TTS_FIELDSETS = {
     ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null]
   ],
   audiocpp: [
-    ["##", "Folders & Model"],
+    ["##", "Folder Paths"],
     ["ttsAcppDir", "audio.cpp Folder (the panel finds audiocpp_server.exe inside)", "folder"],
     ["ttsAcppModelsDir", "TTS Models Folder (scanned for .gguf and safetensors)", "folder"],
-    ["##", "Voice"],
+    ["##", "Audio Files"],
     ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
     ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
     ["ttsAcppRefSlots", "Cached Voices (how many speakers stay encoded; raise it if you use many)", null],
+    ["##", "TTS Backend Settings"],
+    ["ttsChunkChars", "Chunk Size in characters (how much text goes to the engine at once - shorter fails less often and costs less when it does; this is what EOC calibration sweeps)", null],
+    ["ttsAcppBusyMs", "Line Time Limit in ms (how long one line may generate before the server gives up - the only thing that bounds a runaway; the longest chunk sent is 170 characters)", null],
     ["##", "Ports & Naming"],
     ["ttsServerPort", "Server Port", null],
     ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null],
@@ -10120,7 +15861,7 @@ const TTS_STEPS = [
   ["Set the log folder", "<b>Folder Settings</b> - only the log folder matters here. Everything else on that page belongs to the LLM fleet."],
   ["Point at the binary and the model", "<b>Proxy</b> then <b>TTS</b>. Fill in <b>TTS Server Binary</b> and <b>TTS Model</b>. Paste the paths, use <b>Choose file</b>, or - if you already run a working TTS launcher - press <b>Import from a launcher</b> and it reads them straight out of it."],
   ["Pick the GPU", "Leave it blank and every visible card is offered to the server. Pick one and it is pinned by its UUID, so a reboot or a reseated card cannot move it onto a different GPU."],
-  ["Choose who translates", "Set <b>Who translates for SkyrimNet</b> to <b>The panel</b>. It takes the wrapper port straight away and the line underneath says whether that succeeded. If it did not, something else is already on that port - usually a wrapper of your own still running."],
+  ["Choose who translates", "Set <b>Who translates for SkyrimNet</b> to <b>The Proxy</b>. It takes the wrapper port straight away and the line underneath says whether that succeeded. If it did not, something else is already on that port - usually a wrapper of your own still running."],
   ["Start the server", "Press <b>Start TTS</b> and wait for <b>ready</b>. The model takes a few seconds to load and the server does not answer until it has, so the button reads <b>Launching</b> in the meantime."],
   ["Point SkyrimNet at the panel", "In SkyrimNet: <b>Voice</b> then <b>Text-to-Speech</b>, engine <b>Zonos</b>, and set the endpoint to this machine on the wrapper port."],
   ["Test it", "Press SkyrimNet's own <b>Test</b> button. The line appears in <b>Proxy</b> then <b>TTS Terminal</b> within a second or two, with its timings."]
@@ -10326,18 +16067,19 @@ async function ttsLoadModels(force) {
 function higgsInstallRow() {
   const g = (state && state.higgsInstall) || {};
   if (g.running) {
-    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="row" style="gap:10px;align-items:center">'
+    higgsPoll();          // idempotent: the row is redrawn by every refresh
+    return HIGGS_SECT + '<div class="row" style="gap:10px;align-items:center">'
          + '<b>Installing Higgs v3</b>'
          + '<button class="stop" data-act="higgsCancel">Stop</button></div>'
-         + '<div class="hint" style="margin-top:7px;line-height:1.7">' + esc(g.step || "starting...")
+         + '<div class="hint" id="higgs-step" data-higgs="step" style="margin-top:7px;line-height:1.7">'
+         + esc(higgsStepText(g))
          + '</div><div style="height:6px;border-radius:3px;background:rgba(255,255,255,.07);'
-         + 'margin-top:8px;overflow:hidden"><div style="height:100%;width:'
-         + (g.pct || 0).toFixed(1) + '%;background:var(--acc);transition:width .3s"></div></div>'
+         + 'margin-top:8px;overflow:hidden">' + higgsBarHtml(g) + '</div>'
          + '<div class="hint" style="margin-top:6px">Watch the TTS Terminal for the detail. '
          + 'Stopping keeps what has downloaded, so starting again resumes.</div></div>';
   }
   if (g.error) {
-    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="hint" style="color:#ff5d5d;line-height:1.7">'
+    return HIGGS_SECT + '<div class="hint" style="color:#ff5d5d;line-height:1.7">'
          + 'Install ' + esc(g.error) + '</div>'
          + '<div class="hint" style="margin-top:6px;line-height:1.7">Anything already '
          + 'downloaded is kept, so trying again resumes rather than starting over.</div>'
@@ -10347,7 +16089,7 @@ function higgsInstallRow() {
   if (g.done) {
     // without this the row falls back to the install button and a finished install
     // looks exactly like one that never ran
-    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="hint" style="color:var(--ok);line-height:1.7">'
+    return HIGGS_SECT + '<div class="hint" style="color:var(--ok);line-height:1.7">'
          + '\u2705 Higgs Audio v3 installed' + (g.model ? (' - ' + esc(g.model)) : '') + '.</div>'
          + (g.warn ? '<div class="hint" style="color:var(--warn);margin-top:6px;line-height:1.7">'
                      + esc(g.warn) + '</div>' : '')
@@ -10363,7 +16105,7 @@ function higgsInstallRow() {
   if (f.adoptable) {
     // the files are there but the settings are not - a config save failing at the last
     // step of an install did exactly this, and so does installing by hand
-    return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="hint" style="color:var(--ok);line-height:1.7">'
+    return HIGGS_SECT + '<div class="hint" style="color:var(--ok);line-height:1.7">'
          + '\u2705 Higgs is already installed here, but not selected.</div>'
          + '<div class="hint" style="margin-top:6px;line-height:1.7">Found '
          + '<code>' + esc(f.exe || "") + '</code> and ' + (f.models || []).length
@@ -10371,10 +16113,96 @@ function higgsInstallRow() {
          + '<button class="stop" data-act="higgsAdopt" style="margin-top:8px">Use it</button>'
          + '<button class="stop" data-act="higgsInstall" style="margin-top:8px">Reinstall</button></div>';
   }
-  return '<div class="tsect">Install</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0"><div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">'
+  return HIGGS_SECT + '<div class="row" style="gap:10px;align-items:center;flex-wrap:wrap">'
        + '<button class="stop bigbtn" data-act="higgsInstall">Install Higgs v3</button>' + badge
        + '<span class="hint" style="width:auto">1 click install into the PandorumLLM '
        + 'directory</span></div></div>';
+}
+
+// The install writes its own two nodes and nothing else.
+//
+// It used to ride the ordinary refresh: the worker raised an event, the page queued a
+// reload, and `uiBusy()` put that reload off until nothing was busy. During an install
+// something always is - which is why the terminal, which has its own tail feed, scrolled
+// happily while the bar above it sat still, and why switching tabs "fixed" it: a tab
+// change calls load() straight out, past the gate. A progress bar cannot be gated on
+// the panel being idle. This asks one small endpoint, patches the step line and the
+// bar width, and reloads the page state ONCE, when the install stops running - which
+// is the moment the row has to become the finished or failed one.
+// The step line, composed in ONE place - the row draws it and the poll writes it, and
+// two spellings of it would drift the moment either changed.
+function higgsStepText(g) {
+  const idle = Number((g && g.idle) || 0);
+  return String((g && g.step) || "starting...")
+       + (idle >= 3 ? "    (nothing new for " + Math.round(idle) + "s)" : "");
+}
+// Write EVERY copy of the row, found fresh each tick by attribute.
+//
+// getElementById returns ONE node and swears it is the right one. A pane rebuilt
+// between the lookup and the write leaves a detached twin behind, and writing to that
+// twin looks exactly like not writing at all - which is the whole complaint. Writing
+// every match costs nothing (there is normally one) and cannot pick the wrong one.
+// A phase with nothing to count - asking github, clearing a folder - has no number
+// to show, and a bar frozen at 0 is the same picture as a bar that has stopped.
+// Striped and moving says working; a width says how far.
+function higgsBarHtml(g) {
+  const pct = Number((g && g.pct) || 0);
+  const idle = "background:repeating-linear-gradient(135deg,var(--acc) 0 8px,rgba(0,0,0,.35) 8px 14px);animation:higgsIdle .7s linear infinite";
+  return '<div id="higgs-bar" data-higgs="bar" style="height:100%;width:'
+       + (pct > 0 ? pct.toFixed(1) + '%;background:var(--acc);transition:width .3s"'
+                  : '100%;' + idle + '"')
+       + '></div>';
+}
+function higgsPaint(g) {
+  const steps = document.querySelectorAll('[data-higgs="step"]');
+  const bars = document.querySelectorAll('[data-higgs="bar"]');
+  const txt = higgsStepText(g), pct = Number(g.pct || 0);
+  let live = 0;
+  steps.forEach(function(n) { n.textContent = txt; if (n.isConnected) live++; });
+  bars.forEach(function(n) {
+    // crossing between a measured phase and an unmeasured one changes the bar's
+    // whole shape, not its width, so hand that back to the one place that draws it
+    if ((pct > 0) !== (n.style.animation === "")) { n.outerHTML = higgsBarHtml(g); }
+    else { n.style.width = pct > 0 ? pct.toFixed(1) + "%" : "100%"; }
+    if (n.isConnected) live++;
+  });
+  return live;                                 // how many of them are actually on screen
+}
+function higgsPoll() {
+  // A CLAIM WITH A DATE ON IT. A bare flag kept a dead loop's place for good: if a
+  // tick threw - and a tick that redraws the page can - the reschedule at the bottom
+  // was never reached, and every attempt to restart was then refused by the flag the
+  // dead loop had left set. Only a page refresh cleared it. A beat older than three
+  // seconds means whoever set it is gone, so take its place.
+  const now = Date.now();
+  if (window.__higgsBeat && now - window.__higgsBeat < 3000) return;
+  window.__higgsBeat = now;
+  (async function loop() {
+    let stop = false;
+    try {
+      window.__higgsBeat = Date.now();         // the loop is alive, this tick
+      let g = null;
+      try { g = await (await fetch("/api/higgs-progress")).json(); } catch (e) { g = null; }
+      // "running" missing means this is not an install record at all - an error body,
+      // a 403, a panel without the endpoint - and none of those mean it finished.
+      if (g && "running" in g) {
+        if (state) state.higgsInstall = g;
+        if (!g.running) {
+          stop = true;
+          window.__higgsBeat = 0;
+          load();                              // done, failed or cancelled: redraw it
+          return;
+        }
+        // nothing of ours on screen: ask for the pane, through the one guarded rule
+        if (!higgsPaint(g) && curTab === "tts") renderCurrent();
+      }
+    } catch (e) {
+      // A bad tick is a bad tick. Three patches running, one of them was the last one.
+      try { trace("refresh", "install poll tick failed", String(e)); } catch (x) {}
+    } finally {
+      if (!stop) setTimeout(loop, 700);        // the reschedule cannot be skipped
+    }
+  })();
 }
 
 async function higgsInstall() {
@@ -10391,7 +16219,16 @@ async function higgsInstall() {
   if (!ok) return;
   await post("/api/higgs-install", { confirm: true });
   showTsub("tts");                        // the install narrates itself there
-  await load(); renderTts();
+  // Draw the running row from what we already know, before asking anyone. The
+  // first phase - asking github, clearing the engine folder - has no number to
+  // report, so waiting for a round trip to change the row left the Install button
+  // sitting there as though the press had done nothing.
+  if (state) state.higgsInstall = Object.assign({}, state.higgsInstall,
+                                                { running: true, pct: 0, idle: 0,
+                                                  step: "starting..." });
+  renderTts(true);
+  higgsPoll();                            // and it reports from here on
+  await load();
 }
 async function higgsCancel() {
   if (!await uiConfirm("Stop the download? A part-finished file is kept, so starting "
@@ -10427,13 +16264,427 @@ async function recheckAcpp() {
 
 // Unpinned does not mean "any card" - the server config carries "device": 0, so it means
 // the FIRST one. Saying so stops a single-GPU owner wondering whether they missed a step.
+// Both are downloaded, so switching is a restart rather than another install.
+//
+// What they differ by is NOT the GPU: the same three names - portable, balance, fast -
+// are also used for the CPU-only builds, where CUDA architecture means nothing. They are
+// the host-side CPU instruction baseline. The GPU floor is the same either way, set by
+// the prebuilt CUDA runtime: compute capability 7.5, so RTX 20-series or newer.
+//
+// Which is why this is offered without a recommendation to switch: on a TTS path the GPU
+// does the work, so a wider CPU baseline is unlikely to show up in the numbers at all.
+// The install row has five states and every one of them opens the same way. Written
+// out five times, a rename touches five places and misses one.
+const HIGGS_SECT = '<div class="tsect">Installation</div><div class="tgroup" style="border-top:none;padding-top:0;margin-top:0">';
+// value -> what the option is called. The panel and the page must agree on the set,
+// which the gate checks against TTS_PING_MODES.
+const PING_MODES = [["on", "Yes"], ["off", "No"], ["banned", "Banned"]];
+const ACPP_BUILDS = [
+  ["balance", "Balanced"],
+  ["fast", "Fast"]
+];
+
 function gpuAutoLabel() {
   const g = (state && state.gpus) || [];
   if (!g.length) return "Automatic - the first card the driver reports";
-  const name = g[0].name || g[0].id;
+  const f = g[0];
+  const name = "#" + (f.index === undefined || f.index === null ? "?" : f.index)
+             + "  " + (f.brand ? f.brand + "  " : "") + (f.name || f.id);
   return g.length === 1
     ? "Automatic - " + name + " (your only card)"
-    : "Automatic - the first card (" + name + ")";
+    : "Automatic - the first card, " + name;
+}
+
+// The player types their line, so nothing tags it - every NPC around them is delivered
+// with feeling and they are read flat. A fleet model can fill that in, but only if one
+// is actually up: an empty list is the honest answer, not a disabled-looking control.
+// A server that can answer a chat request. A vision projector or an MTP draft is
+// loaded as a model and shows as serving, but neither will answer one - offering them
+// would be offering a choice that fails.
+// Shown in place of a control that cannot work yet. Dimmed rather than hidden: hiding it
+// would leave someone hunting for a feature the changelog told them about.
+function llmNeeded(label) {
+  return '<div class="needllm" title="' + esc(NO_LLM_WHY) + '">'
+       + '<label style="margin-top:0">' + esc(label) + '</label>'
+       + '<div class="row" style="flex-wrap:nowrap">'
+       + '<select class="txt" disabled><option>Unavailable - no server has a language model on it</option></select>'
+       + '</div></div>';
+}
+
+// A server that COULD answer a chat request: set up, with a language model on it.
+//
+// Not "currently serving" - these are settings, and settings are arranged before the
+// fleet is launched, not after. A server that is off answers nothing, and the tag path
+// already treats no answer as no tag.
+//
+// A vision projector or an MTP draft is a loaded model and will show as serving, but
+// neither will answer a chat request, so neither is offered.
+function ttsTagServers() {
+  return (state.slots || []).filter(s =>
+    s.scriptExists
+    && (s.model || "").trim()
+    && ["vision", "draft"].indexOf(String(s.modelKind || "")) < 0);
+}
+const NO_LLM_WHY = "Needs a server set up with a language model on it. A vision or "
+                 + "draft model cannot answer this. Assign a launcher whose model is a "
+                 + "language model on the Server page - it does not have to be running "
+                 + "yet.";
+// A title that explains itself on hover. The explanations used to sit under each
+// control as a paragraph, which made the page a wall of prose to read past every time.
+function ttsTitle(text, tip) {
+  return '<label class="ttl" title="' + esc(tip) + '">' + esc(text)
+       + '<span class="qm">?</span></label>';
+}
+
+// Tag Limits mode, shared by both boards. On: the buttons glow, a chip click sets
+// how many of that character's own turns must pass before the tag may speak again,
+// Save writes the table, Reset clears it (no limits is the default). The two boards
+// write two tables: the player's turns and each NPC's own.
+window.__tagLim = window.__tagLim || { player: { on: false, work: null },
+                                       npc: { on: false, work: null } };
+const TAGLIM_KEYS = { player: "ttsTagLimitsPlayer", npc: "ttsTagLimits" };
+// The stepper popover: click a chip in limit mode and adjust with < and > instead
+// of cycling blind. One popover exists at a time; it survives the grid repaint
+// because it lives OUTSIDE the grid container it points into.
+function tagLimPop(board, tag) {
+  tagLimPopClose();
+  const grid = $(board === "player" ? "tts-taggrid" : "tts-finaltaggrid");
+  if (!grid) return;
+  const chip = grid.querySelector('[data-tag="' + tag.replace(/"/g, "") + '"]');
+  if (!chip) return;
+  const m = window.__tagLim[board];
+  const n = (m.work || {})[tag.toUpperCase()] || 0;
+  const pop = document.createElement("div");
+  pop.id = "taglim-pop";
+  pop.innerHTML =
+      '<button class="stop pnv" data-act="tagLimDec" data-board="' + board
+    + '" data-tag="' + esc(tag) + '" title="one turn fewer">&lsaquo;</button>'
+    + '<b class="tlimn">' + n + "</b>"
+    + '<button class="stop pnv" data-act="tagLimInc" data-board="' + board
+    + '" data-tag="' + esc(tag) + '" title="one turn more">&rsaquo;</button>';
+  const host = grid.parentElement;
+  host.style.position = "relative";
+  host.appendChild(pop);
+  const cr = chip.getBoundingClientRect(), hr = host.getBoundingClientRect();
+  pop.style.left = Math.max(0, cr.left - hr.left + cr.width / 2 - pop.offsetWidth / 2) + "px";
+  pop.style.top = (cr.bottom - hr.top + 5) + "px";
+  window.__tagLimPop = { board: board, tag: tag };
+}
+function tagLimPopClose() {
+  const p = document.getElementById("taglim-pop");
+  if (p) p.remove();
+  window.__tagLimPop = null;
+}
+function tagLimSaved(st, board) {
+  const out = {};
+  String(st[TAGLIM_KEYS[board]] || "").split(",").join(" ").split(" ")
+    .filter(Boolean).forEach(p => {
+      const i = p.lastIndexOf(":");
+      if (i > 0 && /^[0-9]+$/.test(p.slice(i + 1)))
+        out[p.slice(0, i).toUpperCase()] = parseInt(p.slice(i + 1), 10);
+    });
+  return out;
+}
+function tagLimTable(st, board) {
+  const m = window.__tagLim[board];
+  return (m.on && m.work) ? m.work : tagLimSaved(st, board);
+}
+function tagLimButtons(board) {
+  const on = window.__tagLim[board].on;
+  return '<button class="stop tlimbtn' + (on ? " on" : "") + '" data-act="tagLimMode"'
+    + ' data-board="' + board + '" title="set per-tag frequency limits: while lit,'
+    + ' click a tag to choose how many of the same character&#39;s turns must pass'
+    + ' before that tag is spoken again - the player counts player turns, an NPC'
+    + ' counts that NPC&#39;s own. Save writes the table; Reset returns to no'
+    + ' limits.">Tag Limits<span class="qm">?</span></button>'
+    + (on ? '<button class="stop" data-act="tagLimSave" data-board="' + board
+          + '">Save</button><button class="stop" data-act="tagLimReset" data-board="'
+          + board + '">Reset</button>' : "");
+}
+function tagLimChip(word, n) {
+  return n > 0 ? '<b class="tlim">' + n + "</b>" : "";
+}
+
+// Every tag Higgs can be sent, as a button - the FINAL gate on the wire. Lit:
+// allowed. Clicked off: dimmed, and that tag never reaches the engine, whoever
+// wrote it - SkyrimNet's NPC lines, the player tagger, an alias. Independent of
+// the Player Audio Tags board below, which edits prompts; this edits the wire.
+function ttsFinalTagGrid(st) {
+  const offer = (state && state.tagOffer) || [];
+  if (!offer.length) return "";
+  const off = new Set(String(st.ttsTagsFinalOff || "").toUpperCase()
+                      .split(",").join(" ").split(" ").filter(Boolean));
+  const lim = tagLimTable(st, "npc");
+  let h = '<div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">'
+    + '<label class="ttl" style="margin:0" title="'
+    + esc("The final gate on what reaches the engine. Every tag Higgs understands, "
+        + "as a button: lit is allowed, dimmed is blocked. A blocked tag never "
+        + "reaches the TTS, whoever wrote it - SkyrimNet's own NPC lines, the "
+        + "player tagger, or an alias like [angry] - and a blocked sound effect "
+        + "takes its onomatopoeia with it. Independent of the Player Audio Tags "
+        + "board, which edits the built-in prompts: that decides what models are "
+        + "ASKED for, this decides what the engine is SENT. With Audio Tags set to "
+        + "Strip, nothing passes anyway and this gate is idle.")
+    + '">Allowed Tags<span class="qm">?</span></label>'
+    + tagLimButtons("npc") + "</div>";
+  offer.forEach(g => {
+    h += '<div class="hint" style="width:auto;margin:8px 0 3px">' + esc(g[0]) + "</div>"
+      + '<div class="tagbox">'
+      + g[1].map(w => '<span class="tagbtn' + (off.has(w.toUpperCase()) ? " off" : "")
+          + '" data-act="ttsFinalTagToggle" data-tag="' + esc(w)
+          + '" title="' + (window.__tagLim.npc.on
+              ? "click to set how many of this NPC&#39;s turns must pass before "
+                + "this tag repeats"
+              : (off.has(w.toUpperCase()) ? "blocked - click to allow it again"
+                                          : "allowed - click to block it")) + '">'
+          + esc(w) + tagLimChip(w, lim[w.toUpperCase()] || 0) + "</span>").join("")
+      + "</div>";
+  });
+  return h;
+}
+
+// Every tag the built-in prompts offer, as a button. Lit: offered. Clicked off:
+// dimmed, and the word leaves the BUILT-IN PTI and PME prompts and their answer
+// filters. A custom prompt is the user's own text and is never edited - the yellow
+// chip says so where the buttons are, not in a paragraph.
+function ttsTagGrid(st) {
+  const offer = (state && state.tagOffer) || [];
+  if (!offer.length) return "";
+  const off = new Set(String(st.ttsTagsOff || "").toUpperCase()
+                      .split(",").join(" ").split(" ").filter(Boolean));
+  const custom = String(st.ttsPtiPrompt || "").trim() || String(st.ttsPmePrompt || "").trim();
+  // prosody words are offered lowercase; the stored set is upper. Compare in one
+  // case or the Audio group's buttons save the click and never show it.
+  const isOff = w => off.has(String(w).toUpperCase());
+  const lim = tagLimTable(st, "player");
+  let h = '<div class="tdiv"></div>'
+    + '<div class="row" style="align-items:center;gap:10px;flex-wrap:wrap">'
+    + '<label class="ttl" style="margin:0" title="'
+    + esc("Every audio tag the built-in tagger and mood prompts offer. Click one to "
+        + "turn it off: it is dimmed here and removed from the built-in PTI prompt, "
+        + "the built-in PME prompt where it appears, their worked examples, and the "
+        + "answer filters - a model that uses it anyway is not kept. Click again to "
+        + "turn it back on. Only the built-in prompts are edited; a custom prompt is "
+        + "your own text and is used exactly as written.")
+    + '">Player Audio Tags<span class="qm">?</span>'
+    + (custom
+       ? '<span class="mandy" title="'
+         + esc("A custom prompt is active for PTI and/or PME and is used exactly as "
+             + "written. These buttons edit only the built-in prompts, so they have "
+             + "no effect until the custom prompt is cleared.")
+         + '">Custom Prompt Active</span>'
+       : "")
+    + "</label>"                  // inside the label: beside the title, not under it
+    + tagLimButtons("player") + "</div>";
+  offer.forEach(g => {
+    // the group's name above its own field, and the buttons inside a field of their
+    // own - bordered like an input, holding buttons instead of text
+    h += '<div class="hint" style="width:auto;margin:8px 0 3px">' + esc(g[0]) + "</div>"
+      + '<div class="tagbox">'
+      + g[1].map(w => '<span class="tagbtn' + (isOff(w) ? " off" : "")
+          + '" data-act="ttsTagToggle" data-tag="' + esc(w)
+          + '" title="' + (window.__tagLim.player.on
+              ? "click to set how many player turns must pass before this tag repeats"
+              : (isOff(w) ? "off - click to offer it again"
+                          : "offered - click to turn it off")) + '">'
+          + esc(w) + tagLimChip(w, lim[w.toUpperCase()] || 0) + "</span>").join("")
+      + "</div>";
+  });
+  return h;
+}
+
+// The setting, and its Thinking switch beside it - they belong to each other.
+function ttsPair(main, mid, side, sideFlex) {
+  // not flex:1 on the first cell - that pushed the others out to the right margin,
+  // away from the setting they belong to
+  return '<div class="row" style="gap:14px;align-items:flex-start;flex-wrap:wrap;'
+       + 'justify-content:flex-start">'
+       + '<div style="flex:0 1 300px;min-width:220px">' + main + '</div>'
+       + (mid ? '<div style="flex:0 0 150px">' + mid + '</div>' : "")
+       + '<div style="flex:' + (sideFlex || "0 0 150px") + '">' + side + '</div></div>';
+}
+
+// A prompt anyone can rewrite. Blank means the built-in wording, so "Reset" is just
+// clearing the box rather than remembering what the default said.
+function ttsPromptBox(key, what) {
+  const has = String((((state || {}).settings) || {})[key] || "").trim();
+  return ttsTitle("Prompt Edit",
+      "Rewrite the instruction sent to the " + what + ". Leave it empty for the built-in "
+      + "wording, which is what almost everyone should do - the parsing expects the "
+      + "shape the default asks for.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<button class="stop" data-act="ttsPromptEdit" data-key="' + key + '">'
+    + (has ? "Edit (changed)" : "Edit") + '</button></div>';
+}
+
+async function ttsPromptEdit(key) {
+  const st = ((state || {}).settings) || {};
+  const isPti = key === "ttsPtiPrompt";
+  const cur = String(st[key] || "");
+  const dflt = isPti ? (state.defaultPtiPrompt || "") : (state.defaultPmePrompt || "");
+  showModal('<h2 style="margin:2px 0 10px">'
+    + (isPti ? "Player Tag Injector prompt" : "Player Mood Evaluation prompt") + '</h2>'
+    + '<p class="hint" style="line-height:1.7;margin:0 0 10px">Empty uses the built-in '
+    + 'wording below. ' + (isPti ? "" : "The reply must still end with a "
+      + "<b>Final Answer</b> section, or nothing can be read out of it. ")
+    + '<code>{n}</code> and <code>{words}</code> are filled in for you.</p>'
+    + '<textarea id="promptbox" class="txt" style="width:100%;height:230px;'
+    + 'font-family:Consolas,monospace;font-size:12.5px;line-height:1.55">'
+    + esc(cur) + '</textarea>'
+    + '<p class="hint" style="line-height:1.6;margin:10px 0 4px">Built in:</p>'
+    // its own field: read-only, scrollable, with a copy corner - the wording is
+    // there to be taken as a starting point, and taking it used to mean dragging
+    // a selection through a grey paragraph
+    + '<div class="copybox"><button class="copybtn" data-act="copyBuiltIn" '
+    + 'title="copy the built-in wording">\u29C9</button>'
+    + '<pre id="tts-builtin" class="copypre">' + esc(dflt) + "</pre></div>"
+    + '<div class="row" style="justify-content:flex-end;gap:8px">'
+    + '<button class="stop" onclick="closeModal()">Cancel</button>'
+    + '<button class="stop" data-act="ttsPromptClear" data-key="' + key + '">Use the built-in</button>'
+    + '<button data-act="ttsPromptSave" data-key="' + key + '">Save</button></div>', true);
+}
+
+function panelProv(pid) {
+  for (const s of (state.routing || [])) {
+    for (const p of (s.providers || [])) if (p.id === pid) return { p: p, s: s };
+  }
+  for (const p of (state.unallocated || [])) if (p.id === pid) return { p: p, s: null };
+  return null;
+}
+function panelProvThinking(pid) {
+  const f = panelProv(pid);
+  return !!(f && f.p && f.p.thinking);
+}
+// The server is the slot it hangs off in Live Network - there is no picker here any
+// more, because two places naming a server is two places that can disagree.
+function ttsWiredBox(pid) {
+  const f = panelProv(pid);
+  const wired = f && f.s;
+  return ttsTitle("Server",
+      "Set by wiring this provider to a server in Live Network - drag its box onto the "
+      + "one you want. Everything else about it lives on its provider card there too: "
+      + "Thinking, priority, and the sampler values it sends.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + (wired
+        ? '<span class="chip" style="color:var(--ok)">' + esc(f.s.label || f.s.id)
+          + ' &middot; ' + esc(String(f.s.port || "")) + '</span>'
+        : '<span class="chip" style="color:var(--warn)">not wired - drag it onto a server in Live Network</span>')
+    + '</div>';
+}
+function ttsPlayerTagRow(st) {
+  const on = String(st.ttsPlayerTags || "off").toLowerCase() === "on";
+  const up = ttsTagServers();
+  if (!up.length) return llmNeeded("Player Tag Injector");
+  const main = ttsTitle("Player Tag Injector",
+      "You type your lines, so nothing has tagged them - every character around you is "
+      + "delivered with feeling while you are read flat. With this on, a model is asked "
+      + "for one feeling and one sound for each line you speak, before it is voiced. "
+      + "You can always write a tag yourself instead: [angry] Get out of my way. A tag "
+      + "found this way is always used, whatever Audio Tags is set to.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsPlayerTags" onchange="saveTtsMode()">'
+    + '<option value="off"' + (on ? "" : " selected") + '>Off</option>'
+    + '<option value="on"' + (on ? " selected" : "") + '>On</option>'
+    + '</select></div>';
+  let h = ttsPair(main, ttsPromptBox("ttsPtiPrompt", "tagger"), ttsWiredBox("pti"), "1 1 260px");
+  if (!on) return h;
+  if (panelProvThinking("pti")) {
+    h += moodSlider("ttsPtiBudget", "Thinking Budget", 100, 10000, st.ttsPtiBudget || "2000",
+        "Tokens the tagger may spend, reasoning included. Too low and it is cut off "
+        + "mid-thought and answers nothing.");
+  }
+  h += '<div class="tsplit"></div>';      // closes PTI, rather than splitting it
+  return h;
+}
+
+// NPC thoughts, spoken automatically: the toggle arms it, and the Sequence select
+// appears beside it only once armed - before the spoken line, or after it.
+function ttsThoughtAudioRow(st) {
+  const on = String(st.ttsThoughtAudio || "off").toLowerCase() === "on";
+  const seq = String(st.ttsThoughtSeq || "before").toLowerCase();
+  let h = '<div class="tsect">Thought Audio</div>'
+    + ttsTitle("NPC thought Audio",
+               "voice each NPC thought automatically, with the inner-monologue echo, "
+               + "and play it on every open panel page around the spoken line")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsThoughtAudio" onchange="saveTts()">'
+    + '<option value="off"' + (on ? "" : " selected") + '>Off - thoughts stay silent unless clicked</option>'
+    + '<option value="on"' + (on ? " selected" : "") + '>On - voice thoughts automatically</option>'
+    + '</select>'
+    + (on
+        ? '<span class="hint" style="width:auto">Sequence</span>'
+          + '<select class="txt" id="tts-ttsThoughtSeq" onchange="saveTts()" '
+          + 'title="a thought is had before the mouth opens - or lingers after">'
+          + '<option value="before"' + (seq === "after" ? "" : " selected") + '>Before NPC dialogue line</option>'
+          + '<option value="after"' + (seq === "after" ? " selected" : "") + '>After NPC dialogue line</option>'
+          + '</select>'
+        : '')
+    + '</div>';
+  return h;
+}
+function ttsMoodRow(st) {
+  const on = String(st.ttsMoodEval || "off").toLowerCase() === "on";
+  const tagging = String(st.ttsPlayerTags || "off").toLowerCase() === "on";
+  const up = ttsTagServers();
+  if (!up.length) return llmNeeded("Player Mood Evaluation");
+  const main = ttsTitle("Player Mood Evaluation",
+      "The tagger sees one sentence with no idea what led to it. With this on, a model "
+      + "reads the conversation after each line is spoken and names the feelings your "
+      + "reply might carry. That reading is given to the tagger as background, marked "
+      + "plainly as NOT what you said - your actual words still decide the tag.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsMoodEval" onchange="saveTtsMode()">'
+    + '<option value="off"' + (on ? "" : " selected") + '>Off</option>'
+    + '<option value="on"' + (on ? " selected" : "") + '>On</option>'
+    + '</select></div>';
+  let h = ttsPair(main, ttsPromptBox("ttsPmePrompt", "reader"), ttsWiredBox("pme"), "1 1 260px");
+  if (!on) return h;
+  const post = String(st.ttsMoodPostpone || "off").toLowerCase() === "on";
+  const activation = ttsTitle("Activation",
+      "When the reading happens. It never delays anything you are waiting for - both "
+      + "choices land while you are still reading the reply. Wait for speech if this "
+      + "model shares a card with the speech engine.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsMoodPostpone" onchange="saveTts()">'
+    + '<option value="off"' + (post ? "" : " selected") + '>After NPC text arrival</option>'
+    + '<option value="on"' + (post ? " selected" : "") + '>After TTS completion</option>'
+    + '</select></div>';
+  h += ttsPair(activation, "",
+      moodSlider("ttsMoodEvery", "PME Frequency", 1, 20, st.ttsMoodEvery || "5",
+        "How often the scene is read. 1 is every NPC line, 5 is every fifth. A line "
+        + "that arrives in pieces counts once. The tagger running resets the count, so "
+        + "in a back-and-forth conversation a high number means it rarely reads at all "
+        + "- the setting earns its keep when NPCs talk among themselves."),
+      "1 1 260px")
+    + '<div class="tsplit"></div>'
+    + moodSlider("ttsMoodHistory", "Chat History", 1, 250, st.ttsMoodHistory || "25",
+        "How many spoken turns it looks back over. A handful carries most of the mood; "
+        + "more costs prefill for little gain.")
+    + moodSlider("ttsMoodCount", "Emotion Tag Count", 1, 5, st.ttsMoodCount || "3",
+        "How many feelings it may name at most. It can name fewer, and naming none is a "
+        + "valid answer. Fewer is firmer background; more gives the tagger options.")
+    + (panelProvThinking("pme")
+        ? moodSlider("ttsPmeBudget", "Thinking Budget", 100, 10000, st.ttsPmeBudget || "3000",
+            "Tokens the reader may spend, reasoning included. Too low and it is cut off "
+            + "mid-thought with no answer at all - which is what a truncated Final Answer "
+            + "means.")
+        : "");
+  if (!tagging) {
+    h += '<div class="hint" style="margin:2px 0 10px;line-height:1.7;color:var(--warn)">'
+       + 'Player Tag Injector is off, so nothing reads this yet.</div>';
+  }
+  return h;
+}
+
+function moodSlider(key, label, lo, hi, val, tip) {
+  return ttsTitle(label, tip)
+    + '<div class="row" style="flex-wrap:nowrap;align-items:center;gap:12px">'
+    + '<input type="range" id="tts-' + key + '" min="' + lo + '" max="' + hi + '"'
+    + ' value="' + esc(String(val)) + '" style="flex:1 1 auto"'
+    + ' oninput="document.getElementById(' + String.fromCharCode(39) + 'sv-' + key
+    + String.fromCharCode(39) + ').textContent = this.value" onchange="saveTts()">'
+    + '<b id="sv-' + key + '" style="min-width:3.5ch;text-align:right">'
+    + esc(String(val)) + '</b></div>';
 }
 
 function ttsModelOptions() {
@@ -10454,13 +16705,50 @@ function ttsModelHint() {
   return list.length + " found" + (sh ? ("  -  " + sh + " safetensors folder(s) hidden because a .gguf sits alongside and wins") : "");
 }
 
-function renderTts() {
+// Everything the pane is DRAWN FROM. The pane used to be rebuilt on every live
+// tick, which replaced the terminal element several times a minute: its text
+// vanished until the next fetch, its resized height went back to the default, and
+// the whole page flickered. Nothing here changing means nothing to redraw.
+function ttsPaneSig() {
+  if (!state) return "";
+  const st = state.settings || {};
+  const keys = Object.keys(st).filter(k => k.indexOf("tts") === 0 && k !== "ttsDiagLast");
+  keys.sort();
+  // The install's SHAPE is part of the signature - running, finished, failed,
+  // adoptable - because the pane draws a different row for each, and a signature
+  // blind to a thing lets a render decline while that thing changes. That is what
+  // five patches of install-display fixes were all funnelling into: pressing
+  // Install flipped ONLY higgsInstall, the sig came out identical, renderTts
+  // declined, the poll asked renderCurrent for the missing row, renderTts declined
+  // again - forever. A page refresh drew it because an empty pane always draws.
+  // pct and step are DELIBERATELY absent: they move every second and are written
+  // into the standing row by higgsPaint - putting them here would turn the whole
+  // pane over once a second for two numbers.
+  const g = state.higgsInstall || {}, f = state.higgsFound || {};
+  return JSON.stringify([keys.map(k => [k, st[k]]), state.ttsServer, state.ttsWrap,
+                         (state.gpus || []).map(g2 => g2.id), ttsBusy,
+                         ttsModels === null ? -1 : ttsModels.length,
+                         [!!g.running, !!g.done, String(g.error || ""),
+                          String(g.warn || ""), String(g.engine || ""),
+                          String(g.model || "")],
+                         [!!f.adoptable, String(f.exe || ""), (f.models || []).length]]);
+}
+let ttsPaneDrawn = "";
+function renderTts(force) {
   const pane = $("dpane-tts");
   if (!pane || !state) return;
+  const sig = ttsPaneSig();
+  if (!force && sig === ttsPaneDrawn && pane.firstChild) {
+    refreshCalTail();                    // the live parts update in place
+    refreshTtsMeter();
+    return;
+  }
+  ttsPaneDrawn = sig;
   const st = state.settings || {};
-  const mode = String(st.ttsWrapMode || "off").toLowerCase();
-  const ping = String(st.ttsAnswerPing || "on").toLowerCase();
-  const tags = String(st.ttsTags || "off").toLowerCase();
+  const mode = String(st.ttsWrapMode || "on").toLowerCase();
+  const ping = PING_MODES.map(p => p[0]).indexOf(String(st.ttsAnswerPing || "off").toLowerCase()) >= 0
+             ? String(st.ttsAnswerPing).toLowerCase() : "off";
+  const tags = String(st.ttsTags || "on").toLowerCase();
   const w = state.ttsWrap || {};
   const eng = String(st.ttsEngine || "moss").toLowerCase();
   if (eng === "audiocpp" && ttsModels === null) ttsLoadModels(false).then(() => renderTts());
@@ -10472,9 +16760,12 @@ function renderTts() {
   const ready = svUp && !busy && (mode === "on" ? w.on : true);
   const keep = {};                       // never wipe a path mid-paste (same rule as Folder Settings)
   ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el) keep[f[0]] = el.value; });
+  // same reading as Live Network: index, board partner, then the card
+  const gpuText = g => "#" + (g.index === undefined || g.index === null ? "?" : g.index)
+                     + "  " + (g.brand ? g.brand + "  " : "") + (g.name || g.id);
   const gsel = (state.gpus || []).map(g =>
       '<option value="' + esc(g.id) + '"' + (st.ttsGpuId === g.id ? " selected" : "") + '>'
-      + esc((g.name || g.id) + "   " + (g.uuid || "")) + '</option>').join("");
+      + esc(gpuText(g) + (g.uuid ? "   " + g.uuid : "")) + '</option>').join("");
   pane.innerHTML = '<div class="card set" style="max-width:860px">'
     // Choose the TTS, not the engine: the engine follows from it. Kept keyed on the
     // engine value so no existing config needs migrating - a second TTS on the same
@@ -10509,7 +16800,7 @@ function renderTts() {
     + '<label>Who translates for SkyrimNet</label><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsWrapMode" onchange="saveTtsMode()">'
     + '<option value="off"' + (mode === "on" ? "" : " selected") + '>Your own wrapper (the panel only writes the launcher)</option>'
-    + '<option value="on"' + (mode === "on" ? " selected" : "") + '>The panel (no separate wrapper process)</option>'
+    + '<option value="on"' + (mode === "on" ? " selected" : "") + '>The Proxy (no separate wrapper process)</option>'
     + '</select></div>'
     + '<div class="hint" style="margin:-4px 0 12px;line-height:1.6">'
     + (mode === "on"
@@ -10517,27 +16808,76 @@ function renderTts() {
                 : '<span style="color:var(--err)">Not listening - the port may be in use.</span>')
         : '')
     + '</div>'
-    + '<label>Answer SkyrimNet startup ping locally</label><div class="row" style="flex-wrap:nowrap">'
+    + ttsTitle("SkyrimNet Ping",
+        "SkyrimNet sends the word ping at startup to see whether the speech endpoint "
+        + "answers. It is a probe, not dialogue - it never reaches the tagger, the mood "
+        + "reader or the conversation record whatever this is set to. Yes: answer it "
+        + "here with silence, and say so in the terminal - it costs no GPU time, where "
+        + "speaking the word costs 600-1100ms of it. No: send it to the speech engine "
+        + "and hear it spoken, which is only useful when you are testing that the engine "
+        + "works at all. Banned: answer with silence and say nothing - the same as Yes "
+        + "without the terminal line.")
+    + '<div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsAnswerPing" onchange="saveTts()">'
-    + '<option value="on"' + (ping === "off" ? "" : " selected") + '>Yes - return silence, never touch the GPU</option>'
-    + '<option value="off"' + (ping === "off" ? " selected" : "") + '>No - generate it like any other line</option>'
+    + PING_MODES.map(p => '<option value="' + p[0] + '"'
+        + (ping === p[0] ? " selected" : "") + '>' + esc(p[1]) + '</option>').join("")
     + '</select></div>'
     + '<div class="tsect">Audio Tags</div><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsTags" onchange="saveTts()">'
     + '<option value="off"' + (tags === "on" ? "" : " selected") + '>Strip them - speak the words only</option>'
     + '<option value="on"' + (tags === "on" ? " selected" : "") + '>Pass them to the engine</option>'
     + '</select></div>'
+    + (eng === "audiocpp" && tags === "on"
+        ? '<div id="tts-finaltaggrid">' + ttsFinalTagGrid(st) + "</div>"
+        : '')
     + (eng === "audiocpp"
-        ? ('<label>Model</label><div class="row" style="flex-wrap:nowrap">'
+        ? '<div class="tsect">Player Tag System</div>' + ttsPlayerTagRow(st) + ttsMoodRow(st)
+          + '<div id="tts-taggrid">' + ttsTagGrid(st) + "</div>"
+        : '')
+    + (eng === "audiocpp" ? ttsThoughtAudioRow(st) : '')
+    + (eng === "audiocpp"
+        ? ('<div class="tsect">TTS Server</div>'
+           + '<label>Model</label><div class="row" style="flex-wrap:nowrap">'
            + '<select class="txt" id="tts-ttsAcppModel" data-act="ttsModelSel">'
            + ttsModelOptions() + '</select>'
-           + '<button class="stop" data-act="ttsModelRescan" title="rescan the models folder">Rescan</button></div>'
+           + '<button class="stop" data-act="ttsModelRescan" title="rescan the models folder">Rescan</button>'
+           + '<button class="stop" data-act="acppReport" title="a report on how audio.cpp has behaved this session, for an upstream issue">audio.cpp report</button></div>'
            + '<div class="hint" id="tts-mdl" style="margin:-4px 0 12px;line-height:1.6">'
            + ttsModelHint() + '</div>')
+        : '')
+    + ((eng === "audiocpp" && ((state.higgsFound || {}).profiles || []).length > 1)
+        ? (ttsTitle("Audio.cpp Build",
+             "Both builds are installed and switching only needs a restart. They differ "
+             + "in the CPU instruction set they were compiled against, not the GPU - "
+             + "either way you need an RTX 20-series card or newer, which comes from the "
+             + "prebuilt CUDA runtime. Balanced is the tested default and runs on any "
+             + "processor audio.cpp supports. Fast was built for a narrower, more recent "
+             + "CPU baseline. On a TTS path the GPU does the work, so expect little or "
+             + "no difference between them; if Fast will not start, your processor is "
+             + "older than it was built for and Balanced is the answer.")
+           + '<div class="row" style="flex-wrap:nowrap">'
+           + '<select class="txt" id="tts-ttsAcppProfile" data-act="ttsProfileSel">'
+           + ACPP_BUILDS.filter(b => (state.higgsFound.profiles || []).indexOf(b[0]) >= 0)
+               .map(b => '<option value="' + b[0] + '"'
+                    + ((st.ttsAcppProfile || "balance") === b[0] ? " selected" : "") + '>'
+                    + esc(b[1]) + '</option>').join("")
+           + '</select></div>')
         : '')
     + '<label>GPU (pinned by UUID, so a reboot cannot move it)</label>'
     + '<div class="row" style="flex-wrap:nowrap"><select class="txt" id="tts-ttsGpuId" onchange="saveTts()">'
     + '<option value="">' + esc(gpuAutoLabel()) + '</option>' + gsel + '</select></div>'
+    + ttsTitle("GPU Clock Hold",
+        "Between lines the card drops to an idle power state, and the first tokens of "
+        + "the next line are spent climbing back out - which reads as a slow start on "
+        + "every short line. On: while the TTS server runs, the card's graphics clock "
+        + "is locked at its maximum (nvidia-smi -lgc) and released when the server "
+        + "stops or the panel exits. Needs the panel run as administrator, and costs "
+        + "idle watts while held - both are why this is your switch, off by default.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsGpuClockHold" onchange="saveTts()">'
+    + '<option value="off"' + (String(st.ttsGpuClockHold || "off") === "on" ? "" : " selected") + '>Off</option>'
+    + '<option value="on"' + (String(st.ttsGpuClockHold || "off") === "on" ? " selected" : "") + '>On</option>'
+    + '</select></div>'
     + (!st.ttsGpuId && (state.gpus || []).length > 1
         ? '<div class="hint" style="margin:-4px 0 12px;line-height:1.7;color:var(--warn)">'
           + 'With more than one card, pin the one you want - otherwise the server takes '
@@ -10580,27 +16920,615 @@ function renderTts() {
            + '<textarea id="tts-view" class="edit" spellcheck="false" readonly style="width:100%;height:42vh;'
            + 'margin-top:10px;font-family:Consolas,monospace;font-size:12.5px;line-height:1.5;white-space:pre;overflow:auto"></textarea>')
         : '')
+    + (eng === "audiocpp" ? ttsDiagBlock() : "")
     + '</div>';
   ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el && keep[f[0]] !== undefined) el.value = keep[f[0]]; });
+  if (eng === "audiocpp") {
+    // seed the freshly-built pane from what was last known, SYNCHRONOUSLY - the
+    // fetches below repaint a blank pane a beat later otherwise, and that beat is
+    // the blink the whole Monitoring block showed on every state tick
+    if (window.__ttsDiag) {
+      setChanged($("tts-head-now"), headroomBoxes(window.__ttsDiag));
+      setChanged($("tts-samp-chips"), ttsSampChips(window.__ttsDiag || {}));
+    }
+    if (window.__ttsMeter) paintMeter((window.__ttsMeter && window.__ttsMeter.line) || null);
+    loadTtsDiag();                               // fill the pickers and the chips
+    refreshTtsMeter();
+  }
 }
+
+// A section of its own, because it answers a different question from every setting above
+// it: not "what should the engine do" but "what is it actually being asked, and what has
+// gone wrong". Kept read-only - the one control is whether SkyrimNet's own settings are
+// passed on, which is a yes or no rather than a value.
+// The feed is the record. calTermText / calTermLine / ttsDiagLines were a second
+// copy of it inside the browser - unreadable after a reload, and impossible to
+// interleave with the tail in the right order. The panel writes every line of
+// this page to one log now and this page only tails it.
+// Only for what the feed cannot carry: a request that never reached the panel.
+function ttsCalMsg(s) {
+  const m = $("tts-cal-msg");
+  if (m) m.textContent = s;
+}
+function autoCalMode(st) {
+  const m = String(st.ttsAutoCal || "off").toLowerCase();
+  if (m === "proxy" || m === "algo" || m === "median" || m === "llm") return "proxy";
+  return "off";
+}
+// The same chip as a provider card: emoji, key, value, click to change, empty to
+// clear. Set here is accent and bold; SkyrimNet's own value is green; nothing at
+// all is dim. One palette (PSAMP_EMO), one behaviour, two places that show it.
+// Sampling is the only lever that changes how OFTEN a line fails to stop - the cap
+// below only decides what a failure costs. Both failures in the first field test
+// were short, well-punctuated lines, one of them a line that had just succeeded a
+// dozen times: a draw inside the sampler, not a property of the text.
+function ttsSampBlock(st) {
+  const safe = String(st.ttsRetrySafe || "on").toLowerCase() === "on";
+  const on = String(st.ttsSampAutoCal || "off").toLowerCase() === "on";
+  // Automatic: who moves the samplers depends on the calibration method above. In
+  // Proxy (the standard) the failure record IS the diagnosis: one bounded arithmetic
+  // step per fresh window, no model asked. In LLM mode a model reads the record.
+  // Manual: you set them yourself. Either way they are sent with every line.
+  const main = ttsTitle("Sampler Calibration",
+      "Sampling is the one lever on how OFTEN a line fails to stop; the cap above only "
+      + "decides what a failure costs.  AUTOMATIC: under the standard Proxy method, "
+      + "each refit takes at most one bounded arithmetic step - steadier when lines "
+      + "in the last window ran past end-of-content, one notch back towards "
+      + "SkyrimNet's values after a clean window, never past fixed bounds, each "
+      + "change logged with the numbers that drove it. Once, under a retired mode, a "
+      + "failure record is handed to a model instead.  MANUAL: you set them below "
+      + "and nothing moves them. Either way what is set here is sent with every "
+      + "line and wins over whatever arrived with it; left empty, the value that "
+      + "arrived passes through untouched.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    // the same exact fit as the menu in the row above it, for the same reason
+    + '<select class="txt calsel setsel" id="tts-ttsSampAutoCal" onchange="saveTtsMode()">'
+    + '<option value="off"' + (on ? "" : " selected") + ">Manual</option>"
+    + '<option value="on"' + (on ? " selected" : "") + ">Automatic</option>"
+    + "</select></div>";
+  // the model-reading job needs a server; the arithmetic needs nothing
+  return ttsCalRow(main, "", "")
+    + ttsTitle("Samplers",
+          "Click a value to set or clear it. Accent means set here and sent with every "
+          + "line; green means the value that arrived with the line is passing through, "
+          + "which is what it shows.  A sampler nobody has set anywhere shows a dash: "
+          + "nothing is sent for it and the engine uses its own default.  top_p 1.0 "
+          + "truncates nothing, and repetition_penalty pushes away from the wind-down "
+          + "tokens that come before the stop token - both are worth testing against "
+          + "the record.")
+    // Steady Retry sits with the SAMPLERS, not with their title: it is the other thing
+    // that decides what a request carries, and it was a row of its own two settings down
+    + '<div class="row" style="gap:18px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
+    + '<div class="row" id="tts-samp-chips" style="gap:6px;flex-wrap:wrap"></div>'
+    + '<span style="flex:0 0 auto;display:flex;align-items:center;gap:8px">'
+    + swToggle(safe, 'data-act="ttsRetrySafe" title="a retry aims to finish, not to perform"')
+    + ttsTitle("Steady Retry",
+          "A retry drops to a steadier sampler - cooler, no repetition penalty, nucleus "
+          + "truncated - so a second attempt aims to finish rather than to perform. The "
+          + "player hears the retry, not the attempt that failed.")
+    + "</span></div>";
+}
+// A job the panel gives to a model: which server// A job the panel gives to a model: which server, and whether it may think. The
+// two jobs are different questions - fitting a speech rate, and reading failures -
+// so they are chosen separately, but they are chosen the same way.
+// Which server a job would actually reach, by the same rule the panel uses: the
+// job's own picker, then the other one. Written once here so the page cannot
+// promise a server the panel would not ask.
+function fixedTokPerChar(st) {
+  const v = parseFloat(String(((st || {}).ttsFixedTokPerChar) || "3.5"));
+  return String(Math.max(1, Math.min(25, isNaN(v) ? 3.5 : v)));
+}
+function ttsSampChips(d) {
+  const ov = (d && d.samp) || {}, sent = (d && d.sampSent) || {};
+  return ["temp", "top_p", "min_p", "rep"].map(k => {
+    const set = String(ov[k] || "") !== "";
+    const v = set ? ov[k] : (sent[k] !== undefined ? sent[k] : "-");
+    const col = set ? "var(--acc)" : (sent[k] !== undefined ? "var(--ok)" : "var(--dim)");
+    const tip = set
+      ? k + " = " + ov[k] + " is sent with every line, over whatever arrived with it"
+          + "; click to change, empty to clear"
+      : "nothing set here - the " + k + " that arrives with the line passes through"
+          + (sent[k] !== undefined ? " (currently " + sent[k] + ")"
+                                   : " - nothing arrives, so the engine's own default is used")
+          + "; click to set a value";
+    return '<span class="chip clickable sampchip" style="color:' + col + ";--sgl:" + col
+      + (set ? ";font-weight:700" : "") + '" title="' + esc(tip)
+      + '" data-act="ttsSampChip" data-key="' + k + '" data-cur="'
+      + (set ? esc(ov[k]) : "") + '">'
+      + PSAMP_EMO[k] + " " + k + " " + esc(v) + "</span>";
+  }).join("");
+}
+function ttsSampEdit(el) {
+  const key = el.dataset.key;
+  const inp = document.createElement("input");
+  inp.className = "edit"; inp.style.maxWidth = "84px";
+  inp.value = el.dataset.cur;
+  inp.placeholder = "empty = clear";
+  el.replaceWith(inp); inp.focus(); inp.select();
+  let done = false;
+  const commit = async () => {
+    if (done) return; done = true;
+    const r = await post("/api/tts-sampler", { key: key, value: inp.value.trim() });
+    if (r && r.error) ttsCalMsg(r.error);
+    await load();
+    renderTts(true);                     // the chip returns with the new value on it
+  };
+  inp.addEventListener("keydown", e => {
+    if (e.key === "Enter") commit();
+    if (e.key === "Escape") { done = true; renderTts(true); }
+  });
+  inp.addEventListener("blur", commit);
+}
+// The model a panel job asks, and whether it may think - as ONE cell of a row, so a
+// setting and the model that carries it out sit together the way PTI/PME do.
+function ttsCalRow(main, mid, side) {
+  const cell = (html, flex, keepMin) => html
+    ? '<div' + (keepMin ? "" : ' class="calcell"') + ' style="flex:' + flex + '">'
+      + html + "</div>" : "";
+  return '<div class="calrow">'
+       + cell(main, "0 0 250px")
+       // min-width stays auto on this one: the cell may not shrink below its
+       // content, or the Thinking switch inside it would be ridden over - the
+       // squeeze goes to the spring and the shrinkable menus instead
+       + cell(mid, "0 1 auto", true)
+       + '<span class="calgap"></span>'
+       + cell(side, "0 0 auto")
+       + "</div>";
+}
+// A reading under a row, not a cell in it: it reports, it does not set anything.
+// The one reading this section produces, in one sentence: the headroom the
+// arithmetic is carrying, and where the numbers under it came from. The fit and
+// the last attempt used to be two grey lines of their own three settings away -
+// they say nothing that does not belong beside the headroom they went into.
+// One figure per box. A sentence has to be read from the start to find the number in
+// it; a box says which number it is holding, and a row of them can be scanned.
+function hbox(value, label, tip, wide) {
+  return '<div class="hbox' + (wide ? " wide" : "") + '"'
+    + (tip ? ' title="' + esc(tip) + '"' : "")
+    + '><div class="hb-v">' + esc(String(value)) + "</div>"
+    + '<div class="hb-l">' + esc(String(label)) + "</div></div>";
+}
+function headroomBoxes(d) {
+  const st = ((state || {}).settings) || {};
+  const h = (d && d.head) || null;
+  const perf = (d && d.perf) || null;
+  let out = "";
+  if (perf && perf.n) {
+    out += hbox(Number(perf.x).toFixed(2) + "x", "speed",
+                "audio seconds per second of making, median of the last " + perf.n
+                + " spoken lines. What lowers it: a line running past end-of-content "
+                + "and being retried (the whole line is generated again), another "
+                + "model doing work on the same card while speech generates, and a "
+                + "card climbing out of idle clocks at the start of every short line "
+                + "- see GPU Clock Hold under TTS Server.");
+    out += hbox(String(perf.retries), "retries",
+                "lines in that same window that ran past end-of-content and were "
+                + "generated again - each retry roughly halves that line's realtime "
+                + "on the spot. Steadier retry samplers and the learned headroom both "
+                + "exist to keep this at 0.");
+  }
+  if (h) {
+    out += hbox(Number(h.h).toFixed(2), "headroom",
+                "the safety margin over the token estimate: every spoken line's cap = "
+                + "estimate x this number, so " + Number(h.h).toFixed(2) + " gives a "
+                + "line " + Math.round((h.h - 1) * 100) + "% more tokens than "
+                + "predicted. Learned from how far real lines have actually missed "
+                + "their estimates on this machine - never guessed, never typed in.");
+    if (h.seed) {
+      out += hbox(h.n + " / " + h.need, "scored lines",
+                  "finished lines whose cap the ESTIMATE decided - the only lines "
+                  + "that can grade the estimator. Under " + h.need + " of them the "
+                  + "seed headroom is used rather than a figure fitted off two lines.");
+      out += hbox("seed", "not measured yet",
+                  "no headroom has been learned from this machine yet, so a safe "
+                  + "starting value is in force until " + h.need + " lines are scored");
+    } else {
+      out += hbox(Number(h.worst).toFixed(2), "worst line",
+                  "the biggest used-to-estimated token ratio among the scored lines - "
+                  + "the worst the estimator has under-predicted real speech here. "
+                  + Number(h.worst).toFixed(2) + " means one line needed "
+                  + Math.round((h.worst - 1) * 100) + "% more tokens than estimated; "
+                  + "the headroom is this number times the pad.");
+      out += hbox("x " + Number(h.pad).toFixed(2), "pad",
+                  "multiplied over the worst miss because the next line can always "
+                  + "miss by a little more - fixed at 1.10, i.e. 10% on top");
+      out += hbox(h.n, "scored lines",
+                  "finished lines whose cap the ESTIMATE decided - only these can "
+                  + "grade the estimator. Lines held at the floor or the guard say "
+                  + "nothing about it, so they are not counted here.");
+      out += hbox(h.censored, "runaways",
+                  "scored lines that hit their cap: the model missed its "
+                  + "end-of-content token, the line was cut and retried, and its true "
+                  + "length is unknown - it counts as needing AT LEAST its cap. The "
+                  + "cap decides what such a line COSTS; the samplers decide how "
+                  + "OFTEN it happens.");
+    }
+  }
+  const med = String(st.ttsAutoCalMedian || "");
+  if (med) {
+    try {
+      const j = JSON.parse(med);
+      out += hbox(j.cps + " chars/s", "TTS calibration, lead " + j.lead + "s",
+                  "the speech rate and lead-in a model fitted from this machine's own "
+                  + "measured lines - kept from " + (st.ttsAutoCalMedianN || "?")
+                  + " lines " + (st.ttsAutoCalMedianAt || "") + ". Kept only when it "
+                  + "predicts those lines at least as well as the panel's own least "
+                  + "squares; Proxy Algorithm (set to use it) "
+                  + "estimate every line with these numbers.");
+    } catch (e) {
+      out += hbox("unreadable", "TTS calibration", "the stored calibration is not valid JSON");
+    }
+  } else if (autoCalMode(st) !== "off") {
+    out += hbox("none kept", "TTS calibration",
+                "no model-fitted speech rate has been accepted yet - the panel is "
+                + "estimating from its own measured median instead, which works; a "
+                + "kept calibration refines it");
+  }
+  const tried = String(st.ttsAutoCalTried || "").trim();
+  if (tried) {
+    out += hbox(tried, "last attempt"
+                + (st.ttsAutoCalTriedAt ? "  " + st.ttsAutoCalTriedAt : ""),
+                "what the last TTS calibration attempt came to, in the model's own "
+                + "outcome: kept, refused for predicting worse than the panel's own "
+                + "least squares, or unusable - with the time it was tried", true);
+  }
+  return out;
+}
+function ttsAutoCalBlock(st) {
+  const mode = autoCalMode(st);
+  // The fit and the last attempt are NOT read here any more: headroomBoxes() puts
+  // them beside the headroom they went into, which is one reading in one place
+  // instead of three scattered down the section.
+  const every = Math.max(5, Math.min(250, parseInt(st.ttsAutoCalEvery || "25", 10) || 25));
+  const opt = (v, label) => '<option value="' + v + '"'
+    + (mode === v ? " selected" : "") + ">" + label + "</option>";
+  // The three modes, each explained where it is chosen rather than in a paragraph
+  // above them: every spoken line is measured, and the mode decides what is done
+  // with that measurement to cap the next one.
+  const main = ttsTitle("TTS Calibration Method",
+      "Every spoken line is measured - characters in, seconds out - and that becomes a "
+      + "per-line token cap on the next one, always inside the runaway guard. The cap "
+      + "is a STOP-LOSS, not a target: the engine stops at its own end-of-content "
+      + "token, so a smaller cap never shortens a line - it only decides what a "
+      + "runaway costs, and set below what a line needed it turns a good line into a "
+      + "retry.  FIXED: no measuring, a flat 3.5 tokens per character.  PROXY "
+      + "ALGORITHM (the standard): the panel's own least-squares arithmetic over the "
+      + "rate measured on this machine - it refits itself every N lines, steps the "
+      + "samplers when asked to, needs no model, no server and no quiet gap, and so "
+      + "can never contend with speech.  LLM CONTROLLED: the same arithmetic, with a "
+      + "model refitting the rate every N lines while the server is idle - kept for "
+      + "model-read diagnosis.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    // fills its 250px cell exactly: .setsel is width:100% on the stand-in, which
+    // also outruns the page-wide 260px floor the select alone would keep
+    + '<select class="txt calsel setsel" id="tts-ttsAutoCal" onchange="saveTtsMode()">'
+    + opt("off", "Fixed")
+    + opt("proxy", "Proxy Algorithm (standard)")
+    + "</select></div>";
+  // The server that carries a choice out and the button that shows what it sends go
+  // in the setting's OWN row - both settings, the same three cells, so the two rows
+  // line up with each other. The refit interval is a second setting of its own and
+  // sits under the menu it belongs to, not beside it.
+  // a setting of its own: the title on a line, the slider UNDER the title. ONE
+  // block for both modes - only the words differ, because only the runner does.
+  const everyBlock = tip => '<div style="margin-bottom:6px">'
+    + ttsTitle("Refit Interval", tip)
+    + '<div class="row" style="gap:10px;align-items:center;flex-wrap:nowrap;margin-top:2px">'
+    + '<input type="range" id="tts-ttsAutoCalEvery" min="5" max="250" step="5" value="'
+    + every + '" style="flex:0 1 240px;min-width:90px">'
+    + '<span class="hint" id="tts-every-lbl" style="width:auto;white-space:nowrap">'
+    + "<b>" + every + "</b> lines</span></div></div>";
+  let h = "";
+  if (mode === "proxy") {
+    // the arithmetic can read a fit an LLM made earlier, so a machine can be
+    // calibrated once with a model and then run without one
+    // the Speech Rate switch is gone: the refit writes the stored fit itself, so
+    // the arithmetic reads it whenever a valid one exists - nothing to choose.
+    // Refit Interval takes its place in the cell, with Algorithm kept beside it.
+    const rate = everyBlock(
+            "How many spoken lines between arithmetic refits. Each refit is least "
+            + "squares over the measured record - free, instant, and run on the "
+            + "line that makes it due; with Sampler Calibration on it also takes "
+            + "one bounded sampler step when the failure record calls for one.")
+      + '<div class="row" style="flex-wrap:nowrap;margin-top:8px">'
+      + '<button class="stop" data-act="ttsAutoInfo" title="Every step of the'
+      + ' arithmetic, as the panel runs it: the rate, the lead-in, the headroom and'
+      + ' the guard.">Algorithm</button></div>';
+    h = ttsCalRow(main, rate, "");
+  } else {
+    // Fixed IS this number: chars x tok/char, floored at the lead-in. It is also the
+    // ceiling every other mode stays under, so it is set here and read everywhere.
+    const tpc = fixedTokPerChar(st);
+    h = ttsCalRow(main, "", "")
+      + '<div style="margin-bottom:6px">'
+      + ttsTitle("Token per character",
+            "How many tokens one character of a line may cost. Fixed mode is nothing "
+            + "but this number, and every other mode stays under it as the runaway "
+            + "guard. Higgs' own natural rate is about 1.75, so 3.5 is double it - low "
+            + "enough to bound a runaway, high enough that a real line is never cut.")
+      + '<div class="row" style="gap:10px;align-items:center;flex-wrap:nowrap;margin-top:2px">'
+      + '<input type="range" id="tts-ttsFixedTokPerChar" min="1" max="25" step="0.1"'
+      + ' value="' + tpc + '" style="flex:0 1 240px;min-width:90px">'
+      + '<span class="hint" id="tts-tpc-lbl" style="width:auto;white-space:nowrap">'
+      + "<b>" + tpc + "</b> tokens per character</span>"
+      + '<button class="stop" data-act="ttsTokPerCharReset"'
+      + ' title="put back 3.5 - twice Higgs own natural rate">Reset to Higgs Default</button>'
+      + "</div></div>";
+  }
+  h += '<div class="tsplit"></div>' + ttsSampBlock(st)
+    // The reading the whole section exists to produce, directly above the bars it
+    // explains and below a rule of its own - it was a grey caption in the mode row,
+    // three settings away from the picture it belongs to.
+    + '<div class="tsplit"></div>'
+    // Both bars at once: the same line in time and in tokens. They answer different
+    // questions and reading one usually asks the other. Title, then the reading the
+    // section exists to produce, then the line that reading was taken from.
+    + '<div class="row" style="gap:8px;align-items:center;margin:2px 0 4px">'
+    + ttsTitle("Monitoring",
+          "The line just spoken, split two ways: the seconds it took and where they "
+          + "went, and the tokens it was allowed against the tokens it used. Reading "
+          + "one usually asks the other.")
+    + "</div>"
+    + '<div class="headnow" id="tts-head-now"></div>'
+    + '<div class="hint" id="tts-meter-head" style="width:auto;margin:0 0 8px"></div>'
+    + '<div id="tts-meter">'
+    + '<div id="tts-meter-keys-time" class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:5px"></div>'
+    + '<div id="tts-meter-bar-time" style="display:flex;height:26px;width:100%;border-radius:7px;'
+    + 'overflow:hidden;border:1px solid var(--line);background:var(--card)"></div>'
+    + '<div style="height:1px;margin:12px 0;background:var(--line)"></div>'
+    + '<div id="tts-meter-keys-tok" class="row" style="gap:6px;flex-wrap:wrap;margin-bottom:5px"></div>'
+    + '<div id="tts-meter-bar-tok" style="display:flex;height:26px;width:100%;border-radius:7px;'
+    + 'overflow:hidden;border:1px solid var(--line);background:var(--card)"></div>'
+    + '<div class="hint" id="tts-meter-samp" style="margin-top:8px;line-height:1.6"></div>'
+    + '<div class="hint" id="tts-meter-foot" style="margin-top:4px;line-height:1.6"></div></div>';
+  return '<div class="tsect">TTS Calibration</div>' + h;
+}
+function ttsDiagBlock() {
+  const st = (state && state.settings) || {};
+  const had = String(st.ttsDiagAt || "").trim();
+  // The old TTS Calibration section is folded in here: the Calibrate button became
+  // the Automatic sampler calibration switch (its work is the second half of the
+  // automatic run), and Diagnose - the one hand-tool kept - sits directly above the
+  // record it reads from and writes to.
+  return ttsAutoCalBlock(st)
+    + '<div class="tsplit"></div>'
+    + ttsTitle("TTS Calibration Terminal",
+          "Every calculation, diagnosis and change, in the order they happened - the "
+          + "per-line arithmetic, what a fit was offered and whether it was kept, and "
+          + "what any calibration moved.  DIAGNOSE hands the failure record to the "
+          + "model chosen for it and asks what it shows; the answer lands here. The "
+          + "automatic sampler calibration reads the same thing.")
+    // Diagnose reads and writes this record, so it sits on the record's own row -
+    // it was a section of its own, above, with a title saying what the button says.
+    + '<div class="row" style="gap:8px;align-items:center;flex-wrap:wrap;margin:2px 0 4px">'
+    + '<button class="stop" data-act="ttsCalTerm">'
+    + (calTermOpen() ? "Hide Terminal" : "Show Terminal") + "</button>"
+    + '<button class="stop" data-act="ttsDiagnose">Diagnose</button>'
+    + '<button class="stop" data-act="ttsCalCopy">Copy</button>'
+    + '<span class="hint" id="tts-cal-msg" style="width:auto">'
+    + (had ? "last diagnosis " + esc(had) : "no diagnosis yet") + "</span>"
+    + "</div>"
+    + '<div id="tts-cal-termwrap" style="display:' + (calTermOpen() ? "block" : "none")
+    + ';resize:both;overflow:auto;min-height:120px;height:30vh;'
+    + 'border:1px solid var(--line);border-radius:8px">'
+    + '<pre id="tail-ttscal" class="tail" style="margin:0;padding:8px;'
+    + 'white-space:pre-wrap;font-size:12.5px;line-height:1.6;min-height:100%"></pre></div>';
+}
+function calTermOpen() {
+  return String(((state && state.settings) || {}).ttsCalTermOpen || "off").toLowerCase() === "on";
+}
+// The auto-calibration feed. Its own log, the SAME painter as the Proxy terminal -
+// stamps, ports and tree branches all come out coloured without a second painter.
+// The bar. Filled in place - never re-rendered with the pane - so its widths
+// animate from where they were rather than restarting on every tick.
+// One palette: panel work in warm colours, engine work in cool ones, so a glance
+// separates what the panel spent from what the GPU spent.
+// what each band actually is, in the terms the rest of the page uses
+const METER_WHY = {
+  "player tags": "the tag injector marking up the player\u2019s line - a model call, "
+    + "free on a repeat",
+  "mood": "recording the line for the scene reader (the reading itself runs behind)",
+  "token estimate": "working out this line\u2019s token cap - the automatic calibration",
+  "panel": "config, normalising, tag handling, writing the record",
+  "generate": "audio.cpp generating the audio tokens - the GPU",
+  "codec": "turning those tokens into samples",
+  "http + wav": "the request, the response and reading the WAV header",
+  "used": "audio tokens this line actually needed",
+  "spare to cap": "headroom above the estimate that went unused - the stop-loss",
+  "cap to guard": "between the cap and the fixed 3.5 tok/char runaway guard"
+};
+let meterPin = "";              // a band clicked open, until it is clicked again
+const METER_COL = {
+  "player tags": "#ff5dc8", "mood": "#c07ffb", "token estimate": "#f0c674",
+  "panel": "#8b93a3", "generate": "#2ef2ff", "codec": "#4dd8e6",
+  "http + wav": "#3a4658",
+  "used": "#2ef2ff", "spare to cap": "#f0c674", "cap to guard": "#3a4658"
+};
+function meterSegs(line, view) {
+  if (view === "tok") {
+    const t = line.tok || {};
+    const used = Math.max(0, t.used || 0), cap = Math.max(0, t.cap || 0);
+    const guard = Math.max(cap, t.guard || 0);
+    return [["used", used],
+            ["spare to cap", Math.max(0, cap - used)],
+            ["cap to guard", Math.max(0, guard - cap)]].filter(s => s[1] > 0);
+  }
+  const ms = line.ms || {};
+  return ["player tags", "mood", "token estimate", "panel",
+          "generate", "codec", "http + wav"]
+    .map(k => [k, Math.max(0, ms[k] || 0)]).filter(s => s[1] > 0);
+}
+function meterFmt(v, view) {
+  return view === "tok" ? v + " tok" : (v >= 1000 ? (v / 1000).toFixed(2) + " s" : v + " ms");
+}
+// One bar per question, one above the other with a rule between: where the time went,
+// and where the tokens went. Reading either usually asks the other.
+function paintMeterBar(line, view) {
+  const bar = $("tts-meter-bar-" + view), keys = $("tts-meter-keys-" + view);
+  if (!bar || !keys) return null;
+  if (!line || !line.at) {
+    bar.innerHTML = "";
+    keys.innerHTML = '<span class="hint" style="width:auto">nothing spoken yet</span>';
+    return null;
+  }
+  const segs = meterSegs(line, view);
+  const total = segs.reduce((a, s) => a + s[1], 0) || 1;
+  // the segments carry a width TRANSITION - which only runs on an element that
+  // SURVIVES the repaint. innerHTML every tick replaced them, so the ease was
+  // written on every bar and never once seen: same segment set -> update the
+  // widths in place and let them glide; a different set -> build it fresh.
+  const want = segs.map(s => s[0]).join("|");
+  if (bar.dataset.segset === want && bar.children.length === segs.length) {
+    segs.forEach((s, i) => {
+      const el2 = bar.children[i];
+      el2.style.width = (s[1] * 100 / total).toFixed(2) + "%";
+      el2.title = s[0] + "  " + meterFmt(s[1], view)
+        + "  (" + (s[1] * 100 / total).toFixed(1) + "%)";
+    });
+  } else {
+    bar.dataset.segset = want;
+    bar.innerHTML = segs.map(s =>
+      '<div class="mseg" data-act="ttsMeterSeg" data-key="' + esc(s[0]) + '" style="width:'
+      + (s[1] * 100 / total).toFixed(2) + "%;background:" + (METER_COL[s[0]] || "#8b93a3")
+      + ';height:100%;cursor:pointer;transition:width .35s ease" title="' + esc(s[0]) + "  "
+      + esc(meterFmt(s[1], view)) + "  (" + (s[1] * 100 / total).toFixed(1) + '%)"></div>').join("");
+  }
+  setChanged(keys, '<span class="hint" style="width:auto;opacity:.75">'
+    + (view === "tok" ? "tokens" : "time") + "</span>"
+    + segs.map(s =>
+      '<span class="hint" data-act="ttsMeterSeg" data-key="' + esc(s[0])
+      + '" style="width:auto;cursor:pointer;display:inline-flex;align-items:center;gap:5px'
+      + (meterPin === s[0] ? ";text-decoration:underline" : "") + '">'
+      + '<i style="width:10px;height:10px;border-radius:3px;display:inline-block;background:'
+      + (METER_COL[s[0]] || "#8b93a3") + '"></i>' + esc(s[0]) + "  <b>"
+      + esc(meterFmt(s[1], view)) + "</b></span>").join(""));
+  return { segs: segs, total: total };
+}
+function paintMeter(line) {
+  const head = $("tts-meter-head"), foot = $("tts-meter-foot");
+  const tm = paintMeterBar(line, "time"), tk = paintMeterBar(line, "tok");
+  if (!head && !foot) return;
+  if (!line || !line.at) {
+    if (head) head.textContent = "";
+    if (foot) foot.textContent = "";
+    return;
+  }
+  if (head) {
+    head.textContent = (line.who ? line.who + "  " : "") + line.at
+      + "   " + line.chars + " ch" + (line.tags ? " / " + line.tags + " tags" : "")
+      + "   " + (line.audio_s || 0).toFixed(1) + "s audio   " + (line.realtime || 0).toFixed(2) + "x"
+      + ((line.attempt || 1) > 1 ? "   attempt " + line.attempt : "");
+  }
+  const sb = $("tts-meter-samp");
+  if (sb) {
+    sb.textContent = line.samp
+      ? ("sampler: " + line.samp
+         + ((line.attempt || 1) > 1 ? "   (the steadier retry profile)" : ""))
+      : "";
+  }
+  if (!foot) return;
+  if (meterPin && METER_WHY[meterPin]) {
+    const both = [["time", tm], ["tok", tk]];
+    let hit = null, view = "time";
+    both.forEach(b => {
+      if (hit || !b[1]) return;
+      const f = b[1].segs.find(s => s[0] === meterPin);
+      if (f) { hit = { seg: f, total: b[1].total }; view = b[0]; }
+    });
+    foot.textContent = meterPin
+      + (hit ? "  " + meterFmt(hit.seg[1], view)
+               + "  (" + (hit.seg[1] * 100 / hit.total).toFixed(1) + "%)"
+             : "  not in this line")
+      + "   -   " + METER_WHY[meterPin];
+    return;
+  }
+  const t = line.tok || {};
+  const sum = (r, ks) => r ? r.segs.filter(s => ks.indexOf(s[0]) >= 0)
+    .reduce((a, s) => a + s[1], 0) : 0;
+  foot.textContent = "time " + meterFmt(tm ? tm.total : 0, "time")
+    + "  -  panel " + meterFmt(sum(tm, ["player tags", "mood", "token estimate", "panel"]), "time")
+    + ", engine " + meterFmt(sum(tm, ["generate", "codec", "http + wav"]), "time")
+    + String.fromCharCode(10)
+    + "tokens  mode " + (line.mode || "off") + "   estimate " + (t.estimate || 0)
+    + " -> cap " + (t.cap || 0) + ", used " + (t.used || 0)
+    + (t.estimate ? "   (fit " + ((t.used || 0) / t.estimate).toFixed(2) + ")" : "")
+    + "   guard " + (t.guard || 0);
+}
+async function refreshTtsMeter() {
+  if (!$("tts-meter")) return;           // the wrapper: it outlives how many bars
+                                         // are drawn inside it
+  try {
+    const r = await post("/api/tts-meter", {});
+    window.__ttsMeter = r;                     // the render seeds from this
+    paintMeter((r && r.line) || null);
+    if (r) setChanged($("tts-samp-chips"), ttsSampChips(r));
+  } catch (e) { /* leave the last picture up */ }
+}
+async function refreshCalTail() {
+  const pre = $("tail-ttscal");
+  if (!pre || !pre.offsetParent) return;   // absent, or the terminal is hidden
+  try {
+    const r = await post("/api/tail", { kind: "ttscal" });
+    const stick = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 30;
+    paintTail("ttscal", (r && (r.text || r.error))
+              || "(nothing yet - speak a line, or press Diagnose)", pre);
+    if (stick) pre.scrollTop = pre.scrollHeight;
+  } catch (e) { /* leave what is there */ }
+}
+async function loadTtsDiag() {
+  try {
+    // it fills the pickers and the chips; nothing writes a data block into the feed
+    // any more, so there is one way through here rather than a loud one and a quiet
+    const d = await post("/api/tts-diag", {});
+    const st0 = (state && state.settings) || {};
+    const rows = (d && d.servers) || [];
+    window.__ttsDiag = d;                      // the render seeds from this
+    setChanged($("tts-head-now"), headroomBoxes(d));
+    setChanged($("tts-samp-chips"), ttsSampChips(d || {}));
+  } catch (e) { /* the feed shows what the panel knows; a failed read is not a line */ }
+  refreshCalTail();
+}
+// innerHTML only when the content CHANGED: a same-content rewrite repaints the
+// element and reads as a blink, every refresh, for nothing.
+function setChanged(el, html) {
+  if (!el || el.__pl === html) return;
+  el.__pl = html;
+  el.innerHTML = html;
+}
+
 async function saveTtsMode() { saveTts(); await load(); renderTts(); }
 function saveTts() {
   const body = {};
   ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el) body[f[0]] = el.value; });
   const tg = $("tts-ttsTags"); if (tg) body.ttsTags = tg.value;   // not a path field
+  // a <select> outside ttsFields, like the one above it: read where it is written
+  const sac = $("tts-ttsSampAutoCal"); if (sac) body.ttsSampAutoCal = sac.value;
   const g = $("tts-ttsGpuId");
   if (g) body.ttsGpuId = g.value;
-  ["ttsWrapMode", "ttsAnswerPing"].forEach(k => { const e = $("tts-" + k); if (e) body[k] = e.value; });
+  ["ttsWrapMode", "ttsAnswerPing", "ttsAcppProfile", "ttsPlayerTags", "ttsGpuClockHold",
+   "ttsMoodEval", "ttsMoodHistory", "ttsMoodCount",
+   "ttsMoodPostpone", "ttsMoodEvery", "ttsPtiBudget", "ttsPmeBudget",
+   "ttsAutoCal", "ttsAutoCalEvery", "ttsFixedTokPerChar",
+   "ttsCalibThink", "ttsThoughtAudio", "ttsThoughtSeq"]
+    .forEach(k => { const e = $("tts-" + k); if (e) body[k] = e.value; });
   post("/api/settings", body);
 }
+// The TTS page and the header button are two views of ONE thing. They kept separate
+// flags - ttsBusy and __ttsLaunching - so starting from one left the other showing the
+// old state. Everything goes through here now.
+function ttsRepaint() {
+  if (curTab === "tts") { renderTts(); refreshCalTail(); }   // its own tab since v3.73 patch1
+  syncTtsButton();
+}
+
 async function ttsServer(action) {
   if (ttsBusy) return;                     // one press at a time
   ttsBusy = action;
-  renderTts();                             // disable and relabel before the request goes out
+  ttsRepaint();                            // disable and relabel before the request goes out
   try {
     const r = await post("/api/tts-server", { action: action });
     if (r && r.error) {
-      ttsBusy = ""; renderTts();
+      ttsBusy = ""; ttsRepaint();
       const m = $("tts-run"); if (m) m.textContent = r.error;
       return;
     }
@@ -10612,13 +17540,13 @@ async function ttsServer(action) {
       await load();
       const s = (state && state.ttsServer) || {};
       if (s.state === "serving") return;
-      if (curTab === "dashboard" && curDsub === "tts") renderTts();
+      ttsRepaint();
     }
     const m = $("tts-run");
     if (m) m.textContent = "the server did not answer within 3 minutes - check tts-server.log";
   } finally {
     ttsBusy = "";
-    if (curTab === "dashboard" && curDsub === "tts") renderTts();
+    ttsRepaint();
   }
 }
 async function ttsLauncher(save) {
@@ -10651,7 +17579,7 @@ function showDsub(s) {
 }
 function showTsub(v) {
   curTsub = v;
-  ["proxy","think","split","tts"].forEach(x => {
+  ["proxy","think","split","tts","ptipme"].forEach(x => {
     const p = $("tpane-"+x), b = $("tsub-"+x);
     if (p) p.style.display = x === v ? "" : "none";
     if (b) b.classList.toggle("on", x === v);
@@ -10667,9 +17595,11 @@ function refreshCurTerm() {
   else if (curTsub === "think") refreshTail("thinking");
   else if (curTsub === "split") refreshSplit();
   else if (curTsub === "tts") refreshTail("tts");
+  else if (curTsub === "ptipme") refreshTail("ptipme");
 }
 const SPLIT_FEEDS = [["dashboard", "Proxy"], ["thinking", "Thinking Content"],
-                     ["tts", "TTS"]];
+                     ["tts", "TTS"], ["ttssrv", "TTS Server (audio.cpp)"],
+                     ["ptipme", "PTI / PME"]];
 function splitFeed(side) {
   const st = (state && state.settings) || {};
   const want = String(st[side === "d" ? "splitSrcD" : "splitSrcT"]
@@ -10687,10 +17617,18 @@ function syncSplitUI() {
   ["d", "t"].forEach(side => {
     const sel = $("splitsel-" + side);
     if (sel) sel.innerHTML = splitFeedOptions(side);
-    // the right pane has a second copy in the outer bar for full window
-    [$("splitins-" + side), side === "t" ? $("splitins-t-max") : null].forEach(btn => {
-      if (btn) btn.style.display = (splitFeed(side) === "dashboard") ? "" : "none";
+    // Options carries what only a proxy feed can show - the spliced spoken line, the
+    // tagger's answer, an NPC's thought - so the button belongs to whichever pane is
+    // showing that feed, and goes when the pane is switched to something else.
+    const onProxy = splitFeed(side) === "dashboard";
+    [$("splitopt-" + side), $("splitins-" + side),
+     side === "t" ? $("splitins-t-max") : null].forEach(btn => {
+      if (btn) btn.style.display = onProxy ? "" : "none";
     });
+    if (!onProxy) {                      // a hidden button must not leave its menu open
+      const ch = $("splitsel-" + side) && $("splitsel-" + side).closest(".tchrome");
+      if (ch) ch.classList.remove("optopen");
+    }
   });
 }
 async function setSplitFeed(side, kind) {
@@ -10719,8 +17657,40 @@ async function refreshSplit() {
   if (sd) { const x = d.file ? "source: " + d.file : ""; sd.textContent = x; sd.title = x; }
   if (st) { const x = th.file ? "source: " + th.file : ""; st.textContent = x; st.title = x; }
 }
+// A provider with Cache on gets a KV slot of its own, pinned by id_slot. The slot's
+// cache lives in VRAM and nothing else's prompt evicts it, so a fixed system prompt is
+// prefilled once and reused. The launcher this panel writes gains --parallel and
+// -sps 0 to match; there is nothing else to set.
+function cachedOn(s) {
+  return ((s && s.providers) || []).filter(p => p.cache && p.enabled !== false).length;
+}
+function slotsOpen(s) {
+  const v = parseInt(((s && s.params) || {}).parallel || "1", 10);
+  return v > 0 ? v : 1;
+}
+// --ctx-size is the TOTAL and llama-server divides it between the slots the server was
+// launched with, so what each is left with follows from Parallel slots, not from how
+// many providers happen to be cached.
+function perSlotNote(s) {
+  const ctx = parseInt(((s && s.params) || {}).ctx || "0", 10);
+  const par = slotsOpen(s);
+  if (!ctx || par < 2) return "";
+  return " \u00b7 " + Math.floor(ctx / par) + " tok/slot";
+}
+function cacheWhy(p, s) {
+  const open = slotsOpen(s), want = cachedOn(s) + (p.cache ? 0 : 1) + 1;
+  const ctx = parseInt(((s && s.params) || {}).ctx || "0", 10);
+  return "Keep this prompt in a KV slot of its own, so nothing else on this server "
+    + "evicts it - a fixed system prompt is then prefilled once and reused. "
+    + "How many slots exist is yours to set: Parallel slots on the server card, now "
+    + open + ". Pinning " + (want - 1) + " provider(s) needs " + want + ", because slot 0 "
+    + "is left for everything unpinned. Context size is the total and is divided between "
+    + "those slots"
+    + (ctx ? " - " + ctx + " over " + open + " is " + Math.floor(ctx / open) + " each, so "
+             + "raise it if a prompt here is longer than that." : ".");
+}
 function provCard(p, s) {
-  const emos = ["","💬","🎲","⚔️","🧪","🌐","🤖","🏃","🎭","✍️","🧠","👁️","🛰️","🔧","🗡️","🛡️","📜","🔮","🐉","🏰","🎵","⭐","🔥","⚡"];
+  const emos = ["","💬","🎲","⚔️","🧪","🌐","🤖","🏃","🎭","✍️","🧠","👁️","🛰️","🔧","🗡️","🛡️","📜","🔮","🐉","🏰","🎵","⭐","🔥","⚡","🎼","🎬","💥","⚖️"];
   const cur = p.emoji || "";
   let eopts = emos.map(e => '<option value="'+e+'"'+(e===cur?" selected":"")+'>'+(e||"(none)")+'</option>').join("");
   if (cur && emos.indexOf(cur) < 0) eopts = '<option value="'+esc(cur)+'" selected>'+esc(cur)+'</option>' + eopts;
@@ -10728,17 +17698,40 @@ function provCard(p, s) {
   const prio = [0,1,2].map(n => '<option value="'+n+'"'+(n===pv?" selected":"")+'>'+n+" - "+["High","Normal","Low"][n]+'</option>').join("");
   const st = p.stats ? ' <span class="chip">reqs '+p.stats.n+' &middot; '+esc(p.stats.last)+'</span>' : "";
   const src = (p.samplerSource || "server");
-  return '<div class="prov" data-pid="'+p.id+'" id="prov-'+p.id+'" style="border-left:3px solid '+dashColor(p.title||p.id)+';border-radius:6px'+'">'
-    + '<select class="edit" style="width:62px;min-width:62px;padding:7px 22px 7px 8px;background-position:right 6px center" title="emoji (shown in dashboard + thinking logs)" data-act="provField" data-field="emoji" data-id="'+p.id+'">'+eopts+'</select>'
+  // PTI and PME are called by the panel, not connected to by SkyrimNet. So: no port to
+  // give out, no emoji to choose, no other side to take sampler values from and none to
+  // detect. Accent edge, so they read as the panel's own at a glance.
+  const own = !!p.panelOwned;
+  return '<div class="prov" data-pid="'+p.id+'" id="prov-'+p.id+'" style="border-left:3px solid '
+    + (own ? 'var(--acc)' : dashColor(p.title||p.id)) + ';border-radius:6px">'
+    + (own
+        ? '<span class="chip" title="this provider is the panel itself - its mark is the PandorumLLM icon" style="padding:6px 9px">' + provMark(p) + '</span>'
+        : '<select class="edit" style="width:62px;min-width:62px;padding:7px 22px 7px 8px;background-position:right 6px center" title="emoji (shown in dashboard + thinking logs)" data-act="provField" data-field="emoji" data-id="'+p.id+'">'+eopts+'</select>')
     + '<input class="edit" style="max-width:150px" value="'+esc(p.title).replace(/"/g,"&quot;")+'" data-act="provField" data-field="title" data-id="'+p.id+'">'
-    + '<input class="edit" style="max-width:68px" value="'+esc(p.port)+'" title="SN provider port (4 digits)" data-act="provField" data-field="port" data-id="'+p.id+'">'
-    + '<select class="edit" style="width:auto;min-width:0;max-width:118px" title="priority - per GPU: 0 makes lower tiers on the SAME GPU wait (max 8s)" data-act="provField" data-field="priority" data-id="'+p.id+'">'+prio+'</select>'
-    + '<select class="edit" style="width:auto;min-width:0;max-width:138px" title="which side decides the sampler values actually sent to the model" data-act="provField" data-field="samplerSource" data-id="'+p.id+'">'
-    + '<option value="server"'+(src==="server"?" selected":"")+'>Server Side</option>'
-    + '<option value="skyrimnet"'+(src==="skyrimnet"?" selected":"")+'>SkyrimNet Side</option></select>'
+    + (own
+        ? '<span class="chip" title="called in-process by the panel, so nothing binds a port and nothing on the network can reach it" style="opacity:.85">panel-called</span>'
+        : '<input class="edit" style="max-width:68px" value="'+esc(p.port)+'" title="SN provider port (4 digits)" data-act="provField" data-field="port" data-id="'+p.id+'">')
+    + '<select class="edit" style="width:auto;min-width:0;max-width:118px" title="priority - per GPU: 0 makes lower tiers on the SAME GPU wait (up to 30s, held across the high stage gap)" data-act="provField" data-field="priority" data-id="'+p.id+'">'+prio+'</select>'
+    + (own
+        ? '<span class="chip" title="the panel composes these requests itself, so there is no other side for the values to come from">Server Side</span>'
+        : '<select class="edit" style="width:auto;min-width:0;max-width:138px" title="which side decides the sampler values actually sent to the model" data-act="provField" data-field="samplerSource" data-id="'+p.id+'">'
+          + '<option value="server"'+(src==="server"?" selected":"")+'>Server Side</option>'
+          + '<option value="skyrimnet"'+(src==="skyrimnet"?" selected":"")+'>SkyrimNet Side</option></select>')
     + swToggle(p.thinking, 'data-act="provField" data-field="thinking" data-id="'+p.id+'"', "Thinking")
-    + swToggle(p.detectSN, 'data-act="provField" data-field="detectSN" data-id="'+p.id+'" title="show the value SkyrimNet sends in brackets beside each set value"', "Show SkyrimNet sampler values")
-    + (p.thinking && s.reasoning === "off" ? '<span title="this server was launched with reasoning OFF - the thinking toggle cannot engage until the launcher enables --reasoning" style="color:var(--warn);cursor:help">⚠</span>' : "")
+    + swToggle(p.cache, 'data-act="provField" data-field="cache" data-id="'+p.id+'" title="'
+        + esc(cacheWhy(p, s)) + '"', "Cache")
+    + (!p.cache ? ""
+        : p.cacheSlot
+          ? '<span class="chip" title="its own KV slot on this server - nothing else can evict it">slot '
+            + p.cacheSlot + perSlotNote(s) + '</span>'
+          : '<span class="chip" style="color:var(--warn)" title="Parallel slots on the server card is '
+            + slotsOpen(s) + ', and slot 0 is left for everything unpinned. Raise it to '
+            + (cachedOn(s) + 1) + ' to pin them all - and raise Context size with it, since it is '
+            + 'divided between slots.">no slot free \u00b7 Parallel slots is '
+            + slotsOpen(s) + '</span>')
+    + (own ? ''
+           : swToggle(p.detectSN, 'data-act="provField" data-field="detectSN" data-id="'+p.id+'" title="show the value SkyrimNet sends in brackets beside each set value"', "Show SkyrimNet sampler values"))
+    + (p.thinking && s.reasoning === "off" ? '<span title="this server was launched with reasoning OFF, so the panel sends enable_thinking=false with every request to it - in the chat template kwarg, at the top level, and as reasoning.enabled. The thinking toggle cannot engage until the launcher enables --reasoning" style="color:var(--warn);cursor:help">⚠</span>' : "")
     + (p.thinking && p.diaryGrammar ? '<span title="grammar rail active (GBNF) - the grammar constrains output from the first token, so thinking cannot appear on this provider even when enabled" style="color:var(--warn);cursor:help">🧩</span>' : "")
     + st
     + (p.custom ? '<button class="x" title="remove this added provider" data-act="provDel" data-id="'+p.id+'">&#10005;</button>' : '')
@@ -10750,7 +17743,7 @@ function provCard(p, s) {
         : '')
     + '</div></div>';
 }
-const PSAMP_EMO = { temp: "🌡️", top_p: "🎯", min_p: "🧹", top_k: "🔢", n_sigma: "📊", typ_p: "🎲", xtc_p: "✂", xtc_t: "📏", dry: "🚱", freq: "🔁", pres: "👤" };
+const PSAMP_EMO = { temp: "🌡️", top_p: "🎯", min_p: "🧹", top_k: "🔢", n_sigma: "📊", typ_p: "🎲", xtc_p: "✂", xtc_t: "📏", dry: "🚱", freq: "🔁", pres: "👤", rep: "🔁" };
 function provSampChips(p) {
   const obs = p.obsSamplers || {};       // what SkyrimNet actually sent for THIS provider (proxy-observed)
   const srv = p.srvSamplers || {};       // what the server itself is using, read from its log
@@ -10783,7 +17776,6 @@ function provSampChips(p) {
       + PSAMP_EMO[k] + " " + k + " " + esc(v) + bracket + '</span>';
   }).join("");
 }
-const SAMP_EMO = { temp: "🌡️", top_p: "🎯", min_p: "🧹", top_k: "🔢", n_sigma: "📊", typ_p: "🎲", xtc_p: "✂", xtc_t: "📏", dry: "🚱", freq: "🔁", pres: "👤" };
 
 
 function sampEdit(el) {
@@ -11122,6 +18114,30 @@ function netCard() {
     + '<div id="netgraph" style="margin-top:10px">'+buildNet()+'</div>'
     + '<pre class="log" id="reco-log"' + (recoMsg ? ' style="display:block"' : '') + '>' + esc(recoMsg) + '</pre></div>';
 }
+// A provider's mark, as markup. PANDORUM_MARK is stored on the record as a character
+// - a config file cannot hold an image - and the terminal painter already substitutes
+// it. Everywhere else was printing the lozenge itself.
+function accHex() {
+  const v = getComputedStyle(document.documentElement).getPropertyValue("--acc").trim();
+  return /^#[0-9a-fA-F]{6}$/.test(v) ? v : "#b5f320";
+}
+function provMark(p, px) {
+  const size = px || 20;
+  return (p && p.panelOwned)
+    ? '<img class="pmark" src="/icon.ico" alt="" width="' + size + '" height="' + size
+      + '" style="margin-right:6px;vertical-align:-3px">'
+    : esc((p && p.emoji) || "\u2022");
+}
+// A provider box in Live Network. Panel-called providers have no port to show, so the
+// right-hand slot says what they are reached through instead of a bare colon.
+function provNetBox(p) {
+  return netBox("prov", p.id,
+                (p.panelOwned ? provMark(p, 15)
+                              : '<span style="margin-right:6px">' + provMark(p, 15) + '</span>')
+                + esc(p.title || p.id), "",
+                p.panelOwned ? "Proxy" : ":" + esc(p.port),
+                p.panelOwned ? accHex() : dashColor(p.title || p.id));
+}
 function netBox(kind, id, title, sub, right, col) {
   return '<div class="netbox ' + kind + '" data-nb="' + kind + ':' + id + '" data-kind="' + kind + '" data-id="' + esc(id) + '"'
     + ' draggable="' + (kind === "gpu" ? "false" : "true") + '"'
@@ -11166,7 +18182,7 @@ function buildNet() {
       + '<div class="netdrop" data-nb="drop:' + s.id + '" data-drop="slot" data-id="' + esc(s.id) + '">'
       + ((s.providers || []).length
           ? (s.providers || []).map(function(p) {
-              return netBox("prov", p.id, esc((p.emoji || "\u2022") + " " + (p.title || p.id)), "", ":" + esc(p.port), dashColor(p.title || p.id));
+              return provNetBox(p);
             }).join("")
           : '<div class="nd-e">drop providers here</div>')
       + '</div></div>';
@@ -11176,7 +18192,7 @@ function buildNet() {
   const parked = state.unallocated || [];
   h += '<div class="netband netpark" id="netpark" data-drop="none">'
     + parked.map(function(p) {
-        return netBox("prov", p.id, esc((p.emoji || "\u2022") + " " + (p.title || p.id)), "", ":" + esc(p.port), dashColor(p.title || p.id));
+        return provNetBox(p);
       }).join("")
     + '</div></div>';
   return h;
@@ -11567,11 +18583,23 @@ async function setIp(key, inputId, el) {
 function srvButtons(s, off, running) {
   const A = String.fromCharCode(39);
   const call = function(act) { return "act(" + A + s.id + A + "," + A + act + A + ",this)"; };
+  const busy = slotBusy[s.id];
+  const serving = !!(s.status && s.status.state === "serving");
+  // the transition ends where the state confirms it: a launch is done when the
+  // slot SERVES, a stop when nothing runs - then the buttons and terminal let go
+  if (busy === "launch" && serving) slotBusyClear(s.id);
+  else if (busy === "stop" && !running) slotBusyClear(s.id);
+  const b2 = slotBusy[s.id];
   let h = "";
-  if (off) h += '<button disabled title="pick a model first">Launch</button>';
+  if (b2 === "launch")
+    h += '<button disabled><span class="spin-emoji">&#9881;&#65039;</span> Launching Server...</button>';
+  else if (off) h += '<button disabled title="pick a model first">Launch</button>';
   else if (running) h += '<button disabled><span class="spin-emoji">&#9881;&#65039;</span> Running...</button>';
   else h += '<button onclick="' + call("launch") + '">Launch</button>';
-  if (running) h += ' <button class="stop" onclick="' + call("stop") + '">&#9209;&#65039; Stop</button>';
+  if (b2 === "stop")
+    h += ' <button class="stop" disabled>Shutting Down...</button>';
+  else if (running && b2 !== "launch")
+    h += ' <button class="stop" onclick="' + call("stop") + '">&#9209;&#65039; Stop</button>';
   return h;
 }
 // ITEM 9: the runtime parameters a server launches with. These replace the .ps1
@@ -11627,10 +18655,30 @@ function paramEditor(s) {
     return '<div class="hint chkmsg" style="color:var(--err)">this is a '
          + (KIND[m2.kind] || "plain model") + ', not ' + label + '</div>';
   }
+  // what the FILE says it is, read from its header when it was listed - never from
+  // its name, so a rename or a repack cannot move it between families
+  const archOf = function(m) { return String((m && m.arch) || "").toLowerCase(); };
+  const mArch = archOf(chosen);
+  const STRENGTH_ARCH = ["muse-glimmer"];
+  const wantsStrength = STRENGTH_ARCH.indexOf(mArch) >= 0;
+  const archLine = (function() {
+    if (!p.model) return "";
+    if (!chosen) return '<div class="hint chkmsg" style="color:var(--dim)">'
+      + 'Model architecture: unread &#8212; this file is not in the models folder</div>';
+    const bits = [];
+    if (chosen.blocks) bits.push(chosen.blocks + " layers");
+    if (chosen.archCtx) bits.push(Math.round(chosen.archCtx / 1024) + "k trained context");
+    const lbl = chosen.archLabel || mArch || "not declared";
+    const raw = (chosen.archLabel && mArch && chosen.archLabel !== mArch)
+      ? ' <span style="color:var(--dim)">(' + esc(mArch) + ')</span>' : "";
+    return '<div class="hint chkmsg" style="color:var(--ok)">Model architecture: '
+      + esc(lbl) + raw + (bits.length ? ' <span style="color:var(--dim)">&middot; '
+      + esc(bits.join(" \u00b7 ")) + '</span>' : "") + '</div>';
+  })();
   let h = '<div class="pgrid">'
     + '<div class="pcell stack"><span class="plab hint">Model <span class="mand">Mandatory</span></span>'
     + '<span class="pctl"><select class="msel' + mstate(p.model) + '" data-act="slotParam" data-id="' + s.id + '" data-key="model">' + mopts + '</select></span>'
-    + wrongKind + '</div>'
+    + wrongKind + archLine + '</div>'
     + pick("vision", p.vision, "Vision (mmproj)", "Vision projector", "--mmproj")
     + pick("draft", p.draft, "Speculative decoding", "Draft model", "--model-draft");
   // a setting the rest of the configuration makes moot stays visible but is not
@@ -11646,10 +18694,23 @@ function paramEditor(s) {
     nommap:    maxNgl ? "every layer is on the GPU, so nothing is memory-mapped into RAM" : "",
     cacheK:    pval("flash") === "off" ? "KV cache quantization needs flash attention on" : "",
     cacheV:    pval("flash") === "off" ? "KV cache quantization needs flash attention on" : "",
-    nocontbat: parseInt(pval("parallel"), 10) <= 1 ? "continuous batching only applies with more than one parallel slot" : ""
+    nocontbat: parseInt(pval("parallel"), 10) <= 1 ? "continuous batching only applies with more than one parallel slot" : "",
+    reasoning: wantsStrength ? "this model's chat template opens the thinking channel whatever this says - set Reasoning strength instead" : "",
+    reasonfmt: wantsStrength ? "this model routes its thinking into reasoning_content already" : ""
   };
-  let seenMmap = false;
-  defs.forEach(function(d) {
+  // Grouped, in the order the launcher writes them, so a heading on the card names a
+  // block of flags you can find in the .ps1. The table is not in group order - fit sits
+  // among the batching flags - so the ORDER comes from paramGroups, not from the table.
+  const order = (state.paramGroups || []).slice();
+  defs.forEach(d => { if (order.indexOf(d.group || "Other") < 0) order.push(d.group || "Other"); });
+  const inOrder = [];
+  order.forEach(g => defs.forEach(d => { if ((d.group || "Other") === g) inOrder.push(d); }));
+  let seenMmap = false, lastGroup = "";
+  inOrder.forEach(function(d) {
+    if ((d.group || "Other") !== lastGroup) {
+      lastGroup = d.group || "Other";
+      h += '<div class="pgrp">' + esc(lastGroup) + '</div>';
+    }
     const v = (p[d.key] !== undefined && p[d.key] !== "") ? p[d.key] : d.def;
     if (d.key === "nommap") seenMmap = true;
     const tight = seenMmap;                       // the gap under Disable mmap and below
@@ -11675,9 +18736,28 @@ function paramEditor(s) {
     const ref = d.ref
       ? ' <span class="pref" data-act="paramGuide" data-t="' + pgSlug(d.ref) + '" title="open this setting in the Sampler Guide">[' + esc(d.flag) + ']</span>'
       : "";
+    // a caution belongs to the VALUE, not the dial: it shows when the setting is
+    // standing on one, and says what that choice does that its label does not
+    const cau = (d.caution || {})[String(v)];
+    const warn = cau
+      ? ' <span style="color:var(--warn);cursor:help" title="' + esc(cau) + '">\u26A0</span>'
+      : "";
     h += '<div class="pcell' + (why ? " pdim" : "") + (tight ? " ptight" : "") + '"' + (why ? ' title="' + esc(why) + '"' : "")
-      + '><span class="plab hint">' + esc(d.label) + ref + '</span>'
+      + '><span class="plab hint">' + esc(d.label) + ref + warn + '</span>'
       + '<span class="pctl">' + ctl + '</span></div>';
+    // the dial this family DOES answer to, beside the one it ignores
+    if (d.key === "reasoning" && wantsStrength) {
+      const cs = String(p.reasonStrength || "");
+      const opts = ["", "low", "medium", "high", "xhigh"].map(function(o) {
+        return '<option value="' + esc(o) + '"' + (o === cs ? " selected" : "") + '>'
+             + (o === "" ? "model default (high)" : esc(o)) + '</option>';
+      }).join("");
+      h += '<div class="pcell' + (tight ? " ptight" : "") + '" title="how much this model'
+        + ' thinks before answering - written as a chat template kwarg">'
+        + '<span class="plab hint">Reasoning strength</span><span class="pctl">'
+        + '<select data-act="slotParam" data-id="' + s.id + '" data-key="reasonStrength">'
+        + opts + '</select></span></div>';
+    }
   });
   h += '</div>';
   return h;
@@ -11831,7 +18911,13 @@ function renderProviders(force) {
   const rows = [];
   servers.forEach(function(s) { (s.providers || []).forEach(function(p) { rows.push({ p: p, s: s }); }); });
   (state.unallocated || []).forEach(function(p) { rows.push({ p: p, s: null }); });
-  rows.sort(function(a, b) { return (a.p.port || 0) - (b.p.port || 0); });
+  // the panel's own sit at the end: they have no port to sort by, and they are not
+  // what this page is mostly about
+  rows.sort(function(a, b) {
+    const ao = a.p.panelOwned ? 1 : 0, bo = b.p.panelOwned ? 1 : 0;
+    if (ao !== bo) return ao - bo;
+    return (a.p.port || 0) - (b.p.port || 0);
+  });
   let h = '<div class="row" style="margin-bottom:10px">'
     + '<button class="stop" data-act="restoreProv" title="reset the shipped default providers to their original state">Restore default providers</button>'
     + '<button class="stop" data-act="provSampResetAll" title="clear every sampler value forced on every provider - nothing else about them is touched">↺ Reset all sampler parameters</button>'
@@ -11846,9 +18932,9 @@ function renderProviders(force) {
       + '<div class="row" style="gap:10px">'
       + '<span class="label provlink" data-act="gotoProv" data-id="' + esc(e.p.id) + '"'
       + ' style="--pgl:' + dashColor(e.p.title || e.p.id) + '" title="show this provider in Live Network">'
-      + '<span class="pemoji">' + esc(e.p.emoji || "\u2022") + '</span>'
+      + (e.p.panelOwned ? provMark(e.p) : '<span class="pemoji">' + provMark(e.p) + '</span>')
       + '<span class="ptitle">' + esc(e.p.title || e.p.id) + '</span></span>'
-      + '<span class="portchip">Port ' + esc(e.p.port) + '</span>' + alloc
+      + '<span class="portchip">' + (e.p.panelOwned ? "Proxy" : "Port " + esc(e.p.port)) + '</span>' + alloc
       + '</div>'
       + '<div class="provs">' + provCard(e.p, e.s) + '</div></div>';
   });
@@ -12154,10 +19240,11 @@ function renderCurrent(force) {
     else renderSlots(force);
     return;
   }
-  if (curTab === "dashboard" && curDsub === "tts") {
+  if (curTab === "tts") {
     const ae = document.activeElement, pane = $("dpane-tts");
     if (!(ae && pane && pane.contains(ae) && ["INPUT","SELECT","TEXTAREA"].includes(ae.tagName)))
       renderTts();
+    refreshCalTail(); refreshTtsMeter();   // live, whether or not the pane redrew
     return;
   }
   renderRouting(force);
@@ -12205,6 +19292,21 @@ document.addEventListener("input", ev => {
   const t = ev.target;
   if (t && t.id === "ip-panel") updateIpStatus("panelIp", "ip-panel");
   else if (t && t.id === "ip-remote") updateIpStatus("remoteIp", "ip-remote");
+  // a slider fires input on every pixel of the drag and change once, on release:
+  // the label follows the finger, the setting is written once. A range reaches
+  // neither the click chain nor, while dragging, the change chain.
+  else if (t && t.id === "tts-ttsAutoCalEvery") {
+    const lbl = $("tts-every-lbl");
+    if (lbl) lbl.innerHTML = "<b>" + t.value + "</b> lines";
+  }
+  else if (t && t.id === "tts-ttsFixedTokPerChar") {
+    const lbl = $("tts-tpc-lbl");
+    if (lbl) lbl.innerHTML = "<b>" + t.value + "</b> tokens per character";
+  }
+  else if (t && t.id === "tts-ttsCalibThinkBudget") {
+    const lbl = $(t.id + "-lbl");
+    if (lbl) lbl.textContent = t.value;
+  }
 });
 function fieldDone(el) {
   if (el && el.blur) setTimeout(function() { el.blur(); }, 0);
@@ -12220,6 +19322,25 @@ document.addEventListener("click", function(e) {
 document.addEventListener("change", function(e) {
   const el = e.target;
   if (!el || !el.tagName) return;
+  if (el.id === "tts-ttsAutoCalEvery") {
+    const v = String(el.value || "25");
+    if (state && state.settings) state.settings.ttsAutoCalEvery = v;
+    post("/api/settings", { ttsAutoCalEvery: v });
+    return;                              // no re-render: it would restart the drag
+  }
+  if (el.id === "tts-ttsFixedTokPerChar") {
+    const v = String(el.value || "3.5");
+    if (state && state.settings) state.settings.ttsFixedTokPerChar = v;
+    post("/api/settings", { ttsFixedTokPerChar: v });
+    return;
+  }
+  if (el.id === "tts-ttsCalibThinkBudget") {
+    const key = el.id.slice(4), v = String(el.value || "2000"), b = {};
+    b[key] = v;
+    if (state && state.settings) state.settings[key] = v;
+    post("/api/settings", b);
+    return;
+  }
   if (el.tagName === "SELECT") { el.__opens = 0; fieldDone(el); }
   else if (el.tagName === "INPUT" && el.type !== "range" && el.type !== "checkbox") fieldDone(el);
 });
@@ -12469,6 +19590,7 @@ document.addEventListener("change", ev => {
     });
     return;
   }
+  if (d.act === "ttsProfileSel") { saveTts(); return; }
   if (d.act === "splitFeed") {          // a select: change, not click
     setSplitFeed(ev.target.dataset.side, ev.target.value);
     return;
@@ -12534,6 +19656,13 @@ document.addEventListener("mouseup", () => {
   document.querySelectorAll(".prov").forEach(p => { p.draggable = false; });
 });
 document.addEventListener("click", ev => {
+  // the tag-limit stepper closes on any click that is not the stepper itself and
+  // not another chip about to re-open it - clicking empty space included
+  if (window.__tagLimPop) {
+    const inPop = ev.target && ev.target.closest && ev.target.closest("#taglim-pop");
+    const onChip = ev.target && ev.target.closest && ev.target.closest(".tagbtn");
+    if (!inPop && !onChip) tagLimPopClose();
+  }
   const hbEl = ev.target && ev.target.closest ? ev.target.closest(".hb") : null;
   // a revealed value covers itself again as soon as you look elsewhere; a field you
   // are typing in keeps its own reveal until it loses focus
@@ -12541,12 +19670,40 @@ document.addEventListener("click", ev => {
     if (x !== hbEl && x !== document.activeElement) x.classList.remove("show");
   });
   if (hbEl) { hbEl.classList.toggle("show"); return; }
+  // a click on any ? mark shows its explanation and does nothing else - the
+  // button under it is NOT pressed. The text is the same tooltip the hover shows:
+  // the ? element's own title, or the titled parent it decorates.
+  const qmEl = ev.target.closest ? ev.target.closest(".qm") : null;
+  if (qmEl) { qmShowTip(qmEl); return; }
+  if (window.__qmPop) qmTipClose();
   const el = ev.target.closest ? ev.target.closest("[data-act]") : null;
   if (!el) return;
   const d = el.dataset;
   if (d.act === "revealUuid") { el.classList.toggle("show"); return; }
+  if (d.act === "logSrvSlot") {
+    window.__logSrvSlot = (window.__logSrvSlot === d.sid) ? null : d.sid;
+    renderLog(); return;
+  }
   if (d.act === "sampChip") { sampEdit(el); return; }
   if (d.act === "provSampChip") { provSampEdit(el); return; }
+  if (d.act === "ttsSampChip") { ttsSampEdit(el); return; }
+  if (d.act === "ttsJobThink") {
+    const key = d.key;
+    const on = !(state && state.settings
+                 && String(state.settings[key] || "off").toLowerCase() === "on");
+    if (state && state.settings) state.settings[key] = on ? "on" : "off";
+    const body = {};
+    body[key] = on ? "on" : "off";
+    post("/api/settings", body).then(() => renderTts(true));
+    return;
+  }
+  if (d.act === "ttsRetrySafe") {
+    const on = !(state && state.settings
+                 && String(state.settings.ttsRetrySafe || "on").toLowerCase() === "on");
+    if (state && state.settings) state.settings.ttsRetrySafe = on ? "on" : "off";
+    post("/api/settings", { ttsRetrySafe: on ? "on" : "off" }).then(() => renderTts(true));
+    return;
+  }
   if (d.act === "srvEdLock") { srvEd.locked = !srvEd.locked; post("/api/settings", { srvEdOpen: !srvEd.locked }); renderSrvInspector(); return; }
   if (d.act === "srvEdUndo") { srvEdStep(-1); return; }
   if (d.act === "srvEdRedo") { srvEdStep(1); return; }
@@ -12761,8 +19918,48 @@ document.addEventListener("click", ev => {
     termStampsToggle(ev.target.dataset.kind || "dashboard");
     return;
   }
+  // named literally so the gate's orphan sweep can see both acts are handled; the
+  // act -> setting mapping still lives only in TAG_OUT_BTNS
+  if (d.act === "termTagOutPti" || d.act === "termTagOutPme" || d.act === "termThoughts"
+      || d.act === "termActions") {
+    termToggle(tagOutSetting(d.act), "on", "off");
+    return;
+  }
   if (d.act === "termInsTts") { termToggle("termInsTts", "on", "off"); return; }
   if (d.act === "higgsCancel") { higgsCancel(); return; }
+  // buttons, so the CLICK chain - the select handlers next to these fire on change and
+  // a button press never reaches them
+  if (d.act === "acppReport") {
+    post("/api/acpp-report", {}).then(r => {
+      const txt = (r && r.text) || "(nothing to report yet)";
+      showModal('<h2 style="margin:2px 0 8px">audio.cpp report</h2>'
+        + '<p class="hint" style="line-height:1.7;margin:0 0 10px">How the speech engine '
+        + 'has behaved this session. Paste it into an issue at '
+        + '<b>github.com/0xShug0/audio.cpp</b> along with the line that failed.</p>'
+        + '<textarea id="acppbox" class="txt" readonly style="width:100%;height:340px;'
+        + 'font-family:Consolas,monospace;font-size:12px;line-height:1.5">'
+        + esc(txt) + '</textarea>'
+        + '<div class="row" style="justify-content:flex-end;gap:8px;margin-top:10px">'
+        + '<button class="stop" onclick="closeModal()">Close</button>'
+        + '<button data-act="acppCopy">Copy</button></div>', true);
+    });
+    return;
+  }
+  if (d.act === "acppCopy") {
+    const b = $("acppbox");
+    if (b) { b.select(); try { document.execCommand("copy"); } catch (e) {} }
+    return;
+  }
+  if (d.act === "ttsPromptEdit") { ttsPromptEdit(d.key); return; }
+  if (d.act === "ttsPromptClear" || d.act === "ttsPromptSave") {
+    const box = $("promptbox");
+    const val = d.act === "ttsPromptClear" ? "" : (box ? box.value : "");
+    if (state && state.settings) state.settings[d.key] = val;
+    post("/api/settings", { [d.key]: val });
+    closeModal();
+    setTimeout(renderTts, 60);
+    return;
+  }
   if (d.act === "errClear") {
     if (!confirm("Clear all collected issues and the error log for this session?")) return;
     post("/api/errors-clear", {}).then(async () => {
@@ -12920,7 +20117,384 @@ document.addEventListener("click", ev => {
   if (d.act === "provPower") { provEdit(d.id, { enabled: el.classList.contains("off") }); return; }
   if (d.act === "verClick") { verClick(); return; }
   if (d.act === "remJump") { showTab("perms"); showPsub("settings"); return; }
+  if (d.act === "ttsDiagnose") {
+    const sel = $("tts-srv-calib"), msg = $("tts-cal-msg");
+    const port = sel ? sel.value : "";
+    if (!port) { ttsCalMsg("no server card has a model selected"); return; }
+    // a chat against a cold model can take a while; a button that looks idle is a
+    // button somebody presses twice
+    let dots = 0;
+    const tick = setInterval(() => {
+      dots = (dots + 1) % 4;
+      if (msg) msg.textContent = "diagnosing" + ".".repeat(dots)
+        + "   (the server may be loading)";
+    }, 500);
+    if (msg) msg.textContent = "diagnosing";
+    post("/api/tts-diagnose", { port: port })
+      .then(r => {
+        r = r || {};
+        // the answer is written to the feed by the panel; the button only reports
+        // what could not be started at all
+        if (r.error) { ttsCalMsg(r.error); return; }
+        if (msg) msg.textContent = "last diagnosis " + (r.at || "just now");
+      })
+      .catch(e => ttsCalMsg("the request failed: " + e))
+      .then(() => {
+        clearInterval(tick);
+        refreshCalTail();
+        // NOT load(): it re-renders the pane, and re-rendering the pane replaces the
+        // terminal element - which is why pressing Diagnose cleared it and showed
+        // nothing. The settings it would refresh are re-read on the next visit.
+      });
+    return;
+  }
+// The request pane, colour-coded. The request is JSON: keys salmon, numbers green,
+// short strings quoted green - and a string with newlines in it (the prompt) is laid
+// out as REAL lines, with ## headings and **bold** runs lit the way the layout reads.
+function payMd(line) {
+  const PLAIN = "#c9ccd3", HEAD = "#e8956d";
+  const s = String(line);
+  const lt = s.replace(new RegExp("^ +"), "");
+  if (lt.slice(0, 2) === "# " || lt.slice(0, 3) === "## " || lt.slice(0, 4) === "### ")
+    return '<span style="color:' + HEAD + ';font-weight:700">' + esc(s) + "</span>";
+  // **bold** runs: split on the marks, alternate plain / lit
+  const bits = s.split("**");
+  if (bits.length < 3) return '<span style="color:' + PLAIN + '">' + esc(s) + "</span>";
+  return bits.map((b, i) => i % 2
+    ? '<span style="color:' + HEAD + ';font-weight:700">' + esc(b) + "</span>"
+    : '<span style="color:' + PLAIN + '">' + esc(b) + "</span>").join("");
+}
+function payVal(v, ind) {
+  const NL = String.fromCharCode(10);
+  const KEY = "#e8956d", STR = "#a8d08a", DIMC = "#6b7280";
+  const pun = s => '<span style="color:' + DIMC + '">' + esc(s) + "</span>";
+  if (v === null || v === true || v === false)
+    return '<span style="color:#ff5dc8">' + String(v) + "</span>";
+  if (typeof v === "number")
+    return '<span style="color:var(--ok)">' + String(v) + "</span>";
+  if (typeof v === "string") {
+    if (v.indexOf(NL) < 0)
+      return '<span style="color:' + STR + '">' + esc(JSON.stringify(v)) + "</span>";
+    // the prompt itself: real lines, readable, marked where it marks itself
+    return pun('"') + NL
+      + v.split(NL).map(payMd).join(NL) + NL + ind + pun('"');
+  }
+  if (Array.isArray(v)) {
+    if (!v.length) return pun("[]");
+    return pun("[") + NL + v.map(x => ind + "  " + payVal(x, ind + "  "))
+      .join(pun(",") + NL) + NL + ind + pun("]");
+  }
+  const ks = Object.keys(v);
+  if (!ks.length) return pun("{}");
+  return pun("{") + NL + ks.map(k =>
+      ind + '  <span style="color:' + KEY + '">' + esc(JSON.stringify(k)) + "</span>"
+      + pun(": ") + payVal(v[k], ind + "  "))
+    .join(pun(",") + NL) + NL + ind + pun("}");
+}
+function payloadPretty(text) {
+  try { return payVal(JSON.parse(text), ""); }
+  catch (e) { return esc(text); }
+}
+// The reply pane: [TAGS] gold, <internal_thought> in the terminal's own grape,
+// spoken text plain - the same reading the terminals already taught the eye.
+function respPretty(text) {
+  const GOLD = "#f2c14e", GRAPE = "#c07ffb";
+  // no regex: "not a ]" has no backslash-free spelling, so the tags are walked
+  const lit = s => {
+    let out = "", i = 0;
+    while (i < s.length) {
+      const a = s.indexOf("[", i);
+      if (a < 0) { out += esc(s.slice(i)); break; }
+      const b = s.indexOf("]", a);
+      if (b < 0 || b - a > 40) { out += esc(s.slice(i, a + 1)); i = a + 1; continue; }
+      out += esc(s.slice(i, a))
+           + '<span style="color:' + GOLD + '">' + esc(s.slice(a, b + 1)) + "</span>";
+      i = b + 1;
+    }
+    return out;
+  };
+  const OT = "<internal_thought>", CT = "</internal_thought>";
+  let out = "", s = String(text || "");
+  while (true) {
+    const a = s.indexOf(OT);
+    if (a < 0) { out += lit(s); break; }
+    out += lit(s.slice(0, a));
+    let b = s.indexOf(CT, a);
+    if (b < 0) b = s.length; else b += CT.length;
+    out += '<span style="color:' + GRAPE + '">' + esc(s.slice(a, b)) + "</span>";
+    s = s.slice(b);
+  }
+  return out;
+}
+  if (d.act === "copyBuiltIn") {
+    const pre = $("tts-builtin");
+    const txt = pre ? pre.textContent : "";
+    const btn = t.closest ? (t.closest(".copybtn") || t) : t;
+    const done = () => {
+      const was = btn.textContent;
+      btn.textContent = "\\u2713";
+      setTimeout(() => { btn.textContent = was; }, 900);
+    };
+    // clipboard API on localhost; a hidden textarea everywhere else - the panel is
+    // reached over plain http from the LAN, where navigator.clipboard is absent
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(done).catch(() => {});
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = txt;
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+    return;
+  }
+  if (d.act === "tagLimDec" || d.act === "tagLimInc") {
+    const board = d.board === "player" ? "player" : "npc";
+    const m = window.__tagLim[board], wl = String(d.tag || "").toUpperCase();
+    if (!m.on || !m.work) return;
+    const cur = m.work[wl] || 0;
+    m.work[wl] = Math.max(0, Math.min(99, cur + (d.act === "tagLimInc" ? 1 : -1)));
+    const g2 = $(board === "player" ? "tts-taggrid" : "tts-finaltaggrid");
+    if (g2) g2.innerHTML = board === "player"
+      ? ttsTagGrid((state && state.settings) || {})
+      : ttsFinalTagGrid((state && state.settings) || {});
+    tagLimPop(board, String(d.tag || ""));   // re-anchor over the repainted chip
+    return;
+  }
+  if (d.act === "playThought") {
+    const el2 = el;                       // the [data-act] element IS the thought span
+    const who = d.who || "";
+    const said = el2 ? el2.textContent.split(String.fromCharCode(0x3030)).join(" ")
+                          .split(String.fromCharCode(0xFE0F)).join("").trim() : "";
+    if (!who || !said) return;
+    if (el2 && el2.dataset.aid) {
+      post("/api/tts-replay", { id: el2.dataset.aid }).then(r => {
+        if (!r || r.error) spkPlay(el2.dataset.aid);
+      }).catch(() => spkPlay(el2.dataset.aid));
+      return;
+    }
+    if (el2) el2.classList.add("playing");           // the pulse doubles as "synthesizing"
+    post("/api/tts-thought", { who: who, text: said }).then(r => {
+      if (el2) el2.classList.remove("playing");
+      if (r && r.id && el2) el2.dataset.aid = r.id;
+      else if (r && r.error) uiAlert(r.error);
+    }).catch(() => { if (el2) el2.classList.remove("playing"); });
+    return;
+  }
+  if (d.act === "playSpoken") {
+    const aid = d.aid || "";
+    if (!aid) return;
+    // the click asks the panel to broadcast; every open page - this one, and a
+    // remote view on the game PC - hears the event and plays locally. If the
+    // broadcast cannot be placed (a read-only viewer, or the wav rotated out),
+    // fall back to playing right here so the click never goes silent.
+    post("/api/tts-replay", { id: aid }).then(r => {
+      if (!r || r.error || r.readonly) spkPlay(aid);
+    }).catch(() => spkPlay(aid));
+    return;
+  }
+  if (d.act === "tagLimMode" || d.act === "tagLimSave" || d.act === "tagLimReset") {
+    const board = d.board === "player" ? "player" : "npc";
+    const st = (state && state.settings) || {};
+    const m = window.__tagLim[board];
+    tagLimPopClose();
+    if (d.act === "tagLimMode") {
+      m.on = !m.on;
+      m.work = m.on ? Object.assign({}, tagLimSaved(st, board)) : null;
+    } else if (d.act === "tagLimSave") {
+      const body = {};
+      body[TAGLIM_KEYS[board]] = Object.keys(m.work || {})
+        .filter(w => m.work[w] > 0).map(w => w + ":" + m.work[w]).join(" ");
+      st[TAGLIM_KEYS[board]] = body[TAGLIM_KEYS[board]];
+      post("/api/settings", body);
+      m.on = false; m.work = null;
+    } else {
+      m.work = {};                              // Reset: the default is no limits
+      const body = {};
+      body[TAGLIM_KEYS[board]] = "";
+      st[TAGLIM_KEYS[board]] = "";
+      post("/api/settings", body);
+    }
+    const g = $(board === "player" ? "tts-taggrid" : "tts-finaltaggrid");
+    if (g) g.innerHTML = board === "player" ? ttsTagGrid(st) : ttsFinalTagGrid(st);
+    return;
+  }
+  if (d.act === "copyRawTail") {
+    const txt = String(window.__rawTail || "");
+    const done = () => { t.textContent = "Copied"; setTimeout(() => { t.textContent = "Copy raw tail"; }, 1200); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).then(done).catch(() => {});
+    } else {
+      const ta = document.createElement("textarea");
+      ta.value = txt; document.body.appendChild(ta); ta.select();
+      try { document.execCommand("copy"); done(); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+    return;
+  }
+  if (d.act === "ttsFinalTagToggle") {
+    if (window.__tagLim.npc.on) {               // limit mode: the click opens < N >
+      tagLimPop("npc", String(d.tag || ""));
+      return;
+    }
+    const w = String(d.tag || "").toUpperCase();
+    const st = (state && state.settings) || {};
+    const cur = String(st.ttsTagsFinalOff || "").toUpperCase()
+      .split(",").join(" ").split(" ").filter(Boolean);
+    const nxt = cur.indexOf(w) >= 0 ? cur.filter(x => x !== w) : cur.concat([w]);
+    st.ttsTagsFinalOff = nxt.join(" ");
+    post("/api/settings", { ttsTagsFinalOff: st.ttsTagsFinalOff });
+    const g = $("tts-finaltaggrid");
+    if (g) g.innerHTML = ttsFinalTagGrid(st);   // the grid alone; the pane holds still
+    return;
+  }
+  if (d.act === "ttsTagToggle") {
+    if (window.__tagLim.player.on) {            // limit mode: the click opens < N >
+      tagLimPop("player", String(d.tag || ""));
+      return;
+    }
+    const w = String(d.tag || "").toUpperCase();
+    const st = (state && state.settings) || {};
+    const cur = String(st.ttsTagsOff || "").toUpperCase()
+      .split(",").join(" ").split(" ").filter(Boolean);
+    const nxt = cur.indexOf(w) >= 0 ? cur.filter(x => x !== w) : cur.concat([w]);
+    st.ttsTagsOff = nxt.join(" ");
+    post("/api/settings", { ttsTagsOff: st.ttsTagsOff });
+    const g = $("tts-taggrid");
+    if (g) g.innerHTML = ttsTagGrid(st);       // the grid alone; the pane holds still
+    return;
+  }
+  if (d.act === "proxyPayload") {
+    const pid = d.pid;
+    post("/api/proxy-payload", { id: pid })
+      .then(e => {
+        if (!e || e.error) {
+          showModal('<div class="hint" style="width:auto">'
+                    + esc((e && e.error) || "no such record")
+                    + '</div><div class="row" style="justify-content:flex-end;margin-top:12px">'
+                    + '<button class="stop" onclick="closeModal()">Close</button></div>');
+          return;
+        }
+        const sec = (e.ms / 1000).toFixed(1) + "s";
+        const chip = (txt, col) => '<span class="chip" style="color:' + col
+          + ';--sgl:' + col + '">' + txt + "</span>";
+        const head =
+            '<div class="row" style="gap:10px;align-items:center;flex-wrap:wrap;margin-bottom:12px">'
+          + '<span style="color:var(--ok);font-weight:700">\u2713 COMPLETED</span>'
+          + chip(esc((e.emoji ? e.emoji + " " : "") + e.title), dashColor(e.title))
+          + '<span style="color:#8b93a3">[' + esc(e.server) + "]</span>"
+          + (e.streaming ? chip("Streaming", "var(--dim)") : "")
+          + '<span style="color:var(--warn)">\u23F1 ' + sec + "</span>"
+          + '<span class="hint" style="width:auto;margin-left:auto">' + esc(e.at) + "</span>"
+          + '<button class="stop" onclick="closeModal()">\u2715</button></div>';
+        const NL = String.fromCharCode(10);
+        // the reply coloured as itself; the reasoning under it in the terminal's
+        // grape, dimmed - it is interior, not spoken
+        const respHtml = (e.resp ? respPretty(e.resp) : "(empty)")
+          + (e.think
+             ? '<span style="color:#c07ffb;opacity:.75">' + NL + NL
+               + "--- reasoning ---" + NL + esc(e.think) + "</span>"
+             : "");
+        showModal(head
+          + '<div style="display:flex;gap:14px;flex:1;min-height:0">'
+          + '<div style="flex:1;display:flex;flex-direction:column;min-width:0">'
+          + '<div class="payhead">REQUEST PAYLOAD</div>'
+          + '<pre class="paypre">' + (e.req ? payloadPretty(e.req) : "(empty)") + "</pre></div>"
+          + '<div style="flex:1;display:flex;flex-direction:column;min-width:0">'
+          + '<div class="payhead">RESPONSE PAYLOAD</div>'
+          + '<pre class="paypre">' + respHtml + "</pre></div></div>", true);
+        const bx = document.querySelector("#pl-modal > div");
+        if (bx) { bx.style.width = "min(1200px, 94vw)"; bx.style.height = "min(820px, 88vh)"; }
+      })
+      .catch(() => {});
+    return;
+  }
+  if (d.act === "ttsTokPerCharReset") {
+    const sl = $("tts-ttsFixedTokPerChar"), lbl = $("tts-tpc-lbl");
+    if (sl) sl.value = "3.5";
+    if (lbl) lbl.innerHTML = "<b>3.5</b> tokens per character";
+    if (state && state.settings) state.settings.ttsFixedTokPerChar = "3.5";
+    post("/api/settings", { ttsFixedTokPerChar: "3.5" });
+    return;
+  }
+  if (d.act === "ttsAutoInfo") {
+    // On top of the page, not in a terminal: it is reference, not a record.
+    showModal('<h2 style="margin:2px 0 10px;font-size:17px">'
+      + "The arithmetic, as the panel runs it"
+      + '</h2><pre id="pl-info-pre" class="tail" style="margin:0 0 14px;padding:10px;'
+      + "white-space:pre-wrap;font-size:12.5px;line-height:1.55;border:1px solid var(--line);"
+      + 'border-radius:8px;flex:1;min-height:0;overflow:auto">reading...</pre>'
+      + '<div class="row" style="justify-content:flex-end;gap:8px">'
+      + '<button class="stop" data-act="ttsInfoCopy">Copy</button>'
+      + '<button class="stop" onclick="closeModal()">Close</button></div>', true);
+    post("/api/tts-autocal-info", {})
+      .then(r => {
+        r = r || {};
+        const pre = $("pl-info-pre");
+        if (!pre) return;                       // closed while the answer was coming
+        pre.textContent = (r.headroomWhy ? "RIGHT NOW: " + r.headroomWhy
+                                           + String.fromCharCode(10, 10) : "")
+          + (r.algorithm || "(nothing)");
+      })
+      .catch(e => { const pre = $("pl-info-pre"); if (pre) pre.textContent = "could not read it: " + e; });
+    return;
+  }
+  if (d.act === "ttsInfoCopy" || d.act === "ttsCalCopy") {
+    const src2 = $(d.act === "ttsInfoCopy" ? "pl-info-pre" : "tail-ttscal");
+    const txt = src2 ? src2.textContent : "";
+    if (!txt) return;
+    const back = el.textContent;
+    navigator.clipboard.writeText(txt)
+      .then(() => { el.textContent = "Copied"; })
+      .catch(() => { el.textContent = "Copy failed"; })
+      .then(() => setTimeout(() => { el.textContent = back; }, 1300));
+    return;
+  }
+  if (d.act === "ttsCalTerm") {
+    const on = !calTermOpen();
+    const wrap = $("tts-cal-termwrap");
+    if (wrap) wrap.style.display = on ? "block" : "none";
+    el.textContent = on ? "Hide Terminal" : "Show Terminal";
+    post("/api/settings", { ttsCalTermOpen: on ? "on" : "off" });
+    if (state && state.settings) state.settings.ttsCalTermOpen = on ? "on" : "off";
+    if (on) refreshCalTail();
+    return;
+  }
+  if (d.act === "ttsMeterSeg") {
+    meterPin = (meterPin === d.key) ? "" : d.key;   // click again to let it go
+    refreshTtsMeter();
+    return;
+  }
+  if (d.act === "termProviders") {
+    const c = el.closest(".tchrome");
+    if (c) { c.classList.remove("adjopen", "optopen"); c.classList.toggle("provopen"); }
+    if (c && c.classList.contains("provopen")) paintProvFilter();
+    if (Object.values(tailMaxState).some(x => x)) tmaxWake();
+    return;
+  }
+  if (d.act === "provPick") {                 // one provider, on or off
+    const id = d.id || "";
+    const off = hiddenProvs();
+    if (off.has(id)) off.delete(id); else off.add(id);
+    const body = { termHideProv: [...off].join(",") };
+    if (state && state.settings) state.settings.termHideProv = body.termHideProv;
+    paintProvFilter();
+    post("/api/settings", body).then(() => refreshTail("dashboard"));
+    return;
+  }
+  if (d.act === "termOptions") {
+    const _c1 = el.closest(".tchrome");
+    if (_c1) _c1.classList.remove("provopen");   // one menu open at a time
+    const c = el.closest(".tchrome");
+    if (c) { c.classList.remove("adjopen"); c.classList.toggle("optopen"); }
+    if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+    if (Object.values(tailMaxState).some(x => x)) tmaxWake();
+    return;
+  }
   if (d.act === "tmaxAdjust") {
+    const _c0 = el.closest(".tchrome");
+    if (_c0) _c0.classList.remove("optopen", "provopen");   // one menu open at a time
     const c = d.tc ? $(d.tc) : el.closest(".tchrome");   // each terminal owns its menu; data-tc lets a stand-in button reach it
     if (c) c.classList.toggle("adjopen");
     if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
@@ -13194,7 +20768,7 @@ function gsync(id) {
 const PS_KW = new Set("if,else,elseif,foreach,for,while,function,param,return,try,catch,finally,switch,break,continue,in,do,until,throw,begin,process,end,elseif".split(","));
 function psHl(src) {
   const NL = String.fromCharCode(10);
-  const master = new RegExp('GPU-[0-9a-fA-F][0-9a-fA-F-]{5,}|#[^' + NL + ']*|"[^"' + NL + ']*"|' + "'[^'" + NL + "]*'|" + '[$][{]?[A-Za-z_][A-Za-z0-9_:]*[}]?|[[][A-Za-z][A-Za-z0-9.]*[]]|[0-9]+([.][0-9]+)?|[A-Za-z]+-[A-Za-z][A-Za-z0-9-]*|[A-Za-z_][A-Za-z0-9_]*', "g");
+  const master = new RegExp('GPU-[0-9a-fA-F][0-9a-fA-F-]{5,}|#[^' + NL + ']*|"[^"' + NL + ']*"|' + "'[^'" + NL + "]*'|" + '[$][{]?[A-Za-z_][A-Za-z0-9_:]*[}]?|[[][A-Za-z][A-Za-z0-9.]*]|[0-9]+([.][0-9]+)?|[A-Za-z]+-[A-Za-z][A-Za-z0-9-]*|[A-Za-z_][A-Za-z0-9_]*', "g");
   let out = "", last = 0, m;
   while ((m = master.exec(src)) !== null) {
     out += esc(src.slice(last, m.index));
@@ -13370,11 +20944,11 @@ function renderParams() {
   const RE = [
     { name:"Reasoning on/off", flag:"--reasoning on|off", range:"on | off",
       how:"Turns the model hidden think-first pass on or off. Thinking sharpens complex decisions but adds latency, so it suits reasoning/utility roles more than fast back-and-forth dialogue." },
-    { name:"Reasoning budget", flag:"--reasoning-budget N", range:"N = -1 (unlimited) or 0 or more",
-      how:"Caps how many tokens the model may spend thinking before it must answer." },
+    { name:"Reasoning budget", flag:"--reasoning-budget N", range:"N = -1 unlimited, 0 = no thinking, N above 0 = a token budget",
+      how:"Caps how many tokens the model may spend thinking before it must answer. This is the server default; a provider whose Thinking switch is off sends a budget of 0 with its own requests, so one server can reason for some callers and not others." },
     { name:"Budget message", flag:"--reasoning-budget-message",
       how:"The nudge injected if the thinking budget runs out, telling the model to stop and respond." },
-    { name:"Reasoning format", flag:"--reasoning-format <fmt>", range:"deepseek | none | auto",
+    { name:"Reasoning format", flag:"--reasoning-format <fmt>", range:"auto | deepseek | deepseek-legacy | none",
       how:"How the think block is delimited and parsed in the response (for example the deepseek format), so SkyrimNet and the proxy can separate the hidden reasoning from the spoken answer." }
   ];
   const SP = [
@@ -14072,10 +21646,77 @@ function applyScopeUI() {
     }
   }
 }
+const APP_TAG = "__APPTAG__";
+// One player for the whole page: whichever line is asked for - by a local click's
+// fallback or by the replay event any open page receives - the previous playback
+// yields, the matching line pulses if it is on screen, and the pulse ends with the
+// audio, on error too.
+function spkPlay(aid) {
+  const el2 = document.querySelector('.spk[data-aid="' + String(aid).replace(/"/g, "") + '"]');
+  if (window.__spkAudio) { try { window.__spkAudio.pause(); } catch (e) {} }
+  if (window.__spkEl) window.__spkEl.classList.remove("playing");
+  const au = new Audio("/api/tts-audio?id=" + encodeURIComponent(aid));
+  window.__spkAudio = au; window.__spkEl = el2;
+  if (el2) el2.classList.add("playing");
+  au.onended = au.onerror = () => { if (el2) el2.classList.remove("playing"); };
+  au.play().catch(() => { if (el2) el2.classList.remove("playing"); });
+}
+// The badge answers "which page is this tab actually running" at a glance - the
+// one question a screenshot could never settle. An old tab has no badge at all,
+// which is itself the answer.
+// the ?-click bubble: one at a time, positioned under its mark, closed by any
+// click elsewhere (the global click chain above does the closing)
+function qmTipClose() {
+  if (window.__qmPop && window.__qmPop.parentNode)
+    window.__qmPop.parentNode.removeChild(window.__qmPop);
+  window.__qmPop = null;
+}
+function qmShowTip(qmEl) {
+  qmTipClose();
+  let src = qmEl, tip = "";
+  while (src && !tip) { tip = src.getAttribute && src.getAttribute("title") || ""; src = src.parentElement; }
+  if (!tip) return;
+  const pop = document.createElement("div");
+  pop.id = "qm-pop";
+  pop.textContent = tip;
+  document.body.appendChild(pop);
+  const r = qmEl.getBoundingClientRect();
+  pop.style.left = Math.max(8, Math.min(window.innerWidth - pop.offsetWidth - 8,
+                                        r.left - 12)) + "px";
+  pop.style.top = (r.bottom + 8 + window.scrollY) + "px";
+  window.__qmPop = pop;
+}
+function drawUiBadge() {
+  let b = document.getElementById("uibadge");
+  if (!b) {
+    b = document.createElement("div");
+    b.id = "uibadge";
+    document.body.appendChild(b);
+  }
+  const mine = APP_TAG.indexOf("__APP") === 0 ? "unstamped" : APP_TAG.replace("v3.74-beta-", "");
+  const srv = (state && state.app) ? state.app.replace("v3.74-beta-", "") : "";
+  b.textContent = "ui " + mine + (srv && srv !== mine ? "  panel " + srv : "");
+  b.title = "the page version this tab is running" + (srv ? " - the panel serving it is " + srv : "");
+}
+function appTagCheck() {
+  // the page this tab is running vs the panel now serving it. One reload, guarded:
+  // a tab that cannot fetch the new page must not reload in a loop.
+  if (state && state.app && APP_TAG.indexOf("__APP") !== 0 && state.app !== APP_TAG
+      && !window.__reloading) {
+    window.__reloading = true;
+    location.reload();
+  }
+}
 async function load() {
   try {
     state = await (await fetch("/api/state")).json();
+    appTagCheck();
+    drawUiBadge();
     reconcilePcMode();
+    // An install running anywhere gets its own loop back here, on every reload.
+    // Starting it only from the row that draws it meant one missed redraw ended it
+    // until the page was refreshed by hand.
+    if (state && state.higgsInstall && state.higgsInstall.running) higgsPoll();
     paintChrome();
     renderCurrent();
     applyScopeUI();
@@ -14163,7 +21804,39 @@ async function removeSlot(sid) {
   if (r.error) uiAlert(r.error);
   load();
 }
+// launches and stops mirror the TTS buttons: the button names the phase and stays
+// down, and the card's small terminal opens on the press and LIVES - polled from the
+// slot's own console log - until the server is serving (launch) or gone (stop).
+const slotBusy = {}, slotPoll = {}, slotLogText = {};
+function slotTermTick(sid) {
+  post("/api/slot-log", { slot: sid }).then(r => {
+    if (!slotBusy[sid]) return;
+    slotLogText[sid] = (r && (r.log || r.error)) || slotLogText[sid] || "";
+    const lg = $("log-" + sid);
+    if (lg) { lg.textContent = slotLogText[sid]; lg.style.display = "block";
+              lg.scrollTop = lg.scrollHeight; }
+  }).catch(() => {});
+}
+function slotBusyClear(sid) {
+  delete slotBusy[sid];
+  if (slotPoll[sid]) { clearInterval(slotPoll[sid]); delete slotPoll[sid]; }
+  const lg = $("log-" + sid);
+  if (lg) lg.style.display = "none";
+}
 async function act(sid, kind, btn) {
+  if (kind === "launch" || kind === "stop") {
+    slotBusy[sid] = kind;
+    if (btn) { btn.disabled = true;
+               btn.textContent = kind === "launch" ? "Launching Server..." : "Shutting Down..."; }
+    const log = $("log-" + sid);
+    if (log) { log.textContent = slotLogText[sid] || ""; log.style.display = "block"; }
+    if (!slotPoll[sid]) slotPoll[sid] = setInterval(() => slotTermTick(sid), 1500);
+    slotTermTick(sid);
+    const r = await post("/api/" + kind, { slot: sid });
+    if (r && r.error) { slotBusyClear(sid); uiAlert(r.error); }
+    load();
+    return;
+  }
   const old = btn.textContent;
   btn.disabled = true; btn.textContent = "working...";
   const r = await post("/api/" + kind, { slot: sid });
@@ -14211,7 +21884,7 @@ async function terminateAll(btn) {
   // between running and stopped. Mark it here, exactly as the Stop button does.
   const hadTts = !!(state && state.ttsServer
                     && ["serving", "loading"].indexOf(state.ttsServer.state) >= 0);
-  if (hadTts && !ttsBusy) { ttsBusy = "stop"; if (curTab === "dashboard" && curDsub === "tts") renderTts(); }
+  if (hadTts && !ttsBusy) { ttsBusy = "stop"; ttsRepaint(); }
   try {
     const r = await post("/api/terminate", {});
     stackSet(r.log || r.error || "");
@@ -14232,6 +21905,7 @@ async function exitPanel(btn) {
    how many are. Stopping stays on the TTS page; this only starts. */
 async function launchTts(btn) {
   if (btn && btn.classList.contains("lbbusy")) return;
+  if (ttsBusy) return;                     // the page may already be doing it
   const eng = String(((state && state.settings) || {}).ttsEngine || "moss").toLowerCase();
   const st = (state && state.settings) || {};
   const need = (eng === "audiocpp")
@@ -14244,10 +21918,7 @@ async function launchTts(btn) {
     showTab("tts");            // its own tab since v3.73
     return;
   }
-  window.__ttsLaunching = true;
-  const r = await post("/api/tts-server", { action: "start" });
-  if (r && r.error) { window.__ttsLaunching = false; uiAlert(r.error); }
-  await load();
+  await ttsServer("start");                // exactly what the page does
 }
 function syncTtsButton() {
   const tb = $("launchTtsBtn");
@@ -14256,14 +21927,12 @@ function syncTtsButton() {
   let s;
   // Terminate stops the TTS server too, but unloading a model is not instant - without a
   // state for it the button kept reading "TTS running..." and looked ignored.
-  if (srv.stopping) s = "term";
+  // an in-flight action outranks what the server last reported: during a stop it is
+  // still "serving" for a moment, and reading that first showed "TTS running..."
+  if (srv.stopping || ttsBusy === "stop") s = "term";
+  else if (ttsBusy === "start" && !srv.died) s = "launching";
   else if (String(srv.state || "") === "serving") s = "run";
-  else if (window.__ttsLaunching && srv.pid && !srv.died) s = "launching";
   else s = "idle";
-  // The panel tells us whether it still has a process. Without that, terminating before
-  // the server ever answered left this stuck on "Starting TTS..." with nothing to clear
-  // the flag - there was no state that said "it is gone".
-  if (s !== "launching") window.__ttsLaunching = false;
   if (window.__tbState === s) return;
   const was = window.__tbState;
   window.__tbState = s;
@@ -14328,14 +21997,29 @@ function liveRefresh(src) {
   if (curTab === "helper") renderHelper();
   queueStats(); queueErrors(); queueLoad(); queueRouting();
 }
+// A state event now re-pulls the state itself and repaints the pane that shows
+// it. The Higgs installer saved the folder paths and notified, but the page only
+// refreshed terminals and queues - the TTS pane sat on its old inputs until a
+// hand reload. Editing is respected: a pane holding the keyboard is not stomped.
+async function stateRepull() {
+  try { state = await (await fetch("/api/state")).json(); } catch (e) { return; }
+  appTagCheck();
+  drawUiBadge();
+  liveRefresh("state");
+  const pane = $("dpane-tts");
+  const busy = document.activeElement && pane && pane.contains
+            && pane.contains(document.activeElement);
+  if (curTab === "tts" && !busy) renderTts();
+}
 function connectES() {
   if (window.__es) { try { window.__es.close(); } catch (e) {} }
   const es = new EventSource("/api/events");
   es.onmessage = e => {
     let ev = {}; try { ev = JSON.parse(e.data); } catch (x) { return; }
     if (ev.seq) window.__sseSeq = ev.seq;
-    if (ev.t === "state") liveRefresh("state");
+    if (ev.t === "state") stateRepull();
     if (ev.t === "tail") liveRefresh("tail");
+    if (ev.t === "replay" && ev.id) spkPlay(String(ev.id));
   };
   window.__es = es;
 }
@@ -14419,12 +22103,22 @@ function uiPrompt(msg, def, title) {
 }
 function welcomeGoHelper() { closeModal(); post("/api/settings", { welcomeSeen: true }); showTab("helper"); }
 function welcomeDismiss() { closeModal(); post("/api/settings", { welcomeSeen: true }); }
+// Speech does not need the fleet: the panel can answer SkyrimNet for voices while its
+// language models come from somewhere else entirely. Someone here only for that should
+// not be walked through setting up servers they are never going to run.
+function welcomeTtsOnly() { closeModal(); post("/api/settings", { welcomeSeen: true }); showTab("tts"); }
 function maybeWelcome() {
   if (!state || !state.settings || state.settings.welcomeSeen) return;
   showModal(
     '<h2 style="margin:2px 0 4px">Welcome To PandorumLLM!</h2>'
-    + '<p style="line-height:1.6;margin:8px 0 16px">Head to the <b>User Guide</b> page to get set up - the <b>Main Guide</b> walks you through every step, and the <b>Sampler Guide</b> explains every runtime setting. Want to go there now?</p>'
-    + '<div class="row" style="justify-content:flex-end;gap:8px">'
+    + '<p style="line-height:1.6;margin:8px 0 14px">The panel runs a local <b>llama.cpp fleet</b> for SkyrimNet '
+    + 'and gives its characters <b>voices</b>. You do not have to use both - if your language models already '
+    + 'come from somewhere else, you can set up speech on its own and leave the rest alone.</p>'
+    + '<p style="line-height:1.6;margin:0 0 16px">The <b>Main Guide</b> walks through the whole setup, and the '
+    + '<b>Sampler Guide</b> explains every runtime setting. Where would you like to start?</p>'
+    + '<div class="row" style="gap:8px;align-items:center">'
+    + '<button class="stop bluebtn" onclick="welcomeTtsOnly()" title="go straight to the TTS page and skip the fleet setup">TTS only for now</button>'
+    + '<span style="margin-left:auto"></span>'
     + '<button class="stop" onclick="welcomeDismiss()">Maybe later</button>'
     + '<button onclick="welcomeGoHelper()">\u2728 Take me to the user guide</button></div>'
   );
@@ -14601,13 +22295,19 @@ def write_porterror():
     return p
 
 def _kill_port_owner(port):
-    try:
-        subprocess.run(["pwsh", "-NoProfile", "-Command",
-            "$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; "
-            "if ($c) { Stop-Process -Id $c.OwningProcess -Force }" % port],
-            capture_output=True, timeout=15, **NOWIN)
-    except Exception:
-        pass
+    # pwsh where it exists, Windows PowerShell where it does not - the cmdlet is in
+    # both, and quitting must not depend on PowerShell 7 being installed
+    for shell in ("pwsh", "powershell"):
+        try:
+            subprocess.run([shell, "-NoProfile", "-Command",
+                "$c = Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; "
+                "if ($c) { Stop-Process -Id $c.OwningProcess -Force }" % port],
+                capture_output=True, timeout=15, **NOWIN)
+            return
+        except FileNotFoundError:
+            continue
+        except Exception:
+            return
 
 def choose_port(deadline_s=6.5):
     """Bind is the ground truth: transparent proxies and phantom answerers can't
@@ -14725,6 +22425,9 @@ def main():
                 ld = log_dir()
                 prune_keep_newest(ld, "*_dashboard.log", 4)   # this session's file makes 5
                 prune_keep_newest(ld, "*_thinking.log", 4)
+                prune_keep_newest(ld, "*_ttscal.log", 4)
+                prune_keep_newest(ld, "*_tts-server.log", 4)
+                prune_keep_newest(ld, PTIPME_LOG_GLOB, 4)
                 # not an error: this used to create an error_N.log on every clean
                 # run. The file writes its own header naming the version when a
                 # real error first arrives, so nothing is lost.
@@ -14744,7 +22447,11 @@ def main():
                 log_error("panel", "background init failed: %s" % traceback.format_exc(limit=3))
 
         _th.Thread(target=_background_init, daemon=True).start()
-        srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
+        # the panel page binds the LAN only when the owner has switched LAN mode on;
+        # client_scope() still refuses out-of-scope callers, but in local mode the
+        # socket is simply not there to knock on. Changing the mode takes a restart.
+        _bind = "0.0.0.0" if net_mode() == "lan" else "127.0.0.1"
+        srv = ThreadingHTTPServer((_bind, PORT), Handler)
         print("%s %s   : http://localhost:%d/" % (APP_NAME, APP_VER_UI, PORT))
         print("file         : %s" % BUILD_ID.get("path", "?"))
         print("build        : %s  (%s KB, %s)" % (BUILD_ID.get("sha", "?"), BUILD_ID.get("kb", 0), BUILD_ID.get("mtime", "?")))
@@ -14756,10 +22463,28 @@ def main():
         _th.Thread(target=_peer_loop, daemon=True).start()
         print("From the LAN : http://<this-machine-ip>:%d/" % PORT)
         print("Config       : %s" % CONFIG)
+        if os.name == "nt":
+            # Closing the console window (the X) never raised KeyboardInterrupt: the
+            # process is simply killed after ~5 seconds, and only a registered console
+            # handler runs in them. Register one, keep a REFERENCE (a collected
+            # callback is a crash), and spend the window on full_exit - which now
+            # stops the TTS server first, because it is the one thing that outlives
+            # the console.
+            _HCTRL = ctypes.WINFUNCTYPE(ctypes.c_int, ctypes.c_uint)
+            def _on_ctrl(ev):
+                if ev in (0, 1, 2, 5, 6):   # C, Break, Close, Logoff, Shutdown
+                    full_exit("console closed")
+                    return 1
+                return 0
+            _CTRL_REF = _HCTRL(_on_ctrl)    # module-lifetime reference
+            try:
+                ctypes.windll.kernel32.SetConsoleCtrlHandler(_CTRL_REF, 1)
+            except Exception:
+                pass
         try:
             srv.serve_forever()
         except KeyboardInterrupt:
-            pass
+            full_exit("console interrupt")
         except Exception:
             traceback.print_exc()
             time.sleep(30)

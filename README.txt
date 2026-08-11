@@ -1,4 +1,4 @@
-PandorumLLM v3.74 Beta - local LLM stack for SkyrimNet, all in one folder
+PandorumLLM v3.75 Beta - local LLM stack for SkyrimNet, all in one folder
 ============================================================
 
 
@@ -3892,3 +3892,1272 @@ people had reasonably taken for a fault.
 
 Also in v3.74: the GPU setting on the TTS page now tells you which card will be used when
 you have not chosen one, rather than implying that all of them are available.
+
+v3.74 patch1: the Start and Stop buttons on the TTS page and the Launch TTS button at the
+top now always agree, and neither gets stuck. The GPU list on the TTS page shows the same
+detail as Live Network, and audio.cpp's own output can be watched in Split View.
+
+v3.74 patch2: the Higgs install now brings down two versions of the speech engine, and you
+can switch between them on the TTS page. They differ in the processor instructions they
+were built for, not the graphics card, so expect little difference - the balanced one is
+the default and works everywhere.
+
+v3.74 patch4: spoken lines in the Proxy terminal no longer leave a blank row that pushed
+everything out of line. Terminate now lights up for a running speech server too. The speech
+engine keeps a separate log per session, and if a line takes far longer to speak than its
+length suggests, the terminal explains why.
+
+v3.74 patch6: when a reply is long enough to be spoken in several pieces, the later pieces
+now say they are waiting their turn. The speech engine handles one at a time, so they
+queue - the text appeared straight away while the sound came later, which looked like a
+fault rather than a queue.
+
+v3.74 patch7: spoken lines in the Proxy terminal now line up exactly, and the speech server
+reports starting and stopping there alongside the language servers.
+
+v3.74 patch8: long lines in the terminals now continue on the next row instead of running
+off the right-hand side, and spoken lines line up properly under the speaker.
+
+v3.74 patch9: hover the little face beside a spoken line and the panel tells you which
+emotion it represents.
+
+v3.74 patch10: the first-run welcome now offers to take you straight to speech setup if
+that is all you want - the panel can give SkyrimNet voices whether or not its language
+models come from here.
+
+v3.74 patch12: your own spoken lines can now be given a feeling. NPC lines arrive with
+performance tags because the model that wrote them added those; a line you typed has none,
+so it is read flat. Turn on Inject Player Tags and one of your running models will suggest
+a single tag before the line is spoken. You can also just write one yourself.
+
+v3.74 patch13: adds Player Mood Evaluation. After a character speaks to you, a model reads
+how the conversation is going and notes what your reply might carry. That reading is passed
+to the tagging step as background - it is never treated as what you actually said. It runs
+while you are still reading, so it does not delay anything.
+
+v3.74 patch14: fixes player tags being discarded before they reached the speech engine on
+a default install. A tagged player line can now carry both a feeling and a sound, and the
+mood reading suggests feelings only.
+
+v3.74 patch15: the mood reading now follows the conversation as it is spoken rather than
+reading it out of a prompt. That is quicker, it is not limited by SkyrimNet's own history
+setting, and it works even if you use the panel only for speech.
+
+v3.74 patch16: the two tagging features are greyed out until you have a server running
+with a language model, and hovering over them explains why. A vision or draft model does
+not count - neither can answer the kind of question these ask.
+
+v3.74 patch17: you can now set up the tagging features before launching the fleet - a
+server counts as soon as it has a language model assigned, and the list tells you which
+are not running yet. The TTS page is also a little more spaced out.
+
+v3.74 patch18: the TTS page is tidier. Settings are grouped under coloured headings, the
+explanations appear when you hover over a setting's name instead of filling the page, and
+both tagging features now have their own Thinking switch beside them.
+
+v3.74 patch19: the tagging features now report in the Proxy terminal alongside the servers,
+so you can see them working and how fast they are. The speech server's own starting and
+stopping messages have moved to the fleet terminal, where the other servers report.
+
+v3.74 patch20: a spoken line that wraps onto two rows no longer breaks the little tree
+beside it. The speech server now reports in the fleet terminal as intended. You can edit
+the instructions sent to the tagging models, see what they answered, and a line the speech
+model fails to finish is tried once more instead of being lost.
+
+v3.74 patch21: the TTS log now names the voice clip used for each line, so if a character
+comes out sounding wrong you can see which sample was actually sent.
+
+v3.74 patch22: the "elated" emotion is no longer sent to the speech engine. Testing showed
+it reliably produced the wrong voice - a different speaker entirely, not just a brighter
+delivery - and often failed outright. A new PTI / PME terminal shows exactly what the
+tagging models were asked and what they replied.
+
+v3.74 patch23: when the speech engine produces a line in the wrong voice, the panel now
+notices and asks for it again rather than passing it on. The two tagging features have a
+thinking budget you can set - previously they were cut off part way through reasoning.
+
+v3.74 patch24: the full set of Higgs voice tags is available again, including the elated
+one - the pitch check added last patch catches a wrong voice regardless of which tag caused
+it. Tags can now also be written by their proper names, which previously ended up spoken
+aloud.
+
+v3.74 patch25: the tagging model now gets worked examples rather than just a word list, so
+your lines can pick up a laugh, a whisper or a sigh alongside the feeling instead of
+stopping at one tag.
+
+v3.74 patch26: the tagging model is now told about two kinds of tag - one for the feeling
+and one for what you would actually hear - rather than four overlapping groups, with an
+explanation and examples of each.
+
+v3.74 patch27: a sound tag is now placed where it belongs in your line rather than at the
+front - a cough falls at the pause, not before the first word. If the model changes your
+wording in any way, the whole reply is discarded and the line is spoken exactly as you
+typed it.
+
+v3.74 patch28: adds an audio.cpp report button that gathers everything an upstream
+maintainer would need about a speech failure. The pitch check is off by default - testing
+showed it rejects about one good take in six.
+
+v3.74 patch29: fixes the Thinking switch being ignored for the two tagging features, which
+made them far slower than intended and made the tag appear after the line was spoken rather
+than before.
+
+v3.74 patch30: fixes the mood reading never reaching the tagging step. It was being
+discarded whenever the model wrote its answer without square brackets, which was most of
+the time.
+
+v3.74 patch31: the PTI / PME terminal now shows just the prompt that was sent and the
+answer that came back, without the model's reasoning mixed in.
+
+v3.74 patch32: fixes a stray mark beside dialogue lines that wrap onto two rows, and gives
+the PTI / PME terminal the same colours as the thinking terminal.
+
+v3.74 patch33: a laugh at the start of a line no longer makes the whole line sound like a
+laugh - the tagging model now places each tag where its feeling begins. The pitch check has
+been removed; testing showed the speech engine was never losing your voice sample.
+
+v3.74 patch34: fixes voice clips that the speech engine refused to read. Some WAV files
+- including a great many of Skyrim's own voicetype samples - record the wrong length
+inside themselves, which most players never notice because ordinary media players read
+past it. The panel already knew how to repair that, but its check for whether a file
+needed repairing looked in the wrong place and passed those files straight through.
+Any such clip is now mended the first time it is used, in place, once.
+
+v3.74 patch35: the mood reader can now run less often. A new PME Frequency setting
+beside Activation says how many NPC lines go by between readings, from every one up to
+every twentieth. The single Player Tag Output button is now two - one for the tagger
+and one for the mood reader - so you can hide the tagger's echo of your own line while
+keeping the reading. Both answers now hang off the line that produced them on a proper
+branch, the way spoken lines already do. The prompt speed column, which read "?" for
+every one of these calls, now shows the real figure the server reports, along with
+exact token counts rather than an estimate.
+
+v3.74 patch36: tidies the TTS page. Sections are named for what they hold - Folder
+Paths, Audio Files, Installation, and a new TTS Server heading over the model and build
+choices, which previously sat under nothing. The build choice is now called Audio.cpp
+Build, its two options are simply Fast and Balanced, and the paragraph explaining the
+difference has moved into the hover mark beside the title like every other setting on
+the page. The dividing rule in the Player Tag System now sits below the tagger's server
+picker, where it separates the tagger from the mood reader instead of splitting the
+tagger in half. PME Frequency now starts at 3 rather than 1.
+
+v3.74 patch37: fixes the mood reader losing half its answer. It could name several
+feelings but only those spelled exactly the way the panel lists them survived, so a
+reading of two feelings often reached the tagger as one - and when a feeling was
+dropped, nothing said so. Every spelling the panel understands is now kept, and
+anything refused is named in the terminal. SkyrimNet's startup ping is no longer
+handed to the tagger as though you had said it; it is recognised before anything else
+looks at the line, and the setting is now called SkyrimNet Ping with a third option,
+Banned, that deals with it in complete silence. Both tagging features gained a
+Priority Over Providers switch, which makes requests to other models on the same card
+wait while the tagger runs. Chat History now starts at 25, and the setting titles on
+the TTS page are white and a size larger.
+
+v3.74 patch38: the tagger and the mood reader are now providers. They appear in Live
+Network like any other, and you choose which server answers them by dragging their box
+onto it - the server pickers on the TTS page are gone, along with their Thinking and
+priority switches, because those live on the provider card now with everyone else's.
+This also means the sampler values you set on a provider finally reach them; they never
+did before, and the panel was quietly forcing one of its own. The TTS page keeps the
+on/off switch, and it is the same switch as the power button on the card.
+
+v3.74 patch39: tidies how the tagger and the mood reader are drawn. Their boxes showed
+a bare colon where other providers show a port; they now read Proxy. The PandorumLLM
+icon appears in place of the plain shape that was showing in their titles, and it is
+larger on the provider page. They sit at the end of the provider list rather than in
+the middle of it.
+
+v3.74 patch40: server cards gain two reasoning settings - a Reasoning budget with a
+slider and a Reasoning format dropdown - which are written into the launcher the panel
+generates, with the usual cross-reference to the Sampler Guide beside each. Whether a
+particular provider actually reasons is still its own Thinking switch. Also restores
+the accent glow on the tagger and mood reader boxes in Live Network, and puts the gap
+back between their icon and their name.
+
+v3.74 patch41: any provider with Thinking on is now told what to do when its reasoning
+budget runs out - it is asked to answer now - rather than only the two the panel calls
+itself. A provider with Thinking off never carries that message, since its budget is
+zero and it would be spoken straight away. The reasoning format is left to the server
+card instead of being forced on every panel request.
+
+v3.74 patch42: fixes speech taking half a minute or more to start, or timing out. The
+startup ping SkyrimNet sends was answered correctly but the reply was never handed back
+to the waiting request, so SkyrimNet sat on its own probe for two minutes and every
+line behind it queued. Anything that failed while preparing a line did the same. Server
+cards also gain a Reasoning dial - on, auto or off - which was previously written into
+every launcher as on with no way to change it.
+
+v3.74 patch43: fixes your own spoken lines failing while everyone else's worked, and the
+empty PTI / PME terminal. Both were one mistake: the tagger still named a variable that
+had been replaced, so it crashed after the model had already answered - the answer never
+reached the terminal and your line was never spoken. The panel now refuses to build if
+any function reads a name nothing defines.
+
+v3.74 patch44: fixes the Action Eval and Diary providers failing with server errors.
+Those two are the ones whose replies follow a fixed shape, and the panel had begun
+sending them an instruction that cut a reply short before that shape was complete. Also:
+a shared voicetype no longer wears the name of the first character who used it, so
+commoners and guards are named correctly, and switching the tagger or the mood reader
+off now hides their lines from the Proxy terminal instead of only stopping new ones.
+
+v3.74 patch45: the tagger's instructions are less than half as long. Every rule it used
+to spell out is still made, but by the shortest wording or by a worked example instead
+of a paragraph. Nothing was dropped from the list of tags it may use.
+
+v3.74 patch46: provider cards gain a Cache switch. A provider with it on gets a slice of
+the server's video memory reserved for its own prompt, so the part that never changes is
+worked out once and reused instead of being recalculated every time. How many slices a
+server has is still yours to set - Parallel slots on the server card - and one is always
+kept for everything that is not cached, so two slots cache one provider and three cache
+two. A provider that asks when none is free says so on its card and tells you what to
+raise. Context size is shared out between the slices, so the card shows what each is
+left with.
+
+v3.74 patch47: every line in the Proxy terminal now ends with how much of that prompt
+the server did not have to work out again - `cache 258/270 96%` when it reused almost
+all of it, `cache 0/270 0%` when it reused none, and `cache ?` when the server does not
+report the figure at all. Those are three different situations and only two of them are
+worth chasing. Also: a character's name can no longer be borrowed by a second voice, so
+one NPC's name stops appearing on another's lines.
+
+v3.74 patch48: if a server runs a launcher you wrote yourself, the panel now edits that
+file in place instead of quietly replacing it with one of its own. Only the argument
+list is touched, and only the settings you changed or that were already there - the
+rest of your script is left exactly as it was, and a copy of the version before the
+panel first touched it is kept in ps1-launchers.
+
+v3.74 patch49: an edit to your own launcher was being made and then not remembered when
+the server was launched from the panel - fixed. Server cards gain a Context checkpoints
+slider. And when a spoken line ends up labelled with its voice file rather than the
+character's name, the log now says which of the two reasons it was.
+
+v3.74 patch50: the server cards and the launcher in the Server Editor are one thing at
+last. A launcher pasted or loaded into the editor was written back exactly as it came,
+so anything changed on a card was recorded and then overwritten by the original. The
+cards now edit the flags inside that text, leaving the rest of it alone, and the file
+that launches is the text you can see.
+
+v3.74 patch51: characters whose name is written with a role after it - Azeeda [hunter] -
+were never recognised, so every one of them spoke under the name of its voice file.
+Fixed. The Cache switches also stop adding a flag that was doing more harm than good.
+
+v3.74 patch52: providers with Thinking switched off were answering with a single full
+stop. Turning thinking off was being done by telling the model to stop thinking
+immediately rather than not to start, so it was cut off on its first word and had
+nothing left to say. Reverted to the method used before patch38.
+
+v3.74 patch53: two characters speaking one after the other could end up wearing each
+other's names - the panel was matching the newest pending name rather than the oldest,
+while lines are spoken in the order they were written. The cache figure in the Proxy
+terminal now appears only for providers that have caching switched on.
+
+v3.74 patch54: server cards lay their settings out in labelled groups with a rule
+between them - GPU, context, batching, CPU, generation - in the same order the launcher
+writes them, so a heading on the card names a block you can find in the .ps1. The
+Proxy terminal's switches move behind a single Options button.
+
+v3.74 patch55: the tagger and the mood reader are now offered the fourteen emotions
+SkyrimNet's own voice prompt teaches its characters to use, rather than every one the
+speech engine will accept. Tags written by SkyrimNet itself are unaffected - an NPC
+line still speaks with whatever it was given.
+
+v3.74 patch56: the tagger and the mood reader now write tags the same way SkyrimNet
+does - [EMOTION-SURPRISE], [SFX-LAUGHTER], [STYLE-WHISPERING] - instead of the panel's
+own shorthand. A marked-up player line is now indistinguishable from a marked-up NPC
+line, and every tag says which kind it is.
+
+v3.74 patch57: a new Thoughts switch, in the Proxy terminal's Options. SkyrimNet asks
+its characters to end a reply with their private reasoning, which is never spoken - it
+now appears on its own line above what they said, under a thought bubble.
+
+v3.74 patch58: the thought now sits above the spoken lines rather than below them, in
+grape with a faint glow so it reads as interior rather than said aloud, and its branch
+carries down through a thought long enough to wrap. Server card group headings are
+white, with the same rule the TTS page draws between its blocks.
+
+v3.74 patch59: the tagger was putting every tag at the end of the line; it is now told
+plainly that a felt tag goes at the start of its sentence and a heard one goes where it
+happens. Pause tags are offered as well. A thought carries the name of the character
+whose reply it came from. The split view terminal gains the same Options button, and
+sits last in the row. The mood reader counts NPC lines globally again.
+
+v3.74 patch60: when the speech model fails to stop at the end of a line it no longer
+costs twenty seconds. Each line is now sent with a length limit of about twice what it
+needs, so a runaway is cut off in a second or two and the retry happens almost at once.
+The model still occasionally overruns - that is the speech engine, not the panel - but
+it is no longer something you wait through.
+
+v3.74 patch61: in split view, each pane now has its own Options button in its top right
+corner, with Timestamps and Insert TTS inside it. It appears only while that pane is
+showing the Proxy feed, and goes when the pane is switched to something else.
+
+v3.74 patch62: the Options menu is now slightly see-through with a soft blur behind it,
+so the log underneath reads as depth rather than as a hole in the terminal.
+
+v3.74 patch63: when a line arrives carrying performance tags and Audio Tags is set to
+strip them, the TTS terminal now says so and names the setting. Your own lines were
+always spoken with feeling because the tagger overrides that setting for the line it
+marked up, so NPC lines arriving flat looked like a fault rather than a switch.
+
+v3.74 patch64: the panel now records each spoken line exactly as SkyrimNet sent it,
+before anything here touches it. Whether a performance tag was removed by the panel or
+never arrived was not answerable before - the terminal only ever showed the line after
+processing, so the two looked the same.
+
+v3.74 patch65: some of the tags SkyrimNet can ask a character for have no equivalent in
+this speech engine and are removed so they are not read out. The TTS terminal now names
+them, so a tag the model spent words on but that never arrives is visible.
+
+v3.74 patch66: the tagger and the mood reader are offered every emotion the speech
+engine has again - anger, fear and disgust among them - and pace and pitch are now
+written the same way SkyrimNet writes them, so a marked-up player line and a marked-up
+NPC line are indistinguishable.
+
+v3.74 patch67: a line that runs away now costs about nine seconds instead of eighteen.
+The speech server ignores the length limit sent with each request, so the limit that
+actually stops it is the server's own - which was fixed at twenty seconds inside the
+panel and is now a setting on the TTS page, defaulting to nine.
+
+v3.74 patch68: a TTS Backend Settings block on the TTS page - temperature, top-k,
+top-p, repetition penalty and the audio token ceiling. Temperature is the one that
+decides how OFTEN a line runs away; everything before this only decided what it cost.
+Every overrun is now also written to eoc-events.json with the settings in force at the
+time, and that file survives restarts - it is what a calibration will be measured
+against.
+
+v3.74 patch69: fixes the TTS server refusing to start on patch68. The speech engine
+checks the options it is given and stops if it does not recognise one, so the panel now
+sends none of them unless you hand it the backend - a new Settings Owner choice, SN Side
+or Proxy Side. If the server ever does refuse a name, the panel reads that name out of
+the refusal and starts again without it. Sampling Rate joins the backend settings.
+
+v3.74 patch70: changing the model on a server card now reaches a launcher you wrote
+yourself, including one that names the file through a variable. And a new Actions switch
+shows what the action evaluator picked for a character - Serana > bathe - in the Proxy
+terminal.
+
+v3.74 patch71: the speech engine will not accept sampling settings from the panel, so
+those controls are removed rather than left there looking useful. What remains is the
+one thing the panel can change - how much text it hands over at once - and the record
+of overruns now measures against that.
+
+v3.74 patch72: SkyrimNet sends more with each spoken line than the panel reads - a list
+of arguments of which two are used and the rest were discarded unseen. Any speech
+setting SkyrimNet has of its own is in that list, so the panel now writes the whole of
+it down once per line. Values are never printed for the voice reference.
+
+v3.74 patch73: the Proxy terminal gains a Providers button - each provider shown by its
+own mark, lit when its lines are being shown and dark when they are not - and a Row
+spacing choice in Adjust for blank rows between one record and the next. An action line
+now reads with the character in magenta and the action in cyan.
+
+v3.74 patch74: the sliders on SkyrimNet's own TTS page were doing nothing. It sends them
+with every line and the panel was throwing them away before calling the speech engine.
+Temperature, Top P, Min P and Repetition Penalty are now passed on. A new TTS
+Diagnostics section shows what SkyrimNet is asking for beside what has actually gone
+wrong.
+
+v3.74 patch75: the choice of whether SkyrimNet's speech settings are passed to the
+engine now has a control, in the TTS Diagnostics section beside the explanation of what
+it does. It was a setting with no way to change it.
+
+v3.74 patch76: EOC Calibration. Give it a line and a few chunk sizes and it speaks the
+line at each of them, counts how often generation runs past its own end, and names the
+size that held up best. It speaks through the same path a game line takes, so the
+numbers mean the same thing. Also fixes the seed being shown wrong - it is larger than
+a browser can hold as a number.
+
+v3.74 patch77: a Diagnosis section under the calibration. Pick one of your own servers -
+only those actually up with a model are offered - and it is handed the observed
+settings, the overrun record and the last sweep, and asked what it makes of them.
+
+v3.74 patch78: TTS Diagnostics, EOC Calibration and Diagnosis become one section, TTS
+Calibration, with one terminal shared between them that can be dragged larger from its
+bottom left corner. Diagnose asks one of your servers what the collected data shows;
+Calibrate then asks the same server what to change and applies whatever comes back
+within its bounds. Diagnose has to run first.
+
+v3.74 patch79: fixes the Proxy and Split View terminals falling behind or going blank,
+the calibration terminal clearing itself when Diagnose was pressed, and moves its resize
+handle to the bottom right. Diagnose and Calibrate now show that they are working.
+
+v3.74 patch80: the Proxy terminal working for a few minutes and then stopping, and Split
+View never working at all, were the same fault as patch79 fixed - in a second place
+that runs for everybody by default rather than only when a setting is changed.
+
+v3.74 patch81: the terminal was not stopping - everything after the first spoken line
+was being joined onto the same row, which then ran off to the right where nobody could
+see it. Every row is now its own block and there is no case left where one can be
+joined to the next.
+
+v3.74 patch82: the Proxy and Split View terminals work again. The filter that decides
+which lines to show was built from a text pattern that arrived damaged, so painting the
+terminal failed every time and it simply never updated. It matches by hand now, with no
+pattern to be damaged.
+
+v3.74 patch83: the terminal that patch82 brought back froze again the moment an action
+row appeared - the lines that show which action a character chose. Colouring those rows
+asked for colour names that live inside a different painter, and the browser stops a
+paint at the first name it cannot find, so from that line on nothing updated. The names
+live in one shared place now that every painter can see. Three colour rules that had
+never worked a day also start working: port numbers in the terminals, the [hh:mm:ss]
+stamps in the thinking view, and [type] names in the launcher editor - all three were
+written with a bracket form that JavaScript quietly reads as a class that matches
+nothing.
+
+v3.74 patch84: choosing what a character does is really two questions - first a broad
+category, then the exact action inside it - and the terminal used to show them as two
+unrelated rows, with the second one blamed on 'someone'. They read as one branch now:
+the category row stays open, the follow-up closes it with the chosen action and its
+details, both under the character's real name, and the follow-up's record wears the
+provider's name with a small drill arrow, so hiding a provider in the filter hides
+its drilldowns with it.
+
+v3.74 patch85: every spoken line is now measured - characters in, seconds out - and
+an automatic calibration can turn that into a per-line token allowance, chosen on the
+TTS page: a plain algorithm using the measured speech rate, a model asked before each
+line (the algorithm stands in whenever it cannot answer within three seconds), or a
+model-fitted median the panel then applies by arithmetic alone. Every mode stays
+inside the runaway guard and the lead-in floor, and Off leaves everything exactly as
+it was. The manual Diagnose and Calibrate remain and now see the measured lines too -
+the record used to hold only the failures, which is why a diagnosis kept answering
+that there was not enough data.
+
+v3.74 patch86: the realtime figure had been swallowing the panel's own preparation -
+above all the player line tagger's model call, a quarter to half a second - and
+billing it as 'overhead (http + wav)', which read as the transport slowing down by a
+quarter. Realtime now measures synthesis alone, exactly what it measured before the
+tagger existed, and the preparation is shown on its own line with the tagger named.
+The tagger also remembers its last 32 answers, so a repeated line - the TTS test
+repeats one a dozen times, and play repeats short barks - is tagged for free. The
+config file is parsed once per change instead of several times per spoken line, and
+the measurement record appends one line instead of rewriting itself each time.
+
+v3.74 patch87: the automatic calibration now shows its work. Every calculation is
+written to its own terminal on the TTS page, coloured like the Proxy terminal, with
+the estimate, the headroom and the bound that decided the final number. Two buttons
+beside it show the exact arithmetic and the exact prompts, read-only, with a copy
+button. The spoken-line report also itemises everything the panel spent before the
+engine was asked - player tags, mood, the token estimate, and the rest.
+
+Also in patch87: the 'margin' setting is now called headroom and defaults to auto.
+A token cap is a stop-loss, not a target - the engine stops when it decides the line
+is finished, so a smaller cap does not make speech shorter or faster; it only decides
+what a runaway costs, and set below what a line really needed it turns a good line
+into a failed one that has to be generated again. On auto, the headroom is worked out
+from how wrong the estimate has actually been on this machine rather than from a
+number typed in, and every spoken line now reports how close the estimate was.
+
+v3.74 patch88: the TTS page had two terminals and the page was rebuilt every few
+seconds, which wiped what they were showing and put them back to their default size -
+the flickering. There is one terminal now, carrying the calculations, the data, the
+diagnosis and every change a calibration made, in the order they happened; the page
+is only redrawn when something it shows has actually changed, so the terminal keeps
+its text, its scroll and the size you dragged it to. It starts hidden behind a Show
+the record button, and that choice is remembered.
+
+Also in patch88: Algorithm and Prompts now open over the page rather than filling a
+terminal, each with a copy button. And the automatic calibration has a live bar
+showing where the last spoken line actually went - the tag injector, the mood note,
+the token estimate, the panel, then the engine's own generate, codec and transport -
+colour-coded, with each band named and valued above it. A Tokens view shows the same
+line as tokens used, headroom left unused, and the distance to the runaway guard.
+Click a band and it explains what it is. It fills in as lines are spoken.
+
+v3.74 patch89: both bars are shown at once now, time above and tokens below with a
+line between them, so the two questions can be read together.
+
+Also in patch89: the automatic calibration has three settings instead of four - Off,
+Proxy and LLM. Proxy does the arithmetic here and asks no model at all; LLM asks one
+for each line and refits itself as it goes, on a slider you set between every 5 and
+every 250 lines. The old 'LLM-derived median' is not gone, it has become a choice
+inside Proxy: run LLM for a while (or press Derive now), then switch to Proxy and
+tell it to use the values the model fitted - calibrated by a model once, running
+without one afterwards. Settings saved by earlier patches keep doing exactly what
+they did.
+
+v3.74 patch90: the bars are back. patch89 split the one bar into two and renamed its
+pieces, but the check at the top of the code that fills them still asked for the old
+name - so it gave up before drawing anything, and both bars stayed empty with nothing
+reported anywhere. The panel now refuses to build if any part of the page looks for
+something by a name nothing creates.
+
+Also in patch90: the Derive now button is gone. Fitting is automatic in LLM mode on
+the slider you set, so a button doing the same thing by hand was a second way to do
+one thing. Proxy mode no longer offers a server to pick either - it asks nothing of a
+model by definition, and the values it can read are made by LLM mode.
+
+v3.74 patch91: a new Speech sampling section on the TTS page, with the same chips the
+provider cards use - temperature, top_p, min_p and repetition penalty. Set one and it
+is sent with every line, over whatever SkyrimNet sends; leave it empty and SkyrimNet's
+own value passes through. This matters because the token cap only decides what a
+failure costs, while the sampler decides how often there is one.
+
+Every line spoken now records the sampler it was spoken under, whether it finished or
+ran past the end, so the record can tell you the failure rate for each setting - shown
+in the data block, worst first. That is the first time this question could be answered
+at all: the sampler was never written down before.
+
+Also in patch91: a retry no longer repeats the settings that just failed. It drops to
+a steadier profile - cooler, no repetition penalty, nucleus truncated - because a
+retry only has to finish, and the retry is the take you actually hear. There is a
+switch for it. And a fault worth naming: when a runaway was recorded, the panel wrote
+down the old fixed limit instead of the limit actually in force, so the record a
+calibration reads held a number no request had ever used.
+
+v3.74 patch92: nothing asks a model about a line any more. LLM mode now differs from
+Proxy in one thing only - where the speech rate comes from - and the model is asked
+for that rate periodically rather than for every line. Measured on the same sentence
+spoken over and over, the per-line answer wandered by 14% with no new information in
+it, cost about a third of a second each time, and agreed with the fitted rate anyway.
+
+That fit now waits for a quiet server. It will not start while the chosen server has
+anything open, or while a line is being spoken; if the server stays busy it gives up
+and tries again after the next batch of lines. Once a fit is away it runs to the end -
+which is why the waiting happens before it rather than around it.
+
+And a new Auto Calibration button beside the sampler chips. It reads the failures on
+the record, says what they show, and then changes the sampler settings they point at,
+keeping only values inside their allowed range. It refuses to run when nothing has
+failed yet, because there would be nothing to read and changing settings would be
+guessing. The three server pickers on this page are now one.
+
+v3.74 patch93: the safety margin is no longer something to type in. There is no box
+for it and no setting behind it - the panel works it out, and three things it was
+getting wrong are fixed.
+
+It now only judges itself on lines where its estimate actually decided the limit. A
+short line is covered by the minimum whatever the estimate said - one of yours was
+estimated at 14 tokens and used 34 - and counting those was pushing the margin up on
+the strength of lines where the estimate was never in charge.
+
+A line that ran past its limit now counts too, as 'needed at least this much'. Before,
+only lines that finished were counted, so the record was made of survivors and read
+lower than the truth exactly where it mattered. Losing a line now widens the margin,
+which is the direction that stops lines being lost.
+
+And the panel now fits the measured lines itself, by least squares. That fit is given
+to the model as a starting point and used to judge what comes back: an answer that
+predicts your machine worse than plain arithmetic does is not kept. Ten fits in a row
+had come back claiming there is no breath before the first word, when there plainly
+is one.
+
+v3.74 patch94: the panel gives a model two different TTS jobs - fitting the speech
+rate, and reading the failures to choose sampler settings - and each now has its own
+server and its own thinking switch. A small quick model can do the first while
+something that reasons does the second. Thinking starts off for both: these are short
+questions with a strict answer shape, and a reasoning block in front of the answer is
+the commonest way one comes back unusable. Setting one and leaving the other empty
+still works - the empty one borrows the server you picked.
+
+Also in patch94: when thinking is off, the request now carries every form of saying
+so - the chat template setting, the plain one some builds read instead, and the one
+SkyrimNet itself sends. Builds disagree about which they honour and none of them mind
+an extra. And a server card set to Reasoning off now silences the request as well as
+the server: some models ignore the launcher flag and only honour the per-request
+setting, so a provider asking to think on such a server no longer gets to.
+
+v3.74 patch95: a note on where to look for the above. Turning Reasoning off on a
+server card writes --reasoning off into the launcher, and that is the only part of it
+a .ps1 can carry - the rest travels with each request, not with the command line, so
+there is nothing further to see in the launcher no matter what is set. The Proxy
+terminal now says so when it announces a provider on such a server, and the warning
+triangle on the provider card explains what the panel is actually sending.
+
+v3.74 patch96: and the launcher does carry it after all. llama.cpp has a server flag
+for this - --chat-template-kwargs - so turning Reasoning off on a server card now
+writes a second line into the reasoning paragraph beside --reasoning off:
+
+v3.74 patch97: fixed dialogue lines that began with spoken "channel thought
+channel" on Gemma 4 models such as Prosopon. When a server's launcher already
+says --reasoning off, the panel no longer restates it inside every request:
+Gemma 4's own chat template handles the no-think turn, and the restatement
+made the model write its thinking markers into the answer, which TTS then
+read aloud. Requests to such a server now pass through exactly as SkyrimNet
+sent them - the same thing calling the server directly does. Servers whose
+launcher leaves reasoning on or auto are unchanged: the per-provider Thinking
+switch still turns it off per request there.
+
+v3.74 patch98: the automatic refit runs again, and the panel's own model calls
+are visible. The refit reads the server picked under Automatic calibration, and
+that picker used to draw a server whether or not one had ever been saved - so
+after a fresh config it showed a choice the panel did not have, and every refit
+was skipped without a word. The picker now says "- pick a server -" until one is
+chosen, the page warns beside the refit interval when there is none, and a refit
+that is due but cannot run writes the reason into the calibration feed instead of
+returning in silence. If your refits stopped, open Automatic calibration and
+check that row. Separately, the fit, Diagnose and Calibrate now appear in the
+Proxy terminal as ordinary generations - marked Speech Fit, Diagnose and
+Calibrate, with their tokens, speed and time - and count in the server
+statistics, because the server did the work.
+
+v3.74 patch99: patch97 is reverted, and Thinking ON now actually says so.
+Patch97 stopped the panel repeating "do not think" to a server whose launcher
+already said --reasoning off. It did not fix what it was written for, so it is
+gone and requests carry that instruction every way again, as they did up to
+patch96. The real fault was on the other side: turning Thinking ON only REMOVED
+the off instruction and left the rest to the server, and a server defaults to
+not thinking if it was started with --reasoning off or if the Reasoning dial
+ever wrote its --chat-template-kwargs line into that launcher. That line is only
+removed by setting the dial back to on, so a card whose setting was lost - a
+fresh config, an imported launcher - left it behind with nothing reading it,
+no warning shown, and the Thinking switch doing nothing at all. Thinking ON now
+sends enable_thinking=true, which overrides both the launcher flag and that
+line. If your servers stopped thinking, this is the patch. Worth checking your
+launcher for a stray --chat-template-kwargs line as well.
+
+v3.74 patch100: the cause of the spoken "channel thought" is found, and the
+automatic refit keeps its place across restarts. The server card dial Reasoning
+format was on "none" for that server: llama.cpp leaves the model's thinking in
+the visible answer at that setting instead of splitting it off, so a model that
+writes thought markers hands them over as text and TTS reads them aloud. The
+dial now carries a warning beside it whenever it stands on that value. Use auto
+or deepseek unless you want the raw stream. Separately: the refit counted lines
+from zero every time the panel started, so a long interval and a panel restarted
+often could leave a fit due forever - lines measured before a restart now still
+count. And the page shows what the LAST ATTEMPT came to, not only the last fit
+that was kept: never tried, no server picked, the server stayed busy, or offered
+and refused for predicting worse than the panel's own arithmetic all read the
+same before, and read differently now.
+
+v3.74 patch101: the Higgs install bar moves while it installs. The progress bar
+and the step line above the TTS terminal were only redrawn when the whole page
+state reloaded, which is why switching tabs or refreshing appeared to fix them -
+the install was announcing itself to the terminal alone. Also: the unlabelled
+switch under Speech sampling is now named Steady retry. It decides whether a
+retried line drops to a calmer sampler - temperature down a fifth, repetition
+penalty off, top_p capped at 0.9 - so a second attempt aims to finish rather
+than to perform.
+
+v3.74 patch102: the Higgs install bar really moves now. Patch101 made the panel
+announce each step, which was necessary and not sufficient: the page turns an
+announcement into a QUEUED reload, and a queued reload waits until nothing is
+busy - during an install something always is, so it never landed. Switching tabs
+appeared to fix it because a tab change reloads immediately, past that gate. The
+bar and the step line now read a small endpoint of their own every 0.7s and write
+themselves in place, with no page redraw and nothing to wait for. When the
+install stops, the page reloads once to show what it came to.
+
+v3.74 patch103: the install bar kept its own progress loop but threw it away the
+first time it could not find the bar on screen - which happens a few seconds
+after every page load, when the model list finishes scanning and redraws the
+page from a state older than the install. That is why it ran for several seconds
+after a refresh and then stopped for good. The loop now stops for one reason
+only - the install stopping - draws the row again if it has gone missing, and is
+restarted by every state load, so it cannot be lost.
+
+v3.74 patch104: the install display is redrawn whole every couple of seconds, by
+the same call a tab change makes - the one path that was always seen to work.
+Writing the two nodes directly is kept as the quick path, but it is no longer
+relied on: a node addressed by name can be the wrong one or missing, and every
+such failure looks the same from the outside - the numbers stop. The step line
+also reports how long the install has been silent, so a display that has stopped
+asking can be told apart from an install that is simply between steps: if the
+seconds are counting up, the page is alive and the installer is quiet.
+
+v3.74 patch105: two ways the install display could stop and never start again,
+both removed. A tick that failed - and a tick may redraw the page, which can fail
+- skipped the line at the bottom that schedules the next one, so one bad tick was
+the last. That line now runs whatever happens. And the flag that stops a second
+loop starting was left set by the dead one, so every attempt to restart was
+refused until the page was reloaded by hand; it carries a timestamp now, and a
+loop that has not ticked for three seconds is replaced. The step and bar are also
+written by attribute to every copy of the row that exists rather than to the one
+a lookup by name happens to return, which can be a leftover off-screen copy -
+indistinguishable, from the outside, from not writing at all.
+
+v3.74 patch106: the install display was right and the installer was quiet. The two
+places it appeared to hang are the two places nothing was being reported: from
+pressing the button until the first download can quote a percentage, and the
+whole unpacking step, which ran in complete silence and takes a while on a
+Windows disk with a scanner in the way. Unpacking now reports itself once a
+second with a percentage of its own, pressing Install draws the running row
+immediately instead of after a round trip, and a phase with nothing to count -
+asking github, clearing a folder - shows a moving striped bar rather than one
+frozen at zero, which looked exactly like a bar that had stopped.
+
+v3.74 patch107: the install display is fixed at the actual cause. The TTS page
+skips redrawing when a signature of its contents has not changed, and that
+signature did not include the installer at all - so pressing Install changed
+nothing the page compared, the redraw was declined, and every later attempt to
+show the row was declined the same way. A refresh drew it because an empty page
+always draws. The signature now covers the install and the found-install rows;
+the percentage and step line stay live through the direct writes, which have
+worked all along once the row existed. The five earlier patches remain: each
+fixed a real defect that this one was hiding behind.
+
+v3.74 patch108: the calibration corner of the TTS page is one section. Automatic
+calibration leads it; the model that reads the failures sits directly below the
+fit model, each with its thinking switch beside the dropdown. The Speech sampling
+block lives inside it behind one switch, Automatic sampler calibration: on shows
+the sampler settings AND lets the every-N automatic run read the failure record
+and change them; off hides the settings and stops the automation. Values already
+set keep applying to every line either way - the switch governs the panel and
+the automation, never your settings. The Auto Calibration and Calibrate buttons
+are gone; their work is the second half of the automatic run. Diagnose remains,
+placed directly above the record it reads from and writes to.
+
+v3.74 patch109: the Automatic Calibration area is laid out like the Player Tag
+System one. Each setting is a white title with a "?" that explains it on hover -
+including what each choice in the menu does - followed by its menu, the model
+that carries it out with its thinking switch, and the button that shows what
+will be sent. Automatic Calibration reads Fixed, Proxy Algorithm or LLM
+Controlled: LLM Controlled shows the model and a Prompt button, Proxy Algorithm
+shows the Algorithm button, Fixed shows neither. Sampler Calibration below it
+reads Manual or LLM Controlled, with the samplers under it either way - Manual
+means you move them, not that they stop being sent. The headroom reading now
+sits directly above the bars it explains, under a rule of its own, in lit white
+rather than grey. The grey explanation paragraphs are gone; everything they said
+is in the tooltips.
+
+v3.74 patch110: each calibration setting keeps everything its choice brings with
+it on one line. The middle cell had a fixed width, so the server picker could not
+fit and dropped onto a row of its own, away from the setting it belongs to. The
+row no longer wraps and every cell in it may shrink instead, the picker included.
+LLM Controlled now reads across as: the choice, the server with its thinking
+switch, the refit interval, then Prompt. Proxy Algorithm: the choice, the speech
+rate menu, then Algorithm. Sampler Calibration is the same shape. The readings -
+the fit that was kept, the attempt that was made - sit under the row rather than
+in it, because they report rather than set. The picker is titled Server, not
+Model, matching the wired-server box on the same page.
+
+v3.74 patch111: the calibration rows line up. The server menu was drawn with a
+trimmed padding that the setting menu beside it does not use, so it stood shorter
+and a little higher than the control it is meant to match - it is the same
+control now, and Automatic Calibration and Sampler Calibration are the same three
+cells in the same sizes. The Refit Interval went back under its own menu. The
+thinking switch is labelled and spaced like the one on a provider slot, and its
+word can no longer break onto a line of its own. The two grey fit lines are gone:
+what they said now joins the headroom reading above the bars, which is where the
+numbers they describe end up. Titles are bold.
+
+v3.74 patch112: the calibration rows hold their line. The server menu no longer
+grows into whatever space the card has spare - it is capped, with the full name
+in the opened list and dots when the closed box runs short - and a spring between
+the settings and the Prompt button soaks up the surplus instead, so nothing rides
+the card's edge any more. Every control in the row is the same height, the
+thinking switch sits centred on that line with its word held clear of it, and the
+setting menus fit their cells exactly instead of being pushed wide by the
+page-wide select minimum. The Refit Interval slider moved under its title.
+
+v3.74 patch113: the calibration rows, actually. Every dropdown on the page is
+drawn by a stand-in element that copies the menu's classes and nothing else, so
+patch112's widths were being set on something invisible while the stand-in sized
+itself to the longest model name it held - which is what pushed the Thinking
+switch and the Prompt button out past the card. The server menu is a fixed 300px
+now, with the full name in the opened list and dots when the closed box runs
+short, and the switch sits beside it inside the card, on the same line and at the
+same height as the setting menu. The Prompt buttons are gone from both rows, and
+with them the prompt-text view they opened; the Algorithm button under Proxy
+Algorithm stays.
+
+v3.74 patch114: the two menus in each calibration row now start on the same line
+as each other, and the word Thinking stands clear of its switch. Both had been
+asked for twice and arrived wrong twice: the row was finding its own height, so
+the switch label - a little taller than the menu beside it - pushed that menu
+down inside its own cell while the title above stayed where it was; and the space
+before the word was written as a flex gap, which does nothing unless the box it
+is on is a flex box. The row is a fixed 32px in every cell now, and the space is
+a margin on the switch, which applies either way.
+
+v3.74 patch115: the TTS Calibration page, renamed and rearranged. The section is
+TTS Calibration, the menu picks the Calibration Method, the bars sit under
+Monitoring with the headroom reading under the title at twice the size, and the
+record is the TTS Calibration Terminal with Diagnose on its own button row. Fixed
+mode is now a slider: how many tokens one character may cost, 1 to 25, with a
+Reset to Higgs Default button that puts back 3.5. SkyrimNet's Own Settings is
+gone - whatever arrives with a line is always passed on and then overwritten by
+what you set, or by what the model sets. And all four sampler chips show a value
+now: they were being handed the settings under their engine names while asking
+for them under their short ones, so two of the four could never match.
+
+v3.74 patch116: the headroom line is back to a caption size, one step up from
+where it was; Steady Retry moved next to the sampler chips; and the player is
+called by name in the Proxy Terminal. That last one: the name is read out of a
+"## <name>'s Party" heading in a dialogue request, and the panel was only looking
+at the first 256 KB of it. On the stock prompt the heading is well inside that; a
+long memory block pushes it past, and then the name is never learned and every
+spoken line says "Player" - while the thought under a reply, which takes its name
+from a different line of the same request, reads correctly. The whole request is
+searched now, and if the heading still is not there, the panel log says so once
+and prints the headings the prompt did use.
+
+v3.74 patch117: the headroom reading is now a row of small lit boxes instead of
+one long sentence - headroom, worst line, pad, scored lines, runaways, the LLM
+fit, and the last attempt with the time it was made. They sit centred under the
+Monitoring title and wrap to a second row on a narrow window. Each box explains
+itself on hover. Under eight scored lines it says seed, and how many of the eight
+it has. The numbers are sent to the page as numbers now; the sentence the
+terminal prints is built from those same numbers, so the two cannot disagree.
+
+v3.74 patch118: the calibration actually calibrates again. Measured over a day's
+logs, the fixed 128-token floor and the guard were deciding three caps out of
+four, so the fitted speech rate barely mattered - and one runaway on a short,
+floor-decided line was mis-scored as a 7.4x estimator miss, which pinned the
+headroom at maximum and inflated every cap after it. The floor now scales with
+the line (half the guard, never above the old 128, never below a 48-token
+warm-up), failures are scored by the same rule as successes and record which
+bound decided them, and the fit model is shown the same lines it is judged on.
+In practice: short lines get caps near their real need, the fit decides mid-size
+lines instead of the floor, runaways cost less, and the headroom settles around
+1.3 instead of pinning at 2.5.
+
+v3.74 patch119: every generation line in the Proxy terminal can be opened - click
+the emoji and provider name and the request that was sent and the reply that came
+back appear side by side over the page, with the reasoning under the reply when
+there was any. The last 80 pairs are kept, in memory only; nothing is written to
+disk. And the LLM fit works on a thinking card now: the fit call was giving the
+model 60 tokens in total, which a thinking model spends entirely inside its
+reasoning block, so the visible answer was always empty - the panel's own calls
+now budget the thinking and keep room for the answer after it, and when a fit is
+still refused, the calibration terminal prints what actually came back.
+
+v3.74 patch120: what a model fits from your measured lines is called the TTS
+Calibration now, everywhere - the box under Monitoring, the speech-rate menu, the
+per-line working, the terminal record. Each calibration row also gained a slider
+next to its Thinking switch: how many tokens that model may spend thinking, 500
+to 10000, before it is told to answer. And every box under Monitoring explains
+itself on hover - what the figure means, where it comes from, and what the panel
+does with it.
+
+v3.74 patch121: the clickable terminal records look like the terminal again - no
+underline, no restyled text; the button appears as a soft accent pill only when
+the mouse is over it. The rows line up: every record's emoji sits in a fixed-width
+cell and the name column fits the longest name, so the ports and numbers share
+their columns whatever the mark. The TTS Calibration record carries the glowing
+PandorumLLM icon, like PTI and PME. And the opened request/reply window is colour
+coded: JSON keys and values in their own colours, the prompt laid out as real
+lines with its headings and bold runs lit, tags in gold and internal thoughts in
+grape on the reply side.
+
+v3.74 patch122: the Proxy terminal looks like itself again - patch121's fixed-width
+mark cell assumed a timestamp at the start of every line, so with Hide Stamps on
+the provider names fell into that little cell and wrapped two letters at a time.
+The mark is recognised by what it is now, so the layout holds with stamps on or
+off. And things move instead of snapping: a new terminal record fades and rises
+into place, and the Monitoring bars ease their segments to new widths on every
+spoken line rather than jumping.
+
+v3.74 patch123: quitting the panel now closes the TTS server even when a panel
+restart happened in between - servers running on the panel's own config file are
+found and stopped as process trees, and only those; anything you started yourself
+is never touched. The Thinking switch and its budget slider each sit under their
+own white title in both calibration rows. The Monitoring block stops blinking on
+refresh: the pane is seeded from the last known reading before any fetch, and
+nothing rewrites content that has not changed. And the player's name is learned
+from a third place - the player's own thought prompt - then handed to PTI and PME
+so the tagger and the mood reader know who is speaking; spoken lines in the Proxy
+terminal carry the name from the moment it is learned.
+
+v3.74 patch124: the Proxy terminal breathes where something was said - a record
+with thoughts, spoken lines or actions under it gets your row gap before and
+after, and plain records sit tight. And quitting finally takes the TTS server
+with it, every way out: the exit now runs exactly what the TTS page's Stop
+button always ran - stop the process the panel started, then whatever owns the
+TTS port - before the fleet shutdown, and both Ctrl+C and closing the console
+window trigger it. Works on machines with only Windows PowerShell as well.
+
+v3.74 patch125: the Proxy terminal reads tighter - plain rows close up while the
+air around spoken bundles stays - the tree elbows are honest (a single branch is
+a turn, not a tee), action rows line up with spoken rows, and generic NPCs like
+"Hunter [Bandit]" are named Hunter instead of "someone". And under Player Tag
+System there is a new Audio Tags board: every tag the built-in prompts offer as a
+small lit button. Click one to turn it off - it leaves the built-in PTI and PME
+prompts, their examples and their filters - and click it again to bring it back.
+Custom prompts are never touched; a yellow chip says so when one is active.
+
+v3.74 patch126: three finishes on those newest pieces. The built-in wording in
+the prompt editors sits in its own read-only field with a copy button in the
+corner; the yellow Custom Prompt Active chip stands beside the Audio Tags title
+rather than under it; and each tag group - Emotion, Audio - is titled above a
+bordered field of its own, like a text field that holds buttons.
+
+v3.74 patch127: the Proxy terminal's row rhythm is finally what was asked for -
+and the culprit was the emoji. A colour emoji is taller than the text line, so
+every record row was quietly growing to the emoji's height while everything else
+tightened. The mark cell now has a fixed height, plain rows keep a short breath
+below them, a bundle's rows sit tight, and the air at a bundle's edges is the
+longest spacing on the screen.
+
+v3.74 patch128: the TTS speed regression is found and closed - the automatic
+calibration could start its long model call in the split-second between two
+spoken lines and then share the card with everything that followed. Background
+jobs now wait for real silence, never for an instant. Monitoring shows two new
+boxes, speed (median realtime factor) and retries, so the engine's pace is a
+number you can watch. And a new GPU Clock Hold switch under TTS Server can lock
+the card at its maximum clock while the server runs (needs administrator,
+released on stop and on exit), so short lines stop paying the idle-clock ramp.
+
+v3.74 patch129: the row spacing finally lands where you read it. The Proxy
+Terminal page is the maximized view, and it had a line-height of its own that
+quietly overrode every rhythm change of the last few patches. That override is
+gone: one rhythm everywhere - tight plain rows with a short breath, bundles
+close together, the longest air at a bundle's edges.
+
+v3.74 patch130: the Proxy Algorithm is the standard calibration now, and it does
+everything itself - refitting the speech rate by least squares every few lines
+and stepping the samplers from the failure record, one bounded notch at a time,
+each change logged with the numbers behind it. No model, no server, no waiting
+for a quiet moment: arithmetic cannot contend with speech. The LLM method stays
+as an option. The headroom is now a percentile rather than the single worst
+line, the measured record is read from memory instead of re-parsed per line, and
+the tag board is titled Player Audio Tags.
+
+v3.74 patch131: the plain rows finally stand at the same height as everything
+else. The last grower was the mark cell's alignment - a baseline-aligned cell
+hands the row its internal, emoji-tall baseline however small the cell is
+made, so the cell is now top-aligned and contributes only its own height.
+Bundle rows were never affected, which is why each earlier fix looked right
+below and wrong above.
+
+v3.74 patch132: a second tag board, Allowed Tags, sits under the Audio Tags
+setting - the final word on what reaches the engine. Every tag Higgs
+understands is a button: click one off and it never gets sent, whether it
+came from an NPC line, the player tagger, or an [angry]-style alias - and a
+blocked sound effect takes its written-out sound with it. The Player Audio
+Tags board still decides what the models are asked for; this one decides
+what the engine is sent.
+
+v3.74 patch133: the Proxy terminal rhythm was settled by running the panel's
+own display pipeline outside the browser and reading what it produced: two
+real faults, in text, not styling. Bundles that touched stacked their blank
+rows double, and the player's own arrow-marked spoken lines did not count as
+response rows at all, so they broke their bundle apart and spaced like plain
+records. One shared classifier fixes both: blanks now exist only at bundle
+edges, one run at a time. Also fixed: the Audio group's tag buttons toggle
+(a case mismatch ate the click), a separator line sits above Player Audio
+Tags, and the Allowed Tags board hides itself while Strip is selected.
+
+v3.74 patch134: the terminal rhythm finally shows - the Row Spacing default
+was None, and None rendered the raw log file untouched, blank lines and all,
+so none of the spacing work ever ran on a default setup. The default is now
+1 row, None means truly flat, and a Copy raw tail button in Adjust captures
+the feed for any future report. And Tag Limits: on both tag boards, a Tag
+Limits button lets you click any tag and choose how many of that character's
+own turns must pass before the tag can be spoken again - the player by
+player turns, each NPC by their own - with Save and Reset beside it. No
+more NPCs laughing in every single line.
+
+v3.74 patch135: the panel now notices its own updates - a page left open
+across an update reloads itself once, so fixes reach every tab instead of
+only freshly opened ones (hard-reload each open tab once after THIS update;
+it is the last time that is ever needed). Spoken lines in the TTS and Proxy
+terminals replay on click - a soft glow on hover, a pulse while the audio
+plays - served from the same kept files the engine already writes. And the
+tag-limit boxes open a small < N > stepper under the clicked tag instead of
+cycling, with the green count badge kept right where it was.
+
+v3.74 patch136: the Proxy terminal is back to plain, even spacing - one
+uniform row height for everything, no special rules, and the Row Spacing
+control is gone with them. Replaying a spoken line now works across a
+two-PC setup: open the panel in a browser on the SkyrimNet machine and the
+click plays there, on the speakers that normally carry the TTS. The tag
+limit stepper's arrows are now full-size with the same accent glow as the
+rest of the panel's buttons.
+
+v3.74 patch137: server cards keep their first row - title, port, status and
+the close stay on one line, long titles trim themselves, and automatic names
+read Server (N): <gpu>. A small version badge sits in the page's corner
+naming the page you are actually running - a tab with no badge is an old
+page and wants closing. And clicking a spoken line now plays it on every
+open panel page at once: host and the remote view on the game PC alike,
+each through its own speakers.
+
+v3.74 patch138: installing Higgs now shows its folder paths the moment the
+install finishes - no page reload needed. And the panel ships tuned the way
+it is meant to be played: audio tags pass to the engine, the mood reader
+runs every 5th NPC line, sampler calibration is Automatic, the startup ping
+is No, and the Proxy translates for SkyrimNet (the option is named The
+Proxy now). Settings you have already saved stay exactly as you set them.
+
+v3.74 patch139: the Proxy terminal's record rows now stand exactly as tall
+as the dialogue rows - the record mark cell is styled identically to the
+spoken rows' cell, the one that was always tight. And the server cards keep
+their shape: the title row holds only the title, rename and close, while
+the port - now a quiet grey capsule - and the HTTP status sit on their own
+row beneath.
+
+v3.74 patch140: the Proxy terminal spacing is fixed at the true root - a
+single carriage return. Windows log lines end in CR+LF; the page kept the
+CR and the browser turned it into a second, empty line inside every file
+row, which is why records looked double-spaced while spoken lines sat
+tight. The panel now scrubs it before painting, in every terminal. Rows of
+every kind finally stand at one uniform height.
+
+v3.74 patch141: the terminal rows were rebuilt from scratch. Every row is
+now a fixed-height, single-line box - nothing that arrives in the log, and
+nothing drawn inside a row, can make it taller. Long lines scroll sideways
+like a real terminal. Records, branches and dialogue all stand at exactly
+one uniform height, guaranteed by the shape of the row itself.
+
+v3.74 patch142: long lines wrap again - dialogue hangs neatly under its own
+first line with the tree connector reaching the full row - and the glow and
+pulse effects render clean instead of being sliced at the row's edge. Rows
+still cannot double up: nothing with a line break in it can reach a row in
+the first place, and the release gate proves it with a poisoned feed. The
+Adjust toggle formerly called Insert TTS is now Dialogue Text.
+
+v3.74 patch143: the terminal row spacing is settled - the last grower was a
+run of invisible trailing spaces on record lines that wrapped onto a hidden
+second line. They are stripped as the feed arrives, wrapping and glow stay
+exactly as patch142 restored them, and the release gate now proves both
+break sources dead on every build.
+
+v3.74 patch144: the terminal's rhythm is held by construction. Dialogue,
+thoughts and branch lines wrap as before; every record row is a fixed
+single line that nothing can stretch, with its glow intact. The page also
+scrubs every invisible break character a log could carry and drops the
+file's trailing blank, so no phantom rows remain anywhere.
+
+v3.74 patch145: dialogue icons now show the character's emotion - a sound
+effect like a sigh never stands in for a feeling. Hovering a provider
+record glows the glyphs instead of painting a box behind them. The audio
+tag stepper's arrows are a quarter larger. And wrapped dialogue folds
+between words, with the realtime reading moving to the next row whole.
+
+v3.74 patch146: launching or stopping a server from its card now reads like
+the TTS buttons - Launching Server... and Shutting Down... stay pressed for
+the whole phase - and the card's small terminal stays open from the press
+until the server is up or fully gone, streaming the slot's own console log
+the entire way.
+
+v3.74 patch147: thought lines in the Proxy terminal can now be heard.
+Click one and it is spoken in the character's own voice with an inner-
+monologue echo, cached so a repeat click replays instantly, and played on
+every open panel page - the game PC included. The character needs to have
+spoken once so the panel knows their voice.
+
+v3.74 patch148: clicking a thought line now actually plays it - the click
+handler had a one-word bug that threw before asking for audio. And thought
+voicing can run by itself: arm NPC thought Audio on the TTS page (a new
+Thought Audio section after Player Tag System) and every NPC thought is
+spoken automatically with the inner-monologue echo, either just before its
+dialogue line or right after it - your choice in the Sequence menu.
+
+v3.74 patch149: the thought echo is subtler and deeper - half the ring,
+with a low bass boom underneath so it sounds like the inside of a head.
+And thought lines can now be clicked from the remote panel window on the
+second PC: the host generates the audio and it plays right there.
+
+v3.74 patch150: two new providers for the NarrativeEngine SkyrimNet plugin
+- NE-Composer and NE-Director - on ports 1264 and 1265. They appear on the
+Providers page after the existing providers and before PTI/PME, in bright
+grey, arrive unallocated in existing setups on the next start, and join
+providers.yaml once placed on a server.
+
+v3.74 patch151: the Thought voiced note now reads as a note instead of
+being mistaken for a dialogue response; the thought echo is subtler still
+with twice the bass; the two NarrativeEngine providers now appear by
+themselves on the next panel start; and providers.yaml no longer contains
+the two bogus :0 PTI/PME entries - regenerate it once after updating.
+
+v3.74 patch152: with Sequence set to After, the NPC's thought now waits
+for the entire dialogue reply - every spoken chunk of it - and plays only
+once the last one has finished. Before-mode already respected the whole
+reply and is unchanged.
+
+v3.74 patch153: server 2 launches again - the panel's launch-time flag
+editor now understands a PowerShell variable as a flag's value instead of
+leaving it behind as a stray argument llama-server rejects. LLM Controlled
+is retired (Proxy Algorithm is the automatic mode; old configs keep their
+behaviour), server cards read Server 1: with roomier headers and centered
+section rules, every ? mark now opens its explanation on click instead of
+pressing the button under it, and the card terminal holds one steady size
+through the whole launch.
+
+v3.74 patch154: server 2 for real this time. patch153 stopped the launcher
+editor from creating the stray argument, but your config already carried
+one from earlier launches and the editor kept re-saving it. The editor now
+cleans up the whole value list when it touches a flag, so the very next
+launch repairs the stored launcher and the server comes up.
+
+v3.74 patch155: a full pre-release sweep. The read-only LAN view now truly
+hides your paths, GPU serials and launcher contents - verified by the
+release gate on every build - and every listener stays on 127.0.0.1 unless
+you have actually configured a second PC or switched LAN mode on. A pile of
+dead code left over from retired features is gone.
+
+v3.74 patch156: the launcher exe is rebuilt from source with its embedded
+copyright matching the LICENSE that now ships in the release - source-
+visible, personal use and modification only, no redistribution.
+
+v3.74 patch157: provider boxes in Live Network put a space between the
+emoji and the name, and the ? beside Tag Limits is a real click-for-help
+badge like the others.
+
+v3.74 patch158: the Proxy terminal and the Files viewer are back - two
+constants lost in the patch155 cleanup are restored, and the release gate
+now proves every name the page uses is declared. The Speech Rate menu is
+gone: the stored fit is used automatically whenever a valid one exists,
+and Refit Interval takes its place.
+
+v3.74 patch159: thought audio in After mode now waits for the dialogue to
+actually finish sounding - the timing model includes the game's own start
+latency and the gap between chunks - and the thought voice itself carries
+less echo with a deeper 60 Hz body.
+
+v3.74 patch160: thought audio timing solved at the root - a second thought
+arriving while a reply was still sounding used to erase the first and fire
+early; thoughts now queue per reply and play in order, and the TTS
+terminal logs every arm and fire so timing is visible.
+
+v3.74 patch161: Before-mode now holds the dialogue for the thought's full
+realtime length plus half a second, exactly as specified; After-mode
+already followed the same rule since patch160.
+
+v3.74 patch162: the thought now waits for the reply's FINAL dialogue
+chunk - recognised from the reply text the proxy already saw - plus that
+chunk's audio length and half a second, exactly as designed.
+
+v3.74 patch163: thought audio now counts the dialogue chunks that were
+spoken before the thought even existed - the whole reply's playback is
+reconstructed from an always-on trace, so the thought waits for the real
+end of the reply.
+
+v3.74 patch164: thought timing counts every dialogue chunk - vocalization
+prefixes no longer evict chunks from the reply - thought synthesis logs
+like dialogue in the TTS terminal, and a delay line shows the exact
+period calculated between the dialogue and the thought.
+
+v3.74 patch165: Before-mode thoughts defer cleanly when they arrive
+mid-reply (and sequence switches no longer strand old timers), After's
+extra half second is trimmed, and NPC lines in the Proxy terminal wear
+their Higgs emotion faces again.
+
+v3.74 patch166: NPC lines wear their emotion faces again (the on-wire tag
+form is read now), Before-mode thoughts front their own reply even when
+the first chunk races the stream, and the Log page files TTS and PTI/PME
+under their own headings with per-server filter buttons and a five-file
+rotation for calculation logs.
+
+v3.74 patch167: NPC emotion faces read the raw LLM tags at last, a held
+first chunk no longer splits its reply apart on the dashboard, thought
+blocks in the TTS terminal match the dialogue layout, and tts.log files
+under the TTS category.
+
+v3.74 patch168: NPC emotion faces are read from the completion itself -
+the only place SkyrimNet leaves the tags - one queued face per chunk,
+and a held first chunk no longer breaks its reply out of the dialogue
+branch on the dashboard.
+
+v3.74 patch169: NPC emotions are forwarded to Higgs at last - the tags the
+LLM writes are read from the dialogue completion and armed onto each
+spoken chunk as real control tokens, ruled by the same tag board and
+per-character limits as the player's.
+
+v3.74 patch170: the NPC emotion forwarding now actually fires - the tags
+are captured from every dialogue reply (thought or no thought), and a
+chunk that races the completion by milliseconds waits it out instead of
+going unarmed.
+
+v3.74 patch171: Emotion Chunk Placement chooses where the LLM's emotion
+lands (first chunk or every chunk), sound tags are never doubled again,
+sound-only lines wear the sound's icon, after-mode thoughts no longer
+fire into the gap between chunks, and TTS terminal blocks never
+interleave.
+
+v3.74 patch172: after-mode thought timing is back to its best - short
+prefixed final chunks are recognised again and a chunk racing its own
+completion can no longer match the previous reply, so thoughts land
+after the reply ends, without defer storms.
+
+v3.74 patch173: the per-chunk gap the thought timer allows is doubled to
+0.6 s - tag-performed lines hand between chunks more slowly - closing
+the last half-second of overlap into the final chunk.
+
+v3.74 patch174: the TTS terminal is tidied - blocks separated by blank
+rows, thought lines written out in full and coloured, and every report
+row's numbers, units and names inked in the same palette as the Proxy
+and Thinking terminals.
+
+v3.74 patch175: provider priority now holds for the full length of a
+high call - normal providers no longer barge onto the same GPU after
+eight seconds - and the ActionEval drilldown rides ActionEval's own
+priority as it always structurally did.
+
+v3.74 patch176: two-stage high-priority work (ActionEval and its
+drilldown) now holds its GPU across the gap between the stages, so a
+queued normal provider can no longer slip in between them.
+
+v3.74 patch178: every TTS generation reports the banned tags and each
+character's live tag-limit countdowns - (2) turns left, (+2) just
+recorded - and a limited tag is refused before it can fake a face or a
+log line.
+
+v3.74 patch179: audio tag limits count LLM responses (the round), not
+TTS chunks - proven end to end in the gate - and multi-sentence thought
+audio is synthesized per sentence and joined, so the whole thought
+plays back.
+
+v3.74 patch180: two new providers for the AgencyEngine SkyrimNet plugin
+- AE-Impulse and AE-Resolve - on ports 1266 and 1267, in rust on the
+Providers page and in the proxy terminal. They arrive unallocated in
+existing setups on the next start and join providers.yaml once placed
+on a server.
+
+v3.74 patch181: TTS retries escalate instead of repeating - the token
+cap grows half again per attempt and the samplers cool further each
+step - and the new provider emojis are pickable, carried by seeded
+defaults, and healed onto existing emoji-less entries.
+
+v3.74 patch182: the server card and ps1 launcher now have the final word
+on max tokens over anything SkyrimNet sends, and after-mode thought
+audio no longer stalls on chunks SkyrimNet abandoned - quiet replies
+fire within seconds on what actually played.
+
+v3.74 patch183: two characters sharing one voice sample no longer swap
+names on spoken lines - the line is identified by the words it carries,
+matched against the reply the character actually generated.
+
+v3.74 patch184: a housekeeping pass before the public update - dead code
+and unused constants removed, the fit tooltip's missing numbers written,
+open request counts added to the debug report, and the self-check
+hardened so nothing can sit in the panel unused again.
+
+v3.74 patch185: support for Meta's Muse Glimmer - its DFlash assistant is
+recognised as a draft model, a one-file multimodal model is no longer
+mistaken for a vision projector, and choosing a DFlash drafter emits the
+speculative flags llama.cpp needs instead of --model-draft.
+
+v3.74 patch186: the Vision and Speculative decoding pickers now reach a
+hand-edited launcher like every other server card setting - choosing
+Disabled removes the flags from the file that runs, and every card
+setting is proven to survive the trip out and back.
+
+v3.74 patch187: a server card setting always reaches the launcher now,
+even when the value chosen happens to be the default - and the card is
+read back out of the launcher afterwards, so the file that runs and the
+card that describes it cannot disagree.
+
+v3.74 patch188: server cards now show the model architecture read from
+the file's own header - Muse Glimmer, Gemma, Qwen, Llama/Mistral,
+DeepSeek, GLM, Command-R and many more - and the reasoning controls
+adapt to it: a model whose thinking cannot be switched off is offered
+a reasoning strength instead.
+
+v3.74 patch189: the shipped default configuration now lists the same
+providers the panel seeds, including the NarrativeEngine and
+AgencyEngine pairs.
+
+v3.75 Beta: a release of everything the v3.74 patch line brought - Muse
+Glimmer support, model architecture detection on every server card,
+voiced NPC thoughts, emotion forwarded to the voice engine, and server
+cards that stay in step with their launchers.
+
+v3.74 patch190: the Emotion Chunk Placement setting is gone - a reply's
+feelings now reach the voice exactly as the model wrote them, in reading
+order across the spoken chunks.
+
+v3.74 patch177: emotion tags can be banned outright - the Final-Off
+board now rules the NPC mood armer as well as the wire - and every
+spoken line's TTS report states its Banned Tags and Tag Limits
+(remaining turns, and limits this line just started) in the open.
+
+    # --- reasoning OFF (dialogue model) ---
+    "--reasoning", "off",
+    "--chat-template-kwargs", '{"enable_thinking":false}',
+
+Turning Reasoning back on removes that line again. A --chat-template-kwargs you set
+yourself for other reasons is left alone - the dial only ever writes and removes the
+one it wrote. This is a server-side default for every request; the per-request fields
+from patch94 still apply on top, per provider.
