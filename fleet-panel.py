@@ -29,9 +29,10 @@ from urllib.request import urlopen, Request
 from urllib.error import HTTPError
 
 APP_NAME    = "PandorumLLM"
-APP_VERSION = "v3.75 Beta"
-APP_RELEASE_TAG = "v3.75-beta"    # the tag this build ships under
+APP_VERSION = "v3.76 Beta"
+APP_RELEASE_TAG = "v3.76-beta"   # the tag this build ships under
 APP_PATCH = 0                                # patch number; 0 = none
+APP_PATCH_WORD = "patch"                     # "hotfix" or "patch" - see VER_TIER
 TERM_SCALE_KINDS = ("dashboard", "thinking", "splitd", "splitt", "tts", "ptipme")
 TERM_SCALE_LEGACY = ("split",)                # older configs stored one "split" entry
 _TTS_LANG_RX = re.compile(r"^[a-z]{2}(-[a-z]{2,4})?$", re.I)
@@ -57,6 +58,183 @@ TAG_OUT_KEY = {"PTI": "ttsTagOutputPti", "PME": "ttsTagOutputPme"}
 # It is never spoken, so it never reaches the TTS record - the only place to catch it is
 # the reply as it goes past.
 THOUGHT_RX = re.compile(r"<internal_thought>(.*?)</internal_thought>", re.S | re.I)
+# A reply that OPENS with the thought: SkyrimNet's chunker reads a dialogue reply
+# front to back and a leading thought block left it nothing to speak from - the
+# words after the block never reached TTS. The model's order is kept everywhere
+# else; only a leading thought steps behind the first dialogue segment. (patch3)
+_THOUGHT_OPEN = "<internal_thought>"
+_THOUGHT_CLOSE = "</internal_thought>"
+_LEAD_THOUGHT_RX = re.compile(
+    r"^(\s*(?:\[[^\]\r\n]{1,40}\]\s*)*)(<internal_thought>.*?</internal_thought>)(.*)$",
+    re.S | re.I)
+
+
+def reorder_leading_thought(text):
+    """Move a thought the reply OPENED with behind its first dialogue segment.
+
+    `[tag]` markers in front of the block stay in front - they belong to the
+    dialogue. A reply that is nothing but the thought (a Think task answered
+    properly) is untouched, and so is any thought that arrives mid-reply: the
+    model's order stands wherever SkyrimNet can read it.
+    """
+    m = _LEAD_THOUGHT_RX.match(str(text or ""))
+    if not m:
+        return text
+    pre, th, rest = m.group(1), m.group(2), m.group(3)
+    if not rest.strip():
+        return text                           # the thought is the whole reply
+    n = rest.lower().find(_THOUGHT_OPEN)
+    d1, tail = (rest[:n], rest[n:]) if n >= 0 else (rest, "")
+    return pre + d1 + "\n" + th + tail
+
+
+class ThoughtReorderStream:
+    """The same move, on a completion still arriving as SSE lines.
+
+    Content deltas run through a four-state machine - probing the opening
+    bytes, holding the leading thought, streaming the dialogue live, passing
+    verbatim - and everything that is not a content delta walks straight
+    through. The held thought is re-emitted the moment the first dialogue
+    segment ends: at a second thought's opener, or before the finish. Output
+    text is byte-identical to reorder_leading_thought() on the joined reply,
+    which is what the gate holds it to.
+    """
+    def __init__(self):
+        self.mode = "probe"       # probe -> hold -> live -> pass
+        self.buf = []             # probe: the original lines, kept for fidelity
+        self.cur = ""             # probe/hold: content accumulated so far
+        self.held = ""            # the leading thought block, once closed
+        self.tail = ""            # live: unemitted boundary, one opener wide
+        self.said = []            # what actually left, for the report
+        self.dtext = ""           # dialogue seen while a thought is held
+
+    def _synth(self, txt):
+        if not txt:
+            return []
+        self.said.append(txt)
+        return [b"data: " + json.dumps(
+            {"choices": [{"index": 0, "delta": {"content": txt}}]}).encode("utf-8")
+            + b"\n\n"]
+
+    def _probe_rx(self):
+        return re.match(r"^(\s*(?:\[[^\]\r\n]{1,40}\]\s*)*)(.*)$", self.cur, re.S)
+
+    def feed(self, line, obj):
+        """One SSE line in, the lines to write out. `obj` is the parsed data
+        payload or None; a finish_reason or [DONE] flushes before passing."""
+        s = line.strip()
+        fin = s == b"data: [DONE]"
+        if obj is not None:
+            ch = (obj.get("choices") or [{}])[0]
+            if ch.get("finish_reason"):
+                fin = True
+            content = (ch.get("delta") or {}).get("content") or ""
+        else:
+            content = ""
+        out = []
+        if fin:
+            out.extend(self.flush())
+            out.append(line)
+            return out
+        if not content:
+            if self.mode == "probe":
+                self.buf.append(line)         # order within the reply is kept
+            else:
+                out.append(line)
+            return out
+        if self.mode == "pass":
+            self.said.append(content)
+            out.append(line)
+            return out
+        if self.mode == "live":
+            twin = self.tail + content
+            n = twin.lower().find(_THOUGHT_OPEN)
+            if n >= 0:
+                # the first dialogue segment just ended: the held thought lands here
+                out.extend(self._synth(twin[:n]))
+                self.dtext += twin[:n]
+                out.extend(self._synth("\n" + self.held))
+                self.held = ""
+                self.mode = "pass"
+                out.extend(self._synth(twin[n:]))
+                self.tail = ""
+                return out
+            keep = len(_THOUGHT_OPEN) - 1
+            if len(twin) > keep:
+                emit, self.tail = twin[:-keep], twin[-keep:]
+            else:
+                emit, self.tail = "", twin
+            self.dtext += emit
+            out.extend(self._synth(emit))
+            return out
+        # probe or hold: everything runs through self.cur
+        self.buf.append(line)
+        self.cur += content
+        if self.mode == "probe":
+            m = self._probe_rx()
+            body = m.group(2)
+            partial_tag = (body.startswith("[") and "]" not in body
+                           and len(body) <= 41)         # the rule's own tag width
+            want = (_THOUGHT_OPEN[:len(body)].lower()
+                    if len(body) < len(_THOUGHT_OPEN) else _THOUGHT_OPEN)
+            if body and not partial_tag and not body.lower().startswith(want):
+                # not a leading thought: hand back the original lines untouched
+                self.mode = "pass"
+                for ln in self.buf:
+                    out.append(ln)
+                self.said.append(self.cur)
+                self.buf, self.cur = [], ""
+                return out
+            if partial_tag:
+                return out
+            if body.lower().startswith(_THOUGHT_OPEN):
+                self.mode = "hold"
+                pre = m.group(1)
+                self.cur = body
+                self.buf = []
+                out.extend(self._synth(pre))  # the tags stay in front of the dialogue
+        if self.mode == "hold":
+            n = self.cur.lower().find(_THOUGHT_CLOSE)
+            if n >= 0:
+                end = n + len(_THOUGHT_CLOSE)
+                self.held, rest = self.cur[:end], self.cur[end:]
+                self.cur, self.buf = "", []
+                self.mode = "live"
+                self.tail = ""
+                if rest:
+                    return out + self.feed_text(rest)
+        return out
+
+    def feed_text(self, txt):
+        """Re-enter the machine with text already peeled out of a delta."""
+        fake = b"data: " + json.dumps(
+            {"choices": [{"index": 0, "delta": {"content": txt}}]}).encode("utf-8") + b"\n\n"
+        return self.feed(fake, {"choices": [{"delta": {"content": txt}}]})
+
+    def flush(self):
+        """The stream is ending: everything still held leaves, in order."""
+        out = []
+        if self.mode == "probe":
+            for ln in self.buf:
+                out.append(ln)
+            self.said.append(self.cur)
+        elif self.mode == "hold":
+            # the tag never closed: pass what was swallowed, exactly as it came
+            out.extend(self._synth(self.cur))
+        elif self.mode == "live":
+            if self.held and not (self.dtext + self.tail).strip():
+                # nothing but whitespace ever followed the thought: the pure rule
+                # leaves such a reply untouched, so the stream does too
+                out.extend(self._synth(self.held))
+                out.extend(self._synth(self.tail))
+            else:
+                out.extend(self._synth(self.tail))
+                if self.held:
+                    out.extend(self._synth("\n" + self.held))
+        self.buf, self.cur, self.tail, self.held, self.dtext = [], "", "", "", ""
+        self.mode = "pass"
+        return out
+
 
 # ActionEval answers under a json_schema: {"ACTION": "bathe"}. The actor is not named the
 # way a dialogue prompt names one - "You are selecting a SINGLE action" - so the profile
@@ -68,10 +246,10 @@ ACTION_RX = re.compile(r'"ACTION"\s*:\s*"([^"]{1,64})"')
 # the bracketed ROLE is part of how SkyrimNet names them, not part of the name, and a
 # pattern that did not expect it matched nothing, so the record said "someone".
 _ROLE = rb"(?:\s*\[[^\]\r\n]{1,24}\])?"
-ACTOR_RXS = (re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)" + _ROLE + rb"'s Character Profile"),
-             re.compile(rb"action for ([A-Z][A-Za-z' \-]{1,28}?)" + _ROLE
+ACTOR_RXS = (re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,59}?)" + _ROLE + rb"'s Character Profile"),
+             re.compile(rb"action for ([A-Z][A-Za-z' \-]{1,59}?)" + _ROLE
                         + rb" from a specific action category"),
-             re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)" + _ROLE + rb"'s Current State"))
+             re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,59}?)" + _ROLE + rb"'s Current State"))
 ACTION_MARK = "\u26A1"                          # not a spoken mark: nobody said this
 DRILL_MARK = "\u2937"                           # worn by the record of a drilldown stage
 # SkyrimNet drills into a chosen category with a SECOND prompt, and that prompt
@@ -133,7 +311,11 @@ def action_row(said, who="", drill=False):
         return ""
     tail = ""
     if params:
-        tail = " (" + ", ".join("%s: %s" % (k, " ".join(str(v).split())[:60])
+        # whole. A 60-character cut was a display guess about how long a parameter
+        # could usefully be, and it removed the end of exactly the ones worth
+        # reading - a spoken line, a destination, a reason. The terminal wraps.
+        # (patch38)
+        tail = " (" + ", ".join("%s: %s" % (k, " ".join(str(v).split()))
                                 for k, v in params.items()) + ")"
     return "%s %s %s > %s%s" % (TREE_PAD + (TREE_END if drill else TREE_MID),
                                 ACTION_MARK, who or "someone", act, tail)
@@ -185,7 +367,11 @@ def thought_lines(said, who="", cfg=None):
         # words, and those words are what names the voice that speaks them when
         # two characters share one sample. (patch183)
         REPLY_FULL[who] = (_th_norm(THOUGHT_RX.sub(" ", str(said or ""))), time.time())
-    rows = [" ".join(m.split())[:400] for m in THOUGHT_RX.findall(str(said or "")) if m.strip()]
+        _rr = REPLY_RING.setdefault(who, collections.deque(maxlen=RING_DEPTH))
+        _rr.append(REPLY_FULL[who])
+    # never capped: this list feeds the thought-audio pass as well as the terminal,
+    # and a display trim spoken aloud ends a thought mid-word ("...the heat buil")
+    rows = [" ".join(m.split()) for m in THOUGHT_RX.findall(str(said or "")) if m.strip()]
     if not rows:
         return
     # the freshest thought is remembered for the auto thought-audio pass WHATEVER
@@ -310,7 +496,8 @@ def panel_prov_on(pid, st):
     """Whether this feature is switched on - the TTS page setting, not a second flag."""
     p = panel_prov(pid)
     return bool(p) and str((st or {}).get(p["setting"], "off")).strip().lower() == "on"
-APP_VER_UI = APP_VERSION.replace(" ", "-p%d " % APP_PATCH, 1) if APP_PATCH else APP_VERSION
+APP_VER_UI = (APP_VERSION.replace(" ", "-%s%d " % (APP_PATCH_WORD[0], APP_PATCH), 1)
+              if APP_PATCH else APP_VERSION)
 
 def _build_id():
     """Identity of the file actually running: replacing a file is not the same as
@@ -340,6 +527,44 @@ HISTORY     = os.path.join(STACK, "fleet-history.json")
 ARCHIVE     = os.path.join(STACK, "ps1-launchers")
 FLEET_PS1   = os.path.join(STACK, "launch-llm-fleet.ps1")
 
+# Emotions this build ships with turned OFF - a DEFAULT, not a refusal. Every one of
+# them is still on the Allowed Tags board and one click brings it back.
+#
+# Measured on the owner's rig, one short line each, judged by ear. The engine was
+# re-conditioned on ANOTHER speaker's sample before every take, so each token faced
+# the same carryover pressure rather than a clean engine:
+#
+#   disgust, longing, sadness, shame  the take came back as a different speaker
+#   elation                           the right speaker, but unrecognizable - and
+#                                     measurably so: 4x the RMS of every other take
+#                                     in the sweep, which is a level blowout, not
+#                                     a performance
+#   the other sixteen                 correct, amusement and pride among them as
+#                                     controls
+#
+# ELATION HAS BEEN HERE BEFORE. It was blocked once, then unblocked after a
+# four-voice sweep found "the right speaker, more energy", and the Pitch Guard that
+# replaced the block went the same way in patch33 - pitch and low-band energy move
+# with FEELING, not identity, so nothing measurable separated them. What is different
+# now is that the judgement is the owner's own ear on his own reference, the level
+# blowout is objective, and it sits beside four tokens that produce a different
+# speaker outright. If a later sweep disagrees, read this paragraph before deleting
+# the entry: it has been deleted before.
+#
+# Nothing here is detected in the OUTPUT. The same sweep run through zero-crossing
+# rate and RMS puts the four wrong-speaker takes inside the spread of the correct
+# ones - the third time this project has confirmed that a wrong voice is not
+# separable acoustically. Refuse the token; never try to hear the result.
+# Five measured, one asked for. `determination` is the owner's preference and was
+# never found to misbehave - kept apart in the comment so a later sweep does not read
+# it as evidence it never had.
+TTS_EMOTION_OFF = ("disgust", "elation", "longing", "sadness", "shame",
+                   "determination")
+
+
+# the same six, written the way the two boards read them
+TTS_EMOTION_OFF_WORDS = " ".join("EMOTION-%s" % e.upper() for e in TTS_EMOTION_OFF)
+
 DEF_SETTINGS = {
     "llamacppPath": "",
     "launcherDir":  os.path.join(STACK, "ps1-launchers"),
@@ -351,7 +576,10 @@ DEF_SETTINGS = {
     "ttsPython": "", "ttsWrapper": "", "ttsWrapperPort": "7860",
     # requested defaults: the Proxy translates for SkyrimNet, and the startup ping
     # is sent to the engine and heard (No), out of the box
-    "ttsWrapMode": "on", "ttsAnswerPing": "off",
+    # banned: the probe is answered with silence and not announced. "off" spoke it,
+    # which costs 600-1100ms of GPU for a word nobody wants to hear, and "on" says
+    # so in the terminal every time SkyrimNet starts. (patch37)
+    "ttsWrapMode": "on", "ttsAnswerPing": "banned",
     "ttsEngine": "moss",                          # moss | audiocpp
     "ttsTags": "on",
     "ttsThoughtAudio": "off",                     # voice NPC thoughts automatically
@@ -359,12 +587,12 @@ DEF_SETTINGS = {
     # Audio-tag words the user clicked OFF in Player Tag System: space-separated,
     # KIND-NAME as offered. They leave the BUILT-IN PTI and PME prompts and their
     # answer filters; a custom prompt is the user's own text and is never edited.
-    "ttsTagsOff": "",
+    "ttsTagsOff": TTS_EMOTION_OFF_WORDS,
     # The FINAL gate on the wire to Higgs: KIND-NAME (or bare prosody) words the
     # user clicked off on the Audio Tags board. A tag here never reaches the
     # engine, whoever wrote it - SkyrimNet's NPC lines, the player tagger, an
     # alias. Independent of ttsTagsOff, which edits the built-in prompts.
-    "ttsTagsFinalOff": "",
+    "ttsTagsFinalOff": TTS_EMOTION_OFF_WORDS,
     # Tag Limits: WORD:N pairs. Once a tag is spoken, the SAME character does not get
     # it again for N of their own turns - the player counts their own turns, an NPC
     # counts that NPC's. Empty = no limits, which Reset restores.
@@ -375,12 +603,18 @@ DEF_SETTINGS = {
     # Locked on start, released on stop and on exit. Needs the panel run as
     # administrator; costs idle watts - which is why it is the user's switch.
     "ttsGpuClockHold": "off",
-    "ttsOutDir": "", "ttsVoiceDir": "",
+    # a full path, so the field shows where the files actually go. Computed once
+    # from the panel's own location - a bare name told the user nothing (patch29)
+    "ttsOutDir": os.path.join(STACK, "TTSaudio"),
+    "ttsVoiceDir": "",
     "termStamps": "on", "termInsTts": "on",
-    "termStampsOff": "",                          # terminals hiding the time
+    # every terminal starts without the time column: it is the same clock on every
+    # row, it costs the width where the line matters, and the button is right
+    # there for a session where the timing is the point (patch37)
+    "termStampsOff": "dashboard,thinking,tts,ptipme,splitd,splitt,ttscal",
     "splitSrcD": "dashboard", "splitSrcT": "thinking",
     "ttsAcppDir": "", "ttsAcppExe": "", "ttsAcppModelsDir": "", "ttsAcppModel": "", "ttsAcppModelId": "higgs",
-    "ttsAcppFamily": "higgs_audio_tts", "ttsAcppRefSlots": "64",
+    "ttsAcppFamily": "higgs_audio_tts", "ttsAcppRefSlots": "1024",
     # AR sampling. A missed end-of-content token is a SAMPLING accident: the model
     # passes over EOC and then has no reason to stop. Temperature is the lever that
     # changes how often that happens; a token or time ceiling only changes what it costs.
@@ -390,6 +624,11 @@ DEF_SETTINGS = {
     # exits on anything not on it, and temperature is not. patch68 tried, patch69 made
     # the attempt survivable, and this removes it: an engine that will not be told is
     # not a setting. What IS controllable is how much text is handed over at once.
+    # 170 again (patch37). patch28 lowered it to 140 for a slightly earlier first
+    # chunk; more chunks per line also means more chunk boundaries for anything
+    # that waits on the LAST one, and the owner's thought placement went back to
+    # firing early in the same window. The latency it bought was not worth a
+    # regression in something that was working.
     "ttsChunkChars": "170",
     "ttsAutoCal": "proxy",                        # per-line token cap: off / proxy / llm
                                                   # proxy is the standard: arithmetic,
@@ -406,14 +645,11 @@ DEF_SETTINGS = {
     "ttsCalTermOpen": "off",                      # the calibration record, shown or not
     # set by a calibration, applied to every outgoing speech request, and empty until
     # one has run - an empty string means "not chosen", which is not the same as a value
-    "ttsCalTemp": "", "ttsCalTopP": "", "ttsCalRepPen": "", "ttsCalMinP": "",
-    "ttsRetrySafe": "on",                         # a retry aims to finish, not to perform
-    "ttsSampAutoCal": "on",                       # who moves the speech samplers: "on" is
-                                                  # LLM Controlled, and the every-N run
-                                                  # changes them; "off" is Manual, and only
-                                                  # you do. Values set here are sent with
-                                                  # every line either way - the choice is
-                                                  # who moves them, never whether they apply
+    "ttsCalTemp": "0.8", "ttsCalTopK": "50",   # Boson's reference pair
+    # OFF by default (patch21): stepping the samplers colder on each retry was
+    # driving the engine toward greedy decoding, and greedy decoding is how the
+    # degenerate repeat happens - so the rescue was feeding the fault. Available
+    # for anyone who wants it, but a retry now simply asks again.
     "ttsDiagLast": "", "ttsDiagAt": "",
     # How long each calibration model may think before "Answer now." - one per job,
     # set on the slider beside that job's Thinking switch
@@ -429,6 +665,8 @@ DEF_SETTINGS = {
     # is behaving - so 9s leaves room for a legitimate long line and takes half the
     # cost off a runaway.
     "ttsAcppBusyMs": "9000",
+    "ttsRunawayMode": "detect",   # detect | limit - how a runaway line is bounded
+    "ttsRunawayRatio": "1.7",     # detect: audio this far past its estimate retries
     "ttsAcppVersion": "",                         # the release tag installed
     "ttsAcppProfile": "balance",                  # balance | fast
     "ttsPlayerTags": "off",                       # ask a fleet model to tag player lines
@@ -441,10 +679,27 @@ DEF_SETTINGS = {
     "ttsMoodPostpone": "off",                     # wait for TTS to finish first
     "ttsPtiPrompt": "", "ttsPmePrompt": "",       # blank = the built-in wording
     "ttsPtiBudget": "2000", "ttsPmeBudget": "3000",   # room to reason, in tokens
+    "ttsPlayerName": "",     # your character's name, if you tell the panel outright
+    "ttsAcppAsrModel": "",   # a co-hosted SenseVoice gguf; only read when mode is "on"
+    "ttsAsrMode": "on",      # on | stored | off - see tts_ref_text. On by
+                             # default: until a model is picked it costs
+                             # nothing, and the installer now supplies one
+    "ttsAsrLang": "auto",    # let the model guess: an English default mis-reads
+                             # every other language the player might speak
+    "ttsAsrItn": "words",    # words | digits - inverse text normalisation
+    "ttsSampleDir": "",      # the panel's own repaired-sample vault; blank = beside it
+    "ttsSampleSec": "10",    # the longest a kept sample may run, in seconds
+    "ttsSampleAdopt": "on",  # repair each reference into the vault the first time
     "ttsTagOutputPti": "off",                     # show what PTI answered
     "ttsTagOutputPme": "off",                     # show what PME answered
-    "ttsThoughtOut": "off",                       # show an NPC's <internal_thought>
-    "ttsActionOut": "off",                        # show the action ActionEval chose
+    # on: a thought is the reason the line that follows it makes sense, and the
+    # owner spent a session hunting a "missing thoughts" bug that was this switch
+    # sitting at its shipped value (patch37)
+    "ttsThoughtOut": "on",                        # show an NPC's <internal_thought>
+    # on, like Thoughts: an action is what the character DID about the line, and a
+    # switch that ships off reads as a broken feature to anyone who has not found
+    # the button (patch38)
+    "ttsActionOut": "on",                         # show the action ActionEval chose
     "termHideProv": "",                           # provider ids the Proxy terminal hides
     "launchArc": False,               # the guide step highlights instead
     "autoRefresh": 0,
@@ -712,6 +967,21 @@ def load_config():
         for _tk in TAG_OUT_KEY.values():
             st[_tk] = "on" if _old == "on" else "off"
         changed = True
+    # one-time: six emotions were measured to break the cloned voice, and ship off.
+    # The merge above only fills a setting that is EMPTY, which is right for a
+    # preference and wrong for a measurement - a board the user had ever touched kept
+    # its value and kept the six enabled, so the people most likely to be using tags
+    # were the only ones who did not get the fix. Added to what is already there,
+    # never replacing it, and only once: switching one back on afterwards sticks.
+    if not st.get("emoOffV43"):
+        for _ek in ("ttsTagsOff", "ttsTagsFinalOff"):
+            _have = str(st.get(_ek) or "").replace(",", " ").split()
+            _add = [w for w in TTS_EMOTION_OFF_WORDS.split() if w not in _have]
+            if _add:
+                st[_ek] = " ".join(_have + _add)
+                changed = True
+        st["emoOffV43"] = True
+        changed = True
     # repair booleans that may have been stored as strings by an older build
     for _bk in ("onePC", "devMode", "welcomeSeen", "termBlack", "termScaleOn"):
         if isinstance(st.get(_bk), str):
@@ -831,17 +1101,28 @@ def load_config():
         save_config(cfg)
     return cfg
 
-def read_named_template(name):
+# Two folders, two features. server-templates\ belongs to the fleet cards and
+# every file in it pins a card and disables fitting; templates\ belongs to the
+# Launcher Creator and may say anything, including "no GPU pinning". They were
+# read from ONE folder, so the Creator's single-GPU template was offered to a
+# three-card fleet, and a server that took it saw every GPU and fitted across
+# all of them. A launcher for a fleet server and a launcher for someone's
+# one-GPU PC are not interchangeable. (patch30)
+SERVER_TPL_DIR = "server-templates"
+CREATOR_TPL_DIR = "templates"
+
+
+def read_named_template(name, where=SERVER_TPL_DIR):
     safe = re.sub(r"[^a-zA-Z0-9_-]", "", str(name or ""))
-    p = os.path.join(STACK, "templates", safe + ".ps1")
+    p = os.path.join(STACK, where, safe + ".ps1")
     try:
         return open(p, encoding="utf-8-sig").read()
     except Exception:
         return ""
 
-def list_templates():
-    out = [{"id": "", "name": "PandorumLLM default (pins GPU by ID - for multi-GPU / multi-PC)"}]
-    d = os.path.join(STACK, "templates")
+def list_templates(where=SERVER_TPL_DIR):
+    out = [{"id": "", "name": "PandorumLLM default (built from this card's parameters)"}]
+    d = os.path.join(STACK, where)
     try:
         for f in sorted(os.listdir(d)):
             if not f.endswith(".ps1"):
@@ -859,7 +1140,12 @@ def list_templates():
     return out
 
 def read_template(settings=None):
+    """The Launcher Creator's template. Its own folder, never the fleet's."""
     path = (settings or {}).get("templateFile") or DEF_SETTINGS["templateFile"]
+    if path and not os.path.isabs(path) and os.sep not in path and "/" not in path:
+        # a bare name belongs to the Creator's folder - resolving it against the
+        # fleet's would hand a server template to the Creator and vice versa
+        path = os.path.join(STACK, CREATOR_TPL_DIR, path)
     try:
         return open(path, encoding="utf-8-sig").read()
     except Exception:
@@ -892,6 +1178,17 @@ def prune_keep_newest(ld, pattern, keep):
 ERR_FILE = [None]
 ERR_RX = re.compile(r"\b(error|fail(?:ed|ure)?|fatal|exception|traceback|cuda error|out of memory|unreachable)\b", re.I)
 WARN_RX = re.compile(r"\bwarn(?:ing)?\b", re.I)
+# Lines that read like failures and are not. llama.cpp's memory fitting builds a
+# throwaway probe context for the drafter before the target model exists, so a
+# head that needs the target's context to attach to - a Gemma 4 assistant, a
+# DFlash or EAGLE-3 head with no embedding of its own - always throws there.
+# llama.cpp catches it, says so in the message itself, and carries on to load the
+# drafter properly; only the drafter's VRAM estimate is skipped. Reported as an
+# error it sent the owner hunting a missing parameter that does not exist.
+BENIGN_RX = re.compile(
+    r"requires ctx_other to be set"
+    r"|\[spec\] failed to measure (?:draft model|MTP context) memory", re.I)
+BENIGN_SEEN = set()          # explained once per session, then simply skipped
 # In-memory, session-only issue log for the Log > Errors tab. Capped list (most recent
 # 250 rows kept for display); running counters below are the true session totals.
 ERR_LOG = []
@@ -989,6 +1286,19 @@ def scan_slot_errors(slot_id, label, ld):
         st["pos"] = size
         for line in ANSI_RX.sub("", chunk.decode("utf-8", errors="ignore")).splitlines():
             if line.startswith("==="):
+                continue
+            if BENIGN_RX.search(line):
+                # Not an issue at all, so not in the issue list either: keeping it
+                # out of the error FILE was not enough, because the list decides a
+                # line's severity from its own words and "failed" is in this one.
+                # It stays in the server's raw log, where anyone reading the load
+                # sequence will find it in context.
+                if "fit" not in BENIGN_SEEN:
+                    BENIGN_SEEN.add("fit")
+                    panel_log("[slot] llama.cpp could not measure the drafter's "
+                              "memory during fitting - expected for a drafter that "
+                              "attaches to the target model, and harmless; the "
+                              "drafter loads normally afterwards")
                 continue
             if ERR_RX.search(line):
                 log_error("slot " + label, line)
@@ -1712,6 +2022,7 @@ MODEL_ARCH_NAMES = {
     "qwen3": "Qwen 3 family", "qwen3moe": "Qwen 3 family (MoE)",
     "qwen3vl": "Qwen 3 VL", "qwen3vlmoe": "Qwen 3 VL (MoE)",
     "qwen3next": "Qwen 3-Next",
+    "qwen35": "Qwen 3.5/3.8 family", "qwen35moe": "Qwen 3.5/3.8 family (MoE)",
     "llama": "Llama family - also Mistral, NeMo, Yi and most fine-tunes of them",
     "llama4": "Llama 4", "mllama": "Llama 3.2 Vision",
     "mistral3": "Mistral 3", "pixtral": "Pixtral",
@@ -1735,6 +2046,8 @@ MODEL_ARCH_NAMES = {
     "mamba": "Mamba", "mamba2": "Mamba 2", "rwkv6": "RWKV-6", "rwkv7": "RWKV-7",
     "bitnet-25": "BitNet", "orion": "Orion", "bloom": "BLOOM", "gpt2": "GPT-2",
     "clip": "vision projector (CLIP/ViT)", "dflash": "DFlash drafter",
+    "gemma4-assistant": "Gemma 4 assistant (MTP drafter)",
+    "eagle3": "EAGLE-3 drafter", "medusa": "Medusa drafter",
 }
 
 # Families whose chat template opens the thinking channel unconditionally: on and
@@ -1742,6 +2055,12 @@ MODEL_ARCH_NAMES = {
 # plainly for Muse Glimmer - the strength rides in the template kwargs.
 ARCH_REASON_STRENGTH = ("muse-glimmer",)
 REASON_STRENGTHS = ("low", "medium", "high", "xhigh")
+
+# Families where thinking is a SWITCH and a DEPTH at once: Qwen 3.8 thinks by
+# default, can be told not to, and takes reasoning_effort when it does. Unlike
+# Muse Glimmer the on/off dial stays live, so both controls render. (patch9)
+ARCH_REASON_EFFORT = ("qwen35", "qwen35moe")
+REASON_EFFORTS = ("low", "medium", "xhigh")     # Qwen names no plain "high"
 
 
 def arch_label(arch):
@@ -1752,6 +2071,8 @@ def arch_label(arch):
         return ""
     if a in MODEL_ARCH_NAMES:
         return MODEL_ARCH_NAMES[a]
+    if a.endswith("-assistant"):                  # a head shipped beside a family
+        return "%s assistant (MTP drafter)" % arch_label(a[:-len("-assistant")])
     for pre, fam in (("qwen3", "Qwen 3 family"), ("qwen2", "Qwen 2 family"),
                      ("gemma", "Gemma family"), ("llama", "Llama family"),
                      ("deepseek", "DeepSeek family"), ("mistral", "Mistral family"),
@@ -1766,6 +2087,17 @@ def arch_label(arch):
 # found it. The header is the stronger fact anyway: it is what llama.cpp reads.
 DRAFT_ARCHS = frozenset(("dflash", "mtp", "nextn", "eagle", "eagle2", "eagle3",
                          "medusa", "draft"))
+
+
+def is_draft_arch(arch):
+    """Does this architecture belong to a speculative drafter?
+
+    Named kinds, plus the convention llama.cpp itself follows for a head shipped
+    beside a family: Gemma 4's MTP head declares `gemma4-assistant`, and its
+    tensors are named like any other model's, so nothing but the architecture
+    can tell it apart from a small chat model."""
+    a = str(arch or "").strip().lower()
+    return bool(a) and (a in DRAFT_ARCHS or a.endswith("-assistant"))
 
 def gguf_meta(path):
     """Read a few named values out of a GGUF header, without reading the weights.
@@ -1807,27 +2139,35 @@ def gguf_meta(path):
                 # block count - one says how deep it drafts, the other says the
                 # file is a language model and not a projector (patch185)
                 if k in GGUF_WANT or k.endswith((".block_size", ".block_count",
-                                                 ".context_length")):
+                                                 ".context_length",
+                                                 ".sample_from_anchor")):
                     out[k] = v
     except Exception:
         pass
     return out
 
-def gguf_tensor_hint(path):
-    """Look at a GGUF's tensor names for a marker of what the file is.
+def gguf_tensor_scan(path, block_count=0):
+    """Read EVERY tensor name in a GGUF and report the markers that decide what
+    the file is and what it can do. Names only, never weights.
 
-    Only the names are read, never the weights, and only the first few hundred. A file
-    that carries multi-token-prediction tensors is a drafter whatever it is called.
+    Reading all of them matters: the tensor that says a model drafts for itself
+    sits at the END of the list - blk.{block_count-1}.nextn.* - and a scan capped
+    at the first few hundred names walked straight past it on any model above a
+    few dozen layers. llama.cpp types an MTP drafter by exactly that tensor
+    (common_speculative_types_from_gguf), so the panel reads the same fact the
+    same way. Returns None for anything that is not a readable GGUF. (patch2)
     """
+    out = {"vision": False, "blk0": False, "nextn_last": False,
+           "mtp_names": False, "eagle_names": False, "markov": False}
     try:
         with open(path, "rb") as f:
             if f.read(4) != b"GGUF":
-                return ""
+                return None
             f.read(4)
             ntensor = int.from_bytes(f.read(8), "little")
             nkv = int.from_bytes(f.read(8), "little")
             if ntensor > 100000 or nkv > 4096:
-                return ""
+                return None
             def rd_str():
                 ln = int.from_bytes(f.read(8), "little")
                 if ln > (1 << 20):
@@ -1845,28 +2185,37 @@ def gguf_tensor_hint(path):
                 elif ty == 9:
                     gguf_skip_array(f, SZ)
                 else:
-                    return ""
-            for _ in range(min(ntensor, 400)):        # then the tensor names
+                    return None
+            last = "blk.%d.nextn.eh_proj.weight" % (int(block_count or 0) - 1)
+            for _ in range(ntensor):                  # then ALL the tensor names
                 name = rd_str().lower()
-                if "mtp" in name or "nextn" in name or "eagle" in name:
-                    return "draft"
                 if name.startswith("v.") or name.startswith("mm.") or "vision_model" in name \
                         or name.startswith("resampler.") or name.startswith("mmproj"):
-                    return "vision"
+                    out["vision"] = True
+                elif name.startswith("blk.0."):
+                    out["blk0"] = True
+                elif name == last:
+                    out["nextn_last"] = True
+                elif name == "markov_w1.weight":
+                    out["markov"] = True
+                if "mtp" in name or "nextn" in name:
+                    out["mtp_names"] = True
+                if "eagle" in name:
+                    out["eagle_names"] = True
                 nd = int.from_bytes(f.read(4), "little")
                 if nd > 8:
-                    return ""
+                    return None
                 f.read(8 * nd)                        # dimensions
                 f.read(4)                             # type
                 f.read(8)                             # offset
     except Exception:
-        pass
-    return ""
+        return None
+    return out
 
 _KIND_FILE = os.path.join(STACK, "model-kinds.json")
 _KIND = {"map": None, "dirty": False}
 _KIND_LOCK = threading.Lock()
-_KIND_RULES = "188"        # bumped whenever what a remembered verdict MEANS changes
+_KIND_RULES = "375p2"        # bumped whenever what a remembered verdict MEANS changes
 
 
 def _kind_map():
@@ -1876,7 +2225,9 @@ def _kind_map():
                 _m = json.load(f) or {}
             # every verdict in the file was reached under the rules of its day; when
             # those rules change, the file is stale even though the models are not.
-            # Muse Glimmer's drafter was cached as a plain model. (patch185)
+            # Muse Glimmer's drafter was cached as a plain model (patch185); the
+            # qwen35 heads were cached before the tensor rule and the built-in-head
+            # fact existed (patch2).
             _KIND["map"] = _m if _m.get("_rules") == _KIND_RULES else {"_rules": _KIND_RULES}
         except Exception:
             _KIND["map"] = {"_rules": _KIND_RULES}
@@ -1913,16 +2264,50 @@ def model_kind(path):
         _KIND["dirty"] = True
     return val["kind"]
 
+def _spec_kind(arch, scan):
+    """Which KIND of speculation this file would perform as a drafter.
+
+    llama.cpp names one implementation per kind and runs none unless told which.
+    Its own inference (common_speculative_types_from_gguf) reads the TENSORS,
+    not the architecture: a non-DFlash file is an MTP drafter iff it carries
+    blk.{block_count-1}.nextn.eh_proj.weight - the qwen35-generation heads
+    declare the FAMILY architecture, so an architecture-only rule read them as
+    plain drafters and llama-server tried to load a one-layer head file as a
+    65-layer model. Where llama.cpp infers nothing (assistant heads, EAGLE,
+    plain small models), the kind the file demands is still stated. (patch2)
+    """
+    a = str(arch or "").strip().lower()
+    sc = scan or {}
+    if a == "dflash":
+        # the Markov head is what tells a DSpark drafter from a DFlash one
+        return "draft-dspark" if sc.get("markov") else "draft-dflash"
+    if a.startswith("eagle"):
+        return "draft-eagle3"
+    if a.endswith("-assistant") or "mtp" in a or "nextn" in a \
+            or sc.get("nextn_last") or sc.get("mtp_names"):
+        return "draft-mtp"
+    if sc.get("eagle_names"):
+        return "draft-eagle3"
+    return "draft-simple"           # a whole small model of the same family
+
+
 def _model_facts_read(path):
     """Everything the card needs about a .gguf, from ONE header read: what it is,
-    which family it belongs to, and the two numbers worth showing beside that."""
+    which family it belongs to, the two numbers worth showing beside that, the
+    kind of speculation it would perform as a drafter, and whether - as a model -
+    it carries its own MTP head and drafts for itself."""
     meta = gguf_meta(path)
     arch = str(meta.get("general.architecture") or "").lower()
-    return {"kind": _model_kind_read(path, meta), "arch": arch,
+    blocks = int(meta.get(arch + ".block_count") or 0)
+    scan = gguf_tensor_scan(path, blocks)
+    kind = _model_kind_read(path, meta, scan)
+    return {"kind": kind, "arch": arch,
             "label": arch_label(arch),
-            "blocks": int(meta.get(arch + ".block_count") or 0),
+            "blocks": blocks,
             "ctx": int(meta.get(arch + ".context_length") or 0),
-            "size": str(meta.get("general.size_label") or "")}
+            "size": str(meta.get("general.size_label") or ""),
+            "spec": _spec_kind(arch, scan),
+            "mtpHead": bool(kind == "main" and (scan or {}).get("nextn_last"))}
 
 
 def model_facts(path):
@@ -1948,7 +2333,7 @@ def model_arch(path):
     return str((model_facts(path) or {}).get("arch") or "") if path else ""
 
 
-def _model_kind_read(path, meta=None):
+def _model_kind_read(path, meta=None, scan=None):
     """What a .gguf actually is: a chat model, a vision projector, or a draft model.
 
     The header is asked first. The name is only consulted when the header says nothing
@@ -1958,14 +2343,21 @@ def _model_kind_read(path, meta=None):
     arch = str(meta.get("general.architecture") or "").lower()
     if arch == "clip" or meta.get("clip.has_vision_encoder") or meta.get("clip.has_audio_encoder"):
         return "vision"
-    if arch in DRAFT_ARCHS or any(str(k).split(".")[0] in DRAFT_ARCHS for k in meta):
+    if is_draft_arch(arch) or any(is_draft_arch(str(k).split(".")[0]) for k in meta):
         return "draft"                            # it says so in its own header
-    hint = gguf_tensor_hint(path)                 # what the file is built from
-    if hint == "vision" and meta.get(arch + ".block_count"):
-        hint = ""                                 # it CARRIES a vision tower; it is
-    if hint:                                      # still the model that runs
-        return hint
-    low = os.path.basename(path).lower()          # only then, what it is called
+    if scan is None:                              # what the file is built from
+        scan = gguf_tensor_scan(path, meta.get(arch + ".block_count") or 0)
+    sc = scan or {}
+    if sc.get("nextn_last"):
+        # the multi-token-prediction head llama.cpp itself looks for, at the LAST
+        # block. With the blocks before it, this is a model that drafts for
+        # itself; on its own, it is that head extracted into a drafter file.
+        return "main" if sc.get("blk0") else "draft"
+    if sc.get("mtp_names") or sc.get("eagle_names"):
+        return "draft"                            # a head by any other tensor name
+    if sc.get("vision") and not meta.get(arch + ".block_count"):
+        return "vision"                           # a tower a model CARRIES is not
+    low = os.path.basename(path).lower()          # a projector; only then, the name
     if "mmproj" in low or "-vision" in low or low.startswith("vision"):
         return "vision"
     if "mtp" in re.split(r"[^a-z0-9]+", low) or "draft" in low or "eagle" in low:
@@ -2009,7 +2401,8 @@ def list_models(cfg):
                               "arch": _f188.get("arch", ""),
                               "archLabel": _f188.get("label", ""),
                               "blocks": _f188.get("blocks", 0),
-                              "archCtx": _f188.get("ctx", 0)})
+                              "archCtx": _f188.get("ctx", 0),
+                              "mtpHead": bool(_f188.get("mtpHead"))})
     items.sort(key=lambda x: x["name"].lower())
     _kind_flush()
     _took = (time.time() - _t_scan) * 1000
@@ -2180,6 +2573,16 @@ def api_state():
         script = s.get("script") or ""
         actual = (parse_ps1_port(script) if script else None) or s.get("port")
         st = slot_status(actual)
+        # a card that never turns green used to say nothing at all about why
+        # (patch25)
+        if st.get("state") != "serving":
+            _lf25 = sorted(glob.glob(os.path.join(ld, "srv_%s_*.log"
+                                                  % glob.escape(str(s.get("id") or "")))),
+                           key=os.path.getmtime, reverse=True)
+            if _lf25:
+                _flt = slot_launch_fault(_lf25[0], st.get("state", ""))
+                if _flt:
+                    st = dict(st); st["fault"] = _flt
         spd = speeds_for_slot(s.get("id"), ld) if st["state"] in ("serving", "loading") else None
         scan_slot_errors(s.get("id"), s.get("label", "?"), ld)
         last = next((h for h in hist if h.get("slotId") == s.get("id")), None)
@@ -2266,7 +2669,7 @@ def run_fleet(extra):
         if (p.stderr or "").strip():
             log += "\n" + p.stderr
         for ln in log.splitlines():
-            if ERR_RX.search(ln):
+            if ERR_RX.search(ln) and not BENIGN_RX.search(ln):
                 log_error("fleet", ln)
         return log.strip() or "(no output)"
     except subprocess.TimeoutExpired:
@@ -3098,6 +3501,10 @@ def _wav_join(datas):
     return buf.getvalue()
 
 
+_TH_MAKE = {}            # eid -> Lock, held while that thought is synthesised
+_TH_MAKE_LOCK = threading.Lock()
+
+
 def tts_thought_make(who, text, cfg=None):
     """Synthesize a thought in `who`'s remembered reference with the echo baked in.
     Cached by content. Returns (eid, seconds) or (None, reason)."""
@@ -3113,67 +3520,85 @@ def tts_thought_make(who, text, cfg=None):
         return None, "no voice learned for %s yet - they need to speak one line first" % who
     eid = "th" + hashlib.sha1((who + "|" + text).encode("utf-8")).hexdigest()[:12]
     out = os.path.join(TTSW.dir(), "out-%s.wav" % eid)
-    if not os.path.isfile(out):
-        st = cfg.get("settings", {})
-        mid = st.get("ttsAcppModelId") or "higgs"
-        base = "http://127.0.0.1:%d" % tts_server_port(cfg)
-        _t0m = time.time()
-        # ONE sentence per request: audio.cpp ends a clip at a sentence's EOC on
-        # its own schedule - the owner's field wav held sentence 1 of 2, 5.6 s of
-        # a 7.5 s thought. Ask for each sentence and join the answers. (patch179)
-        _parts = [p for p in re.split(r"(?<=[.!?])\s+", str(text or "").strip())
-                  if p.strip()][:4] or [str(text or "")]
-        _wavs = []
-        for _p179 in _parts:
-            wav, _hdrs = tts_acpp_speak(base, mid, _p179, tts_ref_canonical(ref))
-            if not wav:
-                return None, "no audio returned by audio.cpp"
-            _wavs.append(wav)
-        wav = _wav_join(_wavs)
-        _syn = time.time() - _t0m
-        with open(out, "wb") as f:
-            f.write(wav)
-        tts_echo_wav(out)
-        TTSW.prune()
+    # ONE synthesis per thought. The warm-up armed on the first chunk and the fire
+    # that follows it ask for the SAME eid, and a file-exists cache cannot see a wav
+    # that is still being written: both synthesised, both wrote, and the second take
+    # held the single audio.cpp slot while the reply's own next chunk queued behind
+    # it - 2.7s and 4.7s in the owner's field log, which is the very delay that
+    # closed the arriving window. The second caller now waits and reads the first
+    # one's answer; `with` releases it past every early return below. (patch39)
+    with _TH_MAKE_LOCK:
+        _mk = _TH_MAKE.setdefault(eid, threading.Lock())
+        for _k in list(_TH_MAKE)[:-24]:          # keep the last 24, never a held one
+            if _k != eid and not _TH_MAKE[_k].locked():
+                _TH_MAKE.pop(_k, None)
+    with _mk:
+        if not os.path.isfile(out):
+            st = cfg.get("settings", {})
+            mid = st.get("ttsAcppModelId") or "higgs"
+            base = "http://127.0.0.1:%d" % tts_server_port(cfg)
+            _t0m = time.time()
+            # ONE sentence per request: audio.cpp ends a clip at a sentence's EOC on
+            # its own schedule - the owner's field wav held sentence 1 of 2, 5.6 s of
+            # a 7.5 s thought. Ask for each sentence and join the answers. (patch179)
+            _parts = [p for p in re.split(r"(?<=[.!?])\s+", str(text or "").strip())
+                      if p.strip()][:4] or [str(text or "")]
+            _wavs = []
+            for _p179 in _parts:
+                wav, _hdrs = tts_acpp_speak(base, mid, _p179, tts_ref_canonical(ref),
+                                            tts_ref_text(ref, cfg))
+                tts_ref_learn(ref, cfg)
+                # a voiced thought conditions the session like any spoken line: the
+                # change detector and the ledger's `prev` must know (patch7)
+                tts_conditioned(os.path.splitext(re.split(r"[\\/]", str(ref))[-1])[0])
+                if not wav:
+                    return None, "no audio returned by audio.cpp"
+                _wavs.append(wav)
+            wav = _wav_join(_wavs)
+            _syn = time.time() - _t0m
+            with open(out, "wb") as f:
+                f.write(wav)
+            tts_echo_wav(out)
+            TTSW.prune()
+            try:
+                TTSW.blk.acquire()
+                TTSW.log("")
+                TTSW.log("\U0001F4AD %s (thought): \u3030 %s \u3030" % (who, text))
+                TTSW.log("")
+                with _wave.open(out, "rb") as _wf0:
+                    _fr0 = _wf0.getframerate() or 24000
+                    _nf0 = _wf0.getnframes()
+                    _sec0 = _nf0 / float(_fr0)
+                # the SAME row shapes the dialogue writer uses, so the painter colours
+                # and spaces them identically - the owner's screenshot showed the old
+                # merged line uncoloured and glued to the next chunk
+                TTSW.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)"
+                         % ((_sec0 / _syn) if _syn else 0.0, _syn, _sec0))
+                TTSW.log("   %-9s%6.0f ms   (synthesis)" % ("server:", _syn * 1000.0))
+                TTSW.log("   %-9s%13d samples @ %d Hz" % ("audio:", _nf0, _fr0))
+                TTSW.log("\U0001F4BE Saved: %s (%.1f KB)   voice: %s"
+                         % (os.path.basename(out), os.path.getsize(out) / 1024.0,
+                            os.path.basename(str(ref))))
+            except Exception:
+                pass
+            # NO wave marks here: the dashboard splicer treats a waved line as SPOKEN
+            # dialogue and inserted this note under the nearest record as a response
+            # row - which is exactly the bug the owner photographed
+            TTSW.log("")
+            TTSW.log("\U0001F4AD\U0001F50A Thought voiced: \U0001F4AD %s: \u3030 %s \u3030"
+                     % (who, text))
+            TTSW.log("")
+            try:
+                TTSW.blk.release()
+            except Exception:
+                pass
+        secs = 0.0
         try:
-            TTSW.blk.acquire()
-            TTSW.log("")
-            TTSW.log("\U0001F4AD %s (thought): \u3030 %s \u3030" % (who, text))
-            TTSW.log("")
-            with _wave.open(out, "rb") as _wf0:
-                _fr0 = _wf0.getframerate() or 24000
-                _nf0 = _wf0.getnframes()
-                _sec0 = _nf0 / float(_fr0)
-            # the SAME row shapes the dialogue writer uses, so the painter colours
-            # and spaces them identically - the owner's screenshot showed the old
-            # merged line uncoloured and glued to the next chunk
-            TTSW.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)"
-                     % ((_sec0 / _syn) if _syn else 0.0, _syn, _sec0))
-            TTSW.log("   %-9s%6.0f ms   (synthesis)" % ("server:", _syn * 1000.0))
-            TTSW.log("   %-9s%13d samples @ %d Hz" % ("audio:", _nf0, _fr0))
-            TTSW.log("\U0001F4BE Saved: %s (%.1f KB)   voice: %s"
-                     % (os.path.basename(out), os.path.getsize(out) / 1024.0,
-                        os.path.basename(str(ref))))
+            with _wave.open(out, "rb") as w:
+                secs = w.getnframes() / float(w.getframerate() or 1)
         except Exception:
             pass
-        # NO wave marks here: the dashboard splicer treats a waved line as SPOKEN
-        # dialogue and inserted this note under the nearest record as a response
-        # row - which is exactly the bug the owner photographed
-        TTSW.log("")
-        TTSW.log("\U0001F4AD\U0001F50A Thought voiced: \U0001F4AD %s: \u3030 %s \u3030"
-                 % (who, text))
-        TTSW.log("")
-        try:
-            TTSW.blk.release()
-        except Exception:
-            pass
-    secs = 0.0
-    try:
-        with _wave.open(out, "rb") as w:
-            secs = w.getnframes() / float(w.getframerate() or 1)
-    except Exception:
-        pass
-    return eid, secs
+        return eid, secs
 
 
 # one pending AFTER-thought per speaker: the reply's chunks keep extending the
@@ -3187,12 +3612,79 @@ def _th_norm(s):
 
 
 REPLY_FULL = {}          # who -> (normalized spoken reply, when) - patch162
+REPLY_RING = {}          # who -> deque[(normalized reply, when)] - the matcher's
+                         # memory. REPLY_FULL keeps only the freshest reply for the
+                         # tag and thought readers; a character's SECOND reply used
+                         # to overwrite their first here too, and a chunk of the
+                         # first then matched nothing. Four deep, two minutes. (patch5)
+RING_DEPTH = 4
+RING_LIFE_S = 120.0
 # EVERY NPC chunk is traced here, thought or no thought - the field log showed the
 # reply's early chunks arriving BEFORE the streamed completion had yielded its
 # thought, so the conditional scheduler path never saw them. The trace is written
 # unconditionally; when the thought finally lands, the whole reply's playback is
 # reconstructed from it. (patch163)
 CHUNK_TRACE = {}         # who -> [(delivery_t, secs, normalized_text), ...]
+# Nothing new is DELIVERED before this wall-clock moment. A thought is spoken by the
+# panel while dialogue is spoken by the game, and the two knew nothing of each other:
+# the next character's first line started on top of the thought still sounding. The
+# lever is the one the BEFORE rule already uses - the response waits, so the game has
+# nothing to play yet. REPLACED, not raised: a newer thought cuts the one before it
+# off in the page (spkPlay pauses the old element), so the newest ending is the real
+# one and a stale longer floor must not outlive it. (patch39)
+TTS_FLOOR = [0.0]
+TTS_FLOOR_CAP_S = 12.0   # the ceiling the BEFORE hold has always had
+
+
+def tts_floor_set(secs):
+    """A thought is speaking for `secs`. Half a second after it the room is free -
+    the same half second the BEFORE rule leaves between thought and dialogue."""
+    try:
+        TTS_FLOOR[0] = time.time() + max(0.0, float(secs or 0.0)) + 0.5
+    except Exception:
+        pass
+
+
+# A chunk is written into CHUNK_TRACE when its synthesis RETURNS, so a request the
+# panel is still holding open leaves no mark anywhere. "The reply is still arriving"
+# was decided from that trace alone, which made a slow chunk indistinguishable from
+# no chunk at all: the owner's 08:50:44 field line spent 12.7s inside one request,
+# the 3.5s quiet window closed while it was in flight, and the thought spoke 3.0s
+# before the last chunk was even delivered. An OUTSTANDING request is now evidence
+# in its own right. (patch39)
+TTS_INFLIGHT = {}        # eid -> (who, posted_at) - open chunk requests
+TTS_INFLIGHT_LOCK = threading.Lock()
+TTS_INFLIGHT_MAX_S = 30.0   # an entry older than this is a leak, not a delivery
+
+
+def tts_inflight_add(eid, who):
+    """This speaker has a chunk request open. Keyed by the line's own id so the
+    caller's `finally` can clear it whatever becomes of the request."""
+    if not eid or not who:
+        return
+    with TTS_INFLIGHT_LOCK:
+        TTS_INFLIGHT[eid] = (who, time.time())
+
+
+def tts_inflight_drop(eid):
+    if not eid:
+        return
+    with TTS_INFLIGHT_LOCK:
+        TTS_INFLIGHT.pop(eid, None)
+
+
+def tts_inflight_since(who):
+    """When this speaker's OLDEST open chunk request was posted, 0.0 if none.
+    Bounded: an entry past TTS_INFLIGHT_MAX_S is a bookkeeping leak and must not
+    hold a thought back for the rest of the session."""
+    if not who:
+        return 0.0
+    now = time.time()
+    with TTS_INFLIGHT_LOCK:
+        return min((t for (w, t) in TTS_INFLIGHT.values()
+                    if w == who and now - t < TTS_INFLIGHT_MAX_S), default=0.0)
+
+
 MOOD_QUEUE = {}          # who -> ([alias pairs in reading order], when) - patch168
 
 
@@ -3205,8 +3697,10 @@ def tts_npc_mood_arm(who, text, cool=frozenset()):
     control token, so Higgs finally HEARS the emotion instead of the panel only
     painting a face. Everything downstream is the same wire the player rides:
     tts_apply_tags, the final-off board, this character's own cooldown limits.
-    Emotions measured to break the voice (TTS_EMOTION_BLOCK) are consumed but
-    never injected, exactly as the alias pass refuses them. (patch169)
+    The arm reads the SAME final-off board the wire does, so a tag switched off on
+    the page is refused here too - it writes a finished control token, and the wire
+    gate leaves a line that already carries one alone, so this is the only place that
+    refusal can happen for an NPC. (patch42)
 
     Each chunk takes the NEXT tag the model wrote, in reading order: the model
     decides how many emotions a reply carries and where they change, and the
@@ -3235,12 +3729,17 @@ def tts_npc_mood_arm(who, text, cool=frozenset()):
     # SOUND tags are never injected: SkyrimNet performs [chuckle] itself as a
     # spoken *laughs* prefix, and injecting the token too doubled the laugh -
     # the owner's field line said it twice. Emotions and styles only. (patch171)
+    # The arm writes a FORMED <|emotion:x|> token, and tts_apply_tags returns a line
+    # that already carries one untouched - so the wire gate never saw what the arm had
+    # put there, and a tag switched off on the board was honoured for the player and
+    # ignored for every NPC. Both vocabularies are accepted here: the board says
+    # EMOTION-ANGER, the cooldowns say emotion:anger, and tag_pair maps either. (patch42)
+    cool = frozenset(tag_pair(_w) for _w in (cool or ()))
     _elig = [_pr for _pr in q[0] if _pr[0] in ("emotion", "style")]
     if not _elig:
         return text
     pick = _elig[0]
-    if (pick[0] == "emotion" and pick[1] in TTS_EMOTION_BLOCK) \
-            or ("%s:%s" % pick) in cool:
+    if ("%s:%s" % pick) in cool:
         q[0].remove(pick)               # refused, and the next chunk moves on
         return text
     if len(_elig) > 1:
@@ -3255,6 +3754,28 @@ def tts_chunk_trace(who, secs, text):
         del q[:-12]
 
 
+def _th_why(who, why, nf, chunk_text):
+    """Say why a chunk was not judged the last one.
+
+    The decision was silent, so a thought landing early looked identical whether
+    the reply was missing, stale, or simply did not match - three different bugs
+    with one symptom, and no way to tell them apart from a log. (patch38)
+    """
+    # ONLY when a thought is actually waiting on this speaker's last chunk. The
+    # predicate is called for every chunk of every line; explaining a verdict
+    # nobody is waiting on would fill the log, and it made a pure test write a
+    # file as a side effect. (patch38)
+    try:
+        with TH_AFTER_LOCK:
+            if not TH_AFTER.get(who):
+                return
+        _nc = _th_norm(chunk_text)
+        calterm_log(["thought NOT-FINAL %s: %s  | reply tail %r | chunk tail %r"
+                     % (who, why, str(nf or "")[-28:], _nc[-28:])])
+    except Exception:
+        pass
+
+
 def tts_chunk_is_last(who, chunk_text):
     """The owner's rule: the proxy has SEEN the whole reply, so the final TTS
     chunk is recognised, not counted - it is the one whose text ends the reply.
@@ -3263,10 +3784,16 @@ def tts_chunk_is_last(who, chunk_text):
     full = REPLY_FULL.get(who)
     # a STALE reply is no reply: the owner's 02:38:52 chunk raced its own
     # completion and matched the PREVIOUS reply's text forever - fresh only
-    if not full or time.time() - full[1] > 25.0:
+    if not full:
+        _th_why(who, "no reply kept for this speaker", "", chunk_text)
+        return False
+    if time.time() - full[1] > 25.0:
+        _th_why(who, "the kept reply is %.1fs old" % (time.time() - full[1]),
+                full[0], chunk_text)
         return False
     nf, nc = full[0], _th_norm(chunk_text)
     if not nf or not nc:
+        _th_why(who, "nothing to compare after normalising", nf, chunk_text)
         return False
     # match by COMMON SUFFIX: the true final chunk ENDS as the reply ends,
     # whatever SkyrimNet injected in front of it. Tail-probe endswith could
@@ -3277,7 +3804,11 @@ def tts_chunk_is_last(who, chunk_text):
     while (_n < len(nf) and _n < len(nc)
            and nf[len(nf) - 1 - _n] == nc[len(nc) - 1 - _n]):
         _n += 1
-    return _n >= min(12, len(nf), len(nc))
+    _ok = _n >= min(12, len(nf), len(nc))
+    if not _ok:
+        _th_why(who, "the chunk does not end where the reply ends (%d shared)" % _n,
+                nf, chunk_text)
+    return _ok
 
 
 TH_START_LAT = 0.45      # delivery -> audible, per re-anchor
@@ -3302,7 +3833,7 @@ def tts_thought_fire(who):
     with TH_AFTER_LOCK:
         q = TH_AFTER.get(who) or []
         p = q[0] if q else None
-        if p is not None and not p.get("fin") and p.get("defer", 0) < 3:
+        if p is not None and not p.get("fin"):
             _rf = REPLY_FULL.get(who)
             _nf = _rf[0] if (_rf and time.time() - _rf[1] < 25.0) else ""
             _tr = CHUNK_TRACE.get(who, [])
@@ -3313,7 +3844,11 @@ def tts_thought_fire(who):
             # quiet for 3.5s means the missing chunk is not coming, and the
             # chain fires on what really played. (patch182)
             _last_rx = max((r[0] for r in _tr), default=0.0)
-            _arriving = (time.time() - _last_rx) <= 3.5
+            # An open request is not a guess: the reply demonstrably has not ended,
+            # because the panel is still holding one of its chunks. The quiet window
+            # stays as the fallback for chunks that have already come back.
+            _held = tts_inflight_since(who)
+            _arriving = bool(_held) or (time.time() - _last_rx) <= 3.5
             # unknown or stale reply text claims NOTHING: the defer stands down
             # and the chain fires exactly as patch170 did
             def _cs172(a, b):
@@ -3324,26 +3859,37 @@ def tts_thought_fire(who):
             _unfinished = bool(_nf) and _arriving and not any(
                 r[2] and _cs172(_nf, r[2]) >= min(12, len(_nf), len(r[2]))
                 for r in _tr[-3:])
-            if _unfinished:
+            # THREE defers bounds a GUESS - the quiet window, where an abandoned
+            # chunk must not be waited on forever. A request still open is not
+            # guessed at, so it waits on the clock instead: the owner's 12.7s chunk
+            # exhausted the 6s ladder and fired into its own reply. (patch39)
+            _cap = 3 if not _held else int(TTS_INFLIGHT_MAX_S / 2.0)
+            if _unfinished and p.get("defer", 0) < _cap:
                 p["defer"] = p.get("defer", 0) + 1
                 p["end"] = time.time() + 2.0
                 tm = threading.Timer(2.0 + TH_FIRE_PAD, tts_thought_fire, args=(who,))
                 tm.daemon = True
                 p["timer"] = tm
                 tm.start()
-                calterm_log(["thought DEFER %s: reply still arriving, +2.0s (%d)"
-                             % (who, p["defer"])])
+                calterm_log(["thought DEFER %s: %s, +2.0s (%d/%d)"
+                             % (who,
+                                ("a chunk is still open (%.1fs)" % (time.time() - _held))
+                                if _held else "reply still arriving",
+                                p["defer"], _cap)])
                 return
         p = q.pop(0) if q else None
         if not q:
             TH_AFTER.pop(who, None)
     if not p:
         return
-    eid, _why = tts_thought_make(who, p["text"])
+    eid, _secs = tts_thought_make(who, p["text"])
     calterm_log(["thought FIRE %s: waited %.1fs%s"
                  % (who, time.time() - p.get("t0", time.time()),
                     "" if eid else " - synthesis failed, nothing to play")])
     if eid:
+        # claimed BEFORE the broadcast: the next turn's first chunk can already be
+        # in the panel's hands by the time the page starts playing this
+        tts_floor_set(_secs)
         sse_notify("replay", {"id": eid})
 
 
@@ -3428,8 +3974,124 @@ def api_tts_thought(body):
                                 (body or {}).get("text"))
     if not eid:
         return {"error": why}
+    tts_floor_set(why)      # on success the second value is the wav's own seconds
     sse_notify("replay", {"id": eid})
     return {"ok": True, "id": eid}
+
+
+_VR_BUF_RX = re.compile(r"load_tensors:\s+(\S+) model buffer size =\s+([\d.]+) MiB")
+_VR_KV_RX = re.compile(r"llama_kv_cache:\s+\S+ KV buffer size =\s+([\d.]+) MiB")
+_VR_RS_RX = re.compile(r"llama_memory_recurrent:\s+\S+ RS buffer size =\s+([\d.]+) MiB")
+_VR_CP_RX = re.compile(r"sched_reserve:\s+(\S+) compute buffer size =\s+([\d.]+) MiB")
+_VR_MTP_RX = re.compile(r"\[spec\] estimated memory usage of MTP context is ([\d.]+) MiB")
+_VR_FREE_RX = re.compile(r"GPU free VRAM:\s+([\d,]+) MiB")
+
+
+SLOT_STALL_S = 45.0          # a load that has said nothing for this long is stuck
+
+
+def slot_launch_fault(path, state):
+    """Why a slot that was asked to start is still not answering, or "".
+
+    The panel launches fleet servers into their own consoles, so unlike the
+    speech server there is no process handle to poll - a launch that dies leaves
+    a card that simply never turns green. The log is the only witness, and the
+    panel already tails it. A port that is shut while the log has stopped growing
+    is a launch that ended; the last line it managed is the most useful thing
+    anyone can be told. (patch25)
+    """
+    if state == "serving" or not path:
+        return ""
+    try:
+        quiet = time.time() - os.path.getmtime(path)
+    except OSError:
+        return ""
+    if quiet < SLOT_STALL_S:
+        return ""                      # still writing: it is loading, not dead
+    rep = slot_vram_report(path)
+    if not rep.get("any") and not rep.get("lastLine"):
+        return ""                      # nothing was ever written; not ours to judge
+    if rep.get("ready"):
+        return ("the server finished loading but is not answering on its port - "
+                "it may have exited afterwards")
+    last = rep.get("lastLine") or ""
+    return ("the launch stopped after %.0fs without finishing - last log line: %s"
+            % (quiet, last or "(nothing)"))
+
+
+def slot_vram_report(path):
+    """What the last launch in a slot's console log actually allocated, in MiB.
+
+    Read from the log the card already tails, so it works for generated and
+    hand-written launchers alike. The lines are llama.cpp's own; the launcher's
+    VRAM REPORT block is deliberately NOT trusted - it prints "STATUS: loaded"
+    over a launch that died. Phases are told apart by order: buffer lines after
+    a draft or spec marker belong to the drafter, after an mmproj marker to the
+    projector. (patch3)
+    """
+    out = {"any": False, "exited": False, "ready": False,
+           "weightsGpu": 0.0, "weightsHost": 0.0, "draftGpu": 0.0, "draftHost": 0.0,
+           "mmprojGpu": 0.0, "kv": 0.0, "kvDraft": 0.0, "rs": 0.0,
+           "compGpu": 0.0, "compHost": 0.0, "mtpCtx": 0.0, "freeAtLoad": 0.0,
+           "clamped": "", "lastLine": "", "fault": ""}
+    try:
+        with open(path, "rb") as f:
+            text = f.read(1 << 20).decode("utf-8", errors="ignore")
+        n = text.rfind("\n=== ")
+        sess = text[n + 1:] if n >= 0 else text
+        phase = "main"
+        for ln in sess.splitlines():
+            low = ln.lower()
+            if "loading draft model" in low or "creating mtp draft context" in low:
+                phase = "draft"
+            elif "mmproj" in low and ("load" in low or "buffer" in low):
+                phase = "mmproj"
+            if "clamping to" in low and "draft size" in low:
+                # the engine reduced what we asked for: say so rather than let the
+                # launcher's own banner speak for it (patch25)
+                out["clamped"] = ln.strip()[:200]
+                out["any"] = True
+            if ln.strip():
+                out["lastLine"] = ln.strip()[:200]
+            m = _VR_MTP_RX.search(ln)
+            if m:
+                out["mtpCtx"] = float(m.group(1)); out["any"] = True
+                continue
+            m = _VR_BUF_RX.search(ln)
+            if m:
+                dev, mib = m.group(1), float(m.group(2))
+                host = "host" in dev.lower() or dev.upper() == "CPU"
+                key = ("mmprojGpu" if phase == "mmproj" else
+                       ("draftHost" if host else "draftGpu") if phase == "draft" else
+                       ("weightsHost" if host else "weightsGpu"))
+                out[key] += mib; out["any"] = True
+                continue
+            m = _VR_KV_RX.search(ln)
+            if m:
+                out["kvDraft" if phase == "draft" else "kv"] += float(m.group(1))
+                out["any"] = True
+                continue
+            m = _VR_RS_RX.search(ln)
+            if m:
+                out["rs"] += float(m.group(1)); out["any"] = True
+                continue
+            m = _VR_CP_RX.search(ln)
+            if m:
+                host = "host" in m.group(1).lower() or m.group(1).upper() == "CPU"
+                out["compHost" if host else "compGpu"] += float(m.group(2))
+                out["any"] = True
+                continue
+            m = _VR_FREE_RX.search(ln)
+            if m:
+                out["freeAtLoad"] = float(m.group(1).replace(",", ""))
+                continue
+            if "Server process exited before it became ready" in ln:
+                out["exited"] = True
+            elif ln.startswith("Server ready") or "all slots are idle" in ln:
+                out["ready"] = True
+    except Exception:
+        return out
+    return out
 
 
 def api_slot_log(body):
@@ -3447,7 +4109,11 @@ def api_slot_log(body):
             f.seek(0, 2)
             f.seek(max(0, f.tell() - 8192))
             text = ANSI_RX.sub("", f.read().decode("utf-8", errors="ignore"))
-        return {"log": text[-4000:]}
+        r = {"log": text[-4000:]}
+        if (body or {}).get("report"):
+            # the numbers live at the TOP of the session, past any tail window
+            r["report"] = slot_vram_report(files[0])
+        return r
     except Exception as e:
         return {"error": str(e)}
 
@@ -3551,6 +4217,9 @@ def api_remove(body):
     return {"ok": True}
 
 def api_settings(body):
+    # the naming path reads the typed name from a slot rather than the config; a save
+    # is the moment it can change
+
     cfg = load_config()
     st = cfg.setdefault("settings", {})
     if "networkMode" in body:
@@ -3629,6 +4298,7 @@ def api_settings(body):
     if st.get("launcherDir"):
         cfg["launcherDirs"] = [st["launcherDir"]]
     save_config(cfg)
+    player_name_setting(cfg)     # the naming path reads it from a slot, not the config
     PROXY.sync()
     try:
         TTSW.sync()
@@ -3646,30 +4316,138 @@ def llama_exe(cfg):
 
 DRAFT_SPEC_FLAGS = ("--spec-draft-model", "--spec-type", "--spec-draft-n-max",
                     "--spec-draft-ngl")
+# The drafter that is not a file: a model carrying its own MTP head drafts for
+# itself, and llama.cpp asks for nothing but the type - no path, no placement,
+# no depth. The card stores this sentinel where a drafter path would go. (patch3)
+DRAFT_BUILTIN = "@builtin-mtp"
 
 
-def draft_launch_args(draft_path, ngl=""):
+def draft_spec_type(path):
+    """The --spec-type a chosen drafter file needs, from its cached facts.
+    The rule itself lives in _spec_kind, beside the header read that feeds it."""
+    if not path:
+        return "draft-simple"
+    return str((model_facts(path) or {}).get("spec") or "draft-simple")
+
+
+def draft_n_max_ceiling(meta, kind):
+    """The largest draft size this drafter can actually produce, or 0 if unknown.
+
+    llama.cpp's own rule, from common_speculative_impl_draft_dflash:
+
+        n_draft_max = (is_dspark and sample_from_anchor) ? block_size
+                                                         : block_size - 1
+
+    A DFlash block is laid out [id_last, <mask> x (block_size-1)], so slot zero
+    holds a token that is already known and only the mask slots can be drafted -
+    one fewer than the block. An anchor-first DSpark drafter fills the whole one.
+
+    Every input is READ: block_size and sample_from_anchor come from the
+    drafter's own header, and DSpark-vs-DFlash from the presence of the
+    markov_w1.weight TENSOR, never from the file's name. A repack or a rename
+    cannot move a drafter between the two. (patch25)
+    """
+    m = meta or {}
+    bs = 0
+    for k, v in m.items():
+        if str(k).endswith(".block_size"):
+            try:
+                bs = int(v)
+            except Exception:
+                bs = 0
+            break
+    if bs <= 0:
+        return 0                       # the file did not say; claim nothing
+    anchor = True                      # llama.cpp's default when the key is absent
+    for k, v in m.items():
+        if str(k).endswith(".sample_from_anchor"):
+            anchor = ((str(v).strip().lower() == "true")
+                      if isinstance(v, str) else bool(v))
+            break
+    return bs if (str(kind) == "draft-dspark" and anchor) else bs - 1
+
+
+def draft_launch_args(draft_path, ngl="", params=None):
     """The flags a chosen drafter needs, decided by the drafter's OWN header.
 
-    A DFlash assistant is not a small model of the same family with a smaller
-    weight file: llama.cpp loads it through the speculative path, has to be told
-    which kind of speculation it is, and takes the drafter's own block size as the
-    draft depth. Meta's Muse Glimmer ships exactly this - arch "dflash",
-    block_size 16 - and a bare --model-draft cannot start it. A conventional
-    drafter keeps the flag it has always had. (patch185)
+    A drafter is not simply a smaller weight file: llama.cpp loads it through the
+    speculative path and runs NO speculation at all unless it is also told which
+    kind to run. `--spec-type` defaults to none; for a local file llama.cpp fills
+    it in only where the file proves its kind (an MTP head by its nextn tensor,
+    DFlash and DSpark by architecture and Markov head) and stays silent for
+    everything else. So a plain drafter named with `--model-draft` alone loads,
+    occupies its VRAM and drafts not one token, silently: the owner's Gemma 4
+    assistants did exactly that, and only the decode speed showed it.
+
+    Every drafter therefore leaves here with its type, read from the same tensor
+    facts llama.cpp reads. Kinds that carry their own draft depth in the header
+    (DFlash and DSpark blocks) say so; the rest leave depth to llama.cpp, which
+    reads the drafter's own head count. (v3.75 hotfix1; tensor-read kinds patch2)
     """
     p = str(draft_path or "").strip()
     if not p:
         return []
-    meta = gguf_meta(p) if os.path.isfile(p) else {}
-    if str(meta.get("general.architecture") or "").lower() != "dflash":
-        return [("--model-draft", p)]
-    out = [("--spec-draft-model", p), ("--spec-type", "draft-dflash"),
-           ("--spec-draft-n-max", str(int(meta.get("dflash.block_size") or 16)))]
-    if str(ngl).strip() != "":
+    if p == DRAFT_BUILTIN:
+        # the model drafts for ITSELF: llama.cpp builds the MTP context against
+        # the target already in VRAM (patch3). Its depth and thresholds are still
+        # the user's to set - Qwen 3.8's head is trained multi-step. (patch9)
+        kind, out, p = "draft-mtp", [("--spec-type", "draft-mtp")], ""
+    else:
+        kind = draft_spec_type(p)
+        out = [("--spec-draft-model", p), ("--spec-type", kind)]
+    if kind in ("draft-dflash", "draft-dspark"):
+        # These draft a whole block at a time. The panel used to send the block
+        # size itself, and llama.cpp clamped it every launch - "requested draft
+        # size exceeds the trained block size 16 -- clamping to 15" - because
+        # slot zero of a DFlash block holds a token already known. Send what the
+        # drafter can actually produce, so the number in the launcher is the
+        # number that runs. An anchor-first DSpark drafter fills the whole block
+        # and keeps the larger value. (patch25)
+        meta = gguf_meta(p) if os.path.isfile(p) else {}
+        _nmax = draft_n_max_ceiling(meta, kind)
+        if _nmax > 0:
+            out.append(("--spec-draft-n-max", str(_nmax)))
+    _sp9 = params or {}
+    def _num9(key, kind=int):
+        v = str(_sp9.get(key) or "").strip()
+        if v == "":
+            return None
+        try:
+            return str(kind(v))
+        except Exception:
+            return None
+    # tokens per draft step: DFlash and DSpark carry theirs in the header and the
+    # header wins - a user value there would break the block contract
+    if kind not in ("draft-dflash", "draft-dspark"):
+        _v9 = _num9("specNMax")
+        if _v9 is not None:
+            out.append(("--spec-draft-n-max", _v9))
+    _v9 = _num9("specNMin")
+    if _v9 is not None:
+        out.append(("--spec-draft-n-min", _v9))
+    _v9 = _num9("specPMin", float)
+    if _v9 is not None:
+        out.append(("--spec-draft-p-min", _v9))
+    _v9 = _num9("specPSplit", float)
+    if _v9 is not None:
+        out.append(("--spec-draft-p-split", _v9))
+    _bs9 = str(_sp9.get("specSample") or "").strip().lower()
+    if _bs9 == "on":
+        out.append(("--spec-draft-backend-sampling", None))
+    elif _bs9 == "off":
+        out.append(("--no-spec-draft-backend-sampling", None))
+    if str(ngl).strip() != "" and str(draft_path or "") != DRAFT_BUILTIN:
         # the drafter follows the main model's placement: the panel does not
-        # decide to put layers on a card the user kept off it
+        # decide to put layers on a card the user kept off it. The builtin head
+        # HAS no placement of its own - it rides the target already in VRAM.
         out.append(("--spec-draft-ngl", str(ngl).strip()))
+    for _key9, _flag9 in (("specCtkD", "--spec-draft-type-k"),
+                          ("specCtvD", "--spec-draft-type-v")):
+        _v9 = str(_sp9.get(_key9) or "").strip()
+        if _v9:
+            # a FILE drafter's own KV cache; the built-in head rides the target's
+            if params and str(draft_path or "") != DRAFT_BUILTIN:
+                out.append((_flag9, _v9))
     return out
 
 
@@ -3681,7 +4459,9 @@ def render_launcher_lines(t, dest, llexe):
     two can never drift apart.
     """
     vis_off = t.get("vision") in ("", "N/A", "Disabled", None)
-    drf_off = t.get("draft") in ("", "N/A", "Disabled", None)
+    drf_builtin = str(t.get("draft") or "") == DRAFT_BUILTIN
+    # builtin is not "off": its flags are re-injected below, minus every file flag
+    drf_off = (not drf_builtin) and t.get("draft") in ("", "N/A", "Disabled", None)
     out_lines = []
     drop_value_next = False
     for line in (t.get("content") or "").splitlines():
@@ -3697,14 +4477,15 @@ def render_launcher_lines(t, dest, llexe):
             drop_value_next = line.count('"') < 4 and "<MMPROJ_PATH>" not in line
             continue
         if (('"--model-draft"' in line or "<DRAFT_PATH>" in line
-             or any(('"%s"' % _f) in line for _f in DRAFT_SPEC_FLAGS)) and drf_off):
+             or any(('"%s"' % _f) in line for _f in DRAFT_SPEC_FLAGS))
+                and (drf_off or drf_builtin)):
             drop_value_next = line.count('"') < 4 and "<DRAFT_PATH>" not in line
             continue
         if "<GPU_ID>" in line and t.get("gpu") in ("", "N/A", "Disabled", None):
             continue
         line = (line.replace("<MODEL_PATH>", t.get("model") or "")
                     .replace("<MMPROJ_PATH>", t.get("vision") or "")
-                    .replace("<DRAFT_PATH>", t.get("draft") or "")
+                    .replace("<DRAFT_PATH>", "" if drf_builtin else (t.get("draft") or ""))
                     .replace("<TITLE>", t.get("title") or "")
                     .replace("<SELF_PATH>", dest)
                     .replace("<SELF_NAME>", os.path.basename(dest))
@@ -3733,7 +4514,7 @@ def render_launcher_lines(t, dest, llexe):
         _m = re.search(r'"(?:--n-gpu-layers|-ngl)"\s*,\s*"(\d+)"', "\n".join(out_lines))
         if _m:
             _ngl = _m.group(1)
-        for _f, _v in draft_launch_args(t.get("draft"), _ngl):
+        for _f, _v in draft_launch_args(t.get("draft"), _ngl, t):
             if _have and _f == "--model-draft":
                 continue
             _inject(_f, _v)
@@ -3758,11 +4539,22 @@ SERVER_PARAMS = [
     ("parallel",  "Parallel slots",      "int",  "1",     {"min": 1,    "max": 16,     "step": 1},    "--parallel",         "Concurrency (parallel slots)"),
     ("batch",     "Batch size",          "int",  "2048",  {"min": 32,   "max": 16384,  "step": 32},   "--batch-size",       "Prompt batching"),
     ("ubatch",    "Micro-batch size",    "int",  "512",   {"min": 32,   "max": 4096,   "step": 32},   "--ubatch-size",      "Prompt batching"),
-    ("threads",   "CPU threads",         "int",  "8",     {"min": 1,    "max": 128,    "step": 1},    "--threads",          "Threads / mmap / fit"),
+    ("threads",   "CPU threads",         "int",  "8",     {"min": 1,    "max": 128,    "step": 1},    "--threads",          "Threads / fit"),
     ("npredict",  "Generation cap",      "int",  "-1",    {"min": -2,   "max": 32768,  "step": 1},    "--n-predict",        "Generation cap"),
-    ("nommap",    "Disable mmap",        "sel",  "off",   {"opts": ["off", "on"]},                    "--no-mmap",          "Threads / mmap / fit"),
+    # --no-mmap, --mlock and --direct-io were all folded into --load-mode, and
+    # current llama.cpp warns on each of the old spellings. It also warns when the
+    # new flag is combined with an old one, so this REPLACES rather than adds.
+    #
+    # dio, not auto. MEASURED on a three-card rig: with "auto" the weights are
+    # memory-mapped, stay host-resident and get placed across whatever llama.cpp
+    # can reach - the model spreads over several GPUs and into system RAM. With
+    # "dio" (and equally with the old --no-mmap) each model loads into its pinned
+    # card and nowhere else. This flag decides WHERE the weights end up, not only
+    # how fast they are read, which is why it is a default and not a footnote.
+    ("loadmode",  "Model load mode",     "sel",  "dio",  {"opts": ["auto", "none", "mmap", "mlock", "mmap+mlock", "dio"]},
+                                                                              "--load-mode",        "Load mode"),
     ("nocontbat", "Disable cont batching","sel", "off",   {"opts": ["off", "on"]},                    "--no-cont-batching", "Concurrency (parallel slots)"),
-    ("fit",       "Auto fit to VRAM",    "sel",  "off",   {"opts": ["off", "on"]},                    "--fit",              "Threads / mmap / fit"),
+    ("fit",       "Auto fit to VRAM",    "sel",  "off",   {"opts": ["off", "on"]},                    "--fit",              "Threads / fit"),
     # -1 is llama.cpp's default and means unrestricted; 0 ends thinking at once; above
     # that is a real token budget. This is the SERVER default - a provider with its
     # Thinking switch off sends a per-request budget of 0, which is how one server can
@@ -3776,7 +4568,13 @@ SERVER_PARAMS = [
     ("reasoning",    "Reasoning",        "sel",  "on",    {"opts": ["on", "auto", "off"]}, "--reasoning",        "Reasoning on/off"),
     # llama.cpp default is 8. 0 disables checkpointing, which is what the No-cache switch
     # used to write unconditionally; it is a dial now so the two do not disagree.
-    ("ctxcheck",  "Context checkpoints", "int",  "8",     {"min": 0,    "max": 64,     "step": 1},    "--ctx-checkpoints",  "Context size"),
+    # 0, not llama.cpp's 8. Each checkpoint is a rollback copy of a slot's context
+    # kept in HOST memory, so eight of them on a 31B model at 15k context is real
+    # RAM - and this panel's own guide already said to set both this and
+    # --cache-ram to zero for a GPU-only cache while shipping the opposite
+    # default. A fleet server wants to fail loudly when a model does not fit,
+    # not to quietly borrow system memory and run slow. (patch34)
+    ("ctxcheck",  "Context checkpoints", "int",  "0",     {"min": 0,    "max": 64,     "step": 1},    "--ctx-checkpoints",  "Context size"),
 ]
 
 # Which heading each parameter is written under in a generated launcher, and the order
@@ -3786,7 +4584,7 @@ PARAM_GROUP = {
     "ngl": "GPU", "flash": "GPU", "fit": "GPU",
     "parallel": "Batching and concurrency", "batch": "Batching and concurrency",
     "ubatch": "Batching and concurrency", "nocontbat": "Batching and concurrency",
-    "threads": "CPU", "nommap": "CPU",
+    "threads": "CPU", "loadmode": "CPU",
     "npredict": "Generation",
     "reasonbudget": "Generation", "reasonfmt": "Generation", "reasoning": "Generation",
     "ctxcheck": "Context and cache",
@@ -3812,6 +4610,42 @@ PARAM_CAUTION = {
 
 def param_defaults():
     return {k: d for (k, _lab, _kind, d, _o, _f, _r) in SERVER_PARAMS}
+
+PIN_LINE = "$env:CUDA_VISIBLE_DEVICES"
+
+
+def ps1_force_gpu_pin(text, pin):
+    """Make the launcher pin exactly this card, wherever the text came from.
+
+    A card that adopts a TEMPLATE stores its text and the panel writes that text
+    verbatim; only flags INSIDE $llamaArgs are edited afterwards. The pin is an
+    environment line outside the array, so nothing touched it - a template
+    placeholder stayed a literal placeholder, CUDA could not parse it, and every
+    GPU stayed visible to every server. The pin is not decoration on a template,
+    it is the one thing a fleet launcher must get right, so it is written here
+    rather than hoped for. (patch31)
+    """
+    lines = str(text or "").replace("\r\n", "\n").split("\n")
+    out, seen = [], False
+    for ln in lines:
+        if ln.lstrip().startswith(PIN_LINE):
+            if not pin or seen:
+                continue                      # no card chosen, or a duplicate
+            out.append('%s = "%s"' % (PIN_LINE, pin))
+            seen = True
+            continue
+        out.append(ln)
+    if pin and not seen:
+        # before the argument array, so it is set when llama-server starts
+        for i, ln in enumerate(out):
+            if "$llamaArgs" in ln or "$args_" in ln:
+                out[i:i] = ['%s = "%s"' % (PIN_LINE, pin), ""]
+                seen = True
+                break
+        if not seen:
+            out.insert(0, '%s = "%s"' % (PIN_LINE, pin))
+    return "\n".join(out)
+
 
 def build_param_launcher(cfg, s, dest):
     """Compose a llama-server launcher from a slot's parameter set.
@@ -3841,13 +4675,18 @@ def build_param_launcher(cfg, s, dest):
     if (p.get("vision") or "N/A") not in ("", "N/A", "Disabled"):
         args.append(("Model", "--mmproj", p["vision"]))
     if (p.get("draft") or "N/A") not in ("", "N/A", "Disabled"):
-        for _df, _dv in draft_launch_args(p["draft"], gv("ngl")):
+        for _df, _dv in draft_launch_args(p["draft"], gv("ngl"), p):
             args.append(("Model", _df, _dv))
     args += [("Server", "--port", str(s.get("port") or "")),
              # the proxy is the LAN face; llama itself is reached from this machine
              ("Server", "--host", "127.0.0.1"),
              ("Server", "--alias", title)]
-    bare = {"nommap", "nocontbat", "fit"}          # switches, not values
+    bare = {"nocontbat"}                 # a switch that is absent when off
+    # --fit is NOT one of them. llama.cpp fits by DEFAULT, so writing nothing for
+    # "off" left it fitting - across every visible card, spilling to host memory -
+    # while the card said Auto fit to VRAM: off. A dial whose engine-side default
+    # is "on" has to say "off" out loud. Same law as enable_thinking: absent is
+    # not off. (patch30)
     for (k, _lab, kind, _dv, _o, flag, _ref) in SERVER_PARAMS:
         v = gv(k)
         if v == "":
@@ -3872,12 +4711,18 @@ def build_param_launcher(cfg, s, dest):
     # a build ignores id_slot on the OpenAI-compatible endpoint. Measured on two slots
     # with it set: `cache 0/384 0%` on every call.
     _rs188 = str(p.get("reasonStrength") or "").lower()
-    if model_arch(p.get("model") or "") in ARCH_REASON_STRENGTH:
+    _re9 = str(p.get("reasonEffort") or "").lower()
+    _arch9 = model_arch(p.get("model") or "")
+    if _arch9 in ARCH_REASON_STRENGTH:
         if _rs188 in REASON_STRENGTHS:
             args.append((PARAM_GROUP.get("reasoning", "Other"), CTK_FLAG,
                          '{"reasoning_strength":"%s"}' % _rs188))
     elif str(p.get("reasoning") or "").lower() == "off":
+        # off outranks effort: a depth for thinking that is not happening is noise
         args.append((PARAM_GROUP.get("reasoning", "Other"), CTK_FLAG, CTK_NO_THINK))
+    elif _arch9 in ARCH_REASON_EFFORT and _re9 in REASON_EFFORTS:
+        args.append((PARAM_GROUP.get("reasoning", "Other"), CTK_FLAG,
+                     '{"reasoning_effort":"%s"}' % _re9))
     args.append(("Logging", "-lv", "4"))          # verbose log level, kept out of the UI
     if str(p.get("noCache", "1")) in ("1", "true", "True"):
         args.append(("Context and cache", "--cache-ram", "0"))
@@ -3905,6 +4750,19 @@ def build_param_launcher(cfg, s, dest):
     L.append(")")
     L.append("")
     L.append('& "%s" @llamaArgs' % q(llama_exe(cfg)))
+    # The panel tells a server that DIED from one still loading by this exact
+    # sentence, which llama.cpp never prints. patch26 taught it to the two
+    # TEMPLATES and missed this builder - and this is the one every server card
+    # uses, so cards had no death reporting at all. There is no self-relaunch
+    # here and never was: the line above is the launch itself. (patch29)
+    L.append("$code = $LASTEXITCODE")
+    L.append("Write-Host \"\"")
+    L.append('Write-Host ("Server process exited before it became ready (exit {0})"'
+             " -f $code) -ForegroundColor Red")
+    L.append('Write-Host "This window stays open so the lines above can be read." '
+             "-ForegroundColor DarkGray")
+    L.append('if ($Host.Name -eq "ConsoleHost") { [void][System.Console]::ReadKey($true) }')
+    L.append("exit $code")
     L.append("")
     return "\n".join(L) + "\n"
 
@@ -4105,7 +4963,7 @@ def slot_flag_values(cfg, s, present="", force=()):
     that ran said another. (patch187)
     """
     p = s.get("params") or {}
-    out, bare = {}, {"nommap", "nocontbat", "fit"}
+    out, bare = {}, {"nocontbat"}
     # the model is not in SERVER_PARAMS - the launcher builder writes it itself - so it
     # was never in this dict, and changing it on the card reached the generated launcher
     # and no other
@@ -4122,7 +4980,7 @@ def slot_flag_values(cfg, s, present="", force=()):
         out["--mmproj"] = None if p.get("vision") in _off186 else str(p["vision"])
     if "draft" in p:
         _want186 = {} if p.get("draft") in _off186 else dict(
-            draft_launch_args(p.get("draft"), p.get("ngl") or ""))
+            draft_launch_args(p.get("draft"), p.get("ngl") or "", p))
         for _f186 in ("--model-draft", "-md") + DRAFT_SPEC_FLAGS:
             if _f186 in _want186:
                 out[_f186] = _want186[_f186]
@@ -4139,6 +4997,8 @@ def slot_flag_values(cfg, s, present="", force=()):
         if (k not in force and ('"%s"' % flag) not in present
                 and str(v) == str(dv)):
             continue                          # neither there already nor chosen
+        # patch30: "fit" left this set as bare, so off removed the flag entirely
+        # and llama.cpp fitted anyway. It carries its value like any other dial.
         out[flag] = "" if (k in bare and str(v) == "on") else (None if k in bare else str(v))
     out["--slot-prompt-similarity"] = "0" if cached_slot_map(s) else None
     # Reasoning off writes BOTH ways of saying it. Only ever the enable_thinking
@@ -4153,6 +5013,15 @@ def slot_flag_values(cfg, s, present="", force=()):
             out[CTK_FLAG] = '{"reasoning_strength":"%s"}' % _rs
         elif "reasoning_strength" in present:
             out[CTK_FLAG] = None        # back to the model's own default
+    elif model_arch(p.get("model") or "") in ARCH_REASON_EFFORT:
+        _rz = str(p.get("reasoning") or "").lower()
+        _re9 = str(p.get("reasonEffort") or "").lower()
+        if _rz == "off":
+            out[CTK_FLAG] = CTK_NO_THINK      # off outranks effort, as the creator does
+        elif _re9 in REASON_EFFORTS:
+            out[CTK_FLAG] = '{"reasoning_effort":"%s"}' % _re9
+        elif "reasoning_effort" in present or CTK_NO_THINK in present:
+            out[CTK_FLAG] = None        # back to the model's default (thinking, xhigh)
     else:
         _rz = str(p.get("reasoning") or "").lower()
         if _rz == "off":
@@ -4212,9 +5081,44 @@ def regen_slot_script(cfg, s, force=()):
             # is the root, the cards are a view of it, and two stores that are never
             # reconciled are two stores that drift (patch187)
             p.update(parse_launcher_params(edited))
+    # A slot with no card chosen gets one HERE, before the launcher is written.
+    # patch31 warned and pinned nothing; the owner's fresh install had no gpuId
+    # on any slot, so every server saw every card - the warning was right and
+    # useless. Least-loaded card first (fewest slots already pinned to it), the
+    # bigger card on a tie, and the choice is written back to the slot so the
+    # card shows what it runs on. (patch32)
+    if not (s.get("gpuId") or "").strip():
+        _gpus32 = cfg.get("gpus", []) or []
+        if _gpus32:
+            _cnt32 = {}
+            for _o32 in cfg.get("slots", []) or []:
+                if _o32 is not s and (_o32.get("gpuId") or "").strip():
+                    _cnt32[_o32["gpuId"]] = _cnt32.get(_o32["gpuId"], 0) + 1
+            def _mem32(g):
+                try:
+                    return int(str(g.get("mem", "0")).split()[0])
+                except (ValueError, TypeError):
+                    return 0
+            _pick32 = sorted(_gpus32,
+                             key=lambda g: (_cnt32.get(g.get("id"), 0),
+                                            -_mem32(g),
+                                            str(g.get("index", ""))))[0]
+            s["gpuId"] = _pick32.get("id") or ""
+            panel_log("[slot] %s had no GPU chosen - pinned to %s"
+                      % (s.get("label") or s.get("id"),
+                         _pick32.get("name") or _pick32.get("id")))
+    body = (custom + "\n") if custom else build_param_launcher(cfg, s, dest)
+    # the pin is enforced on the text that will actually run (patch31)
+    _pin31 = _gpu_pin_value(cfg, s.get("gpuId") or "")
+    body = ps1_force_gpu_pin(body, _pin31)
+    if not body.endswith("\n"):
+        body += "\n"
+    if not _pin31:
+        panel_log("[slot] %s has no GPU chosen and none exists to assign - its "
+                  "launcher pins nothing" % (s.get("label") or s.get("id")))
     try:
         with open(dest, "w", encoding="utf-8-sig", newline="\r\n") as f:
-            f.write((custom + "\n") if custom else build_param_launcher(cfg, s, dest))
+            f.write(body)
     except Exception as e:
         return {"error": "cannot write generated launcher: %s" % e}
     s["script"] = dest
@@ -4229,7 +5133,9 @@ def api_slot_params(body):
         return {"error": "unknown server slot"}
     p = s.setdefault("params", {})
     changed = []
-    for k in (["model", "vision", "draft", "noCache", "reasonStrength"]
+    for k in (["model", "vision", "draft", "noCache", "reasonStrength", "reasonEffort",
+               "specNMax", "specNMin", "specPMin", "specPSplit", "specSample",
+               "specCtkD", "specCtvD"]
               + [x[0] for x in SERVER_PARAMS]):
         if k in body:
             p[k] = str(body[k])
@@ -4247,7 +5153,7 @@ def parse_launcher_params(text):
     Used when someone hand-edits the launcher or loads an existing .ps1, so the
     cards stay a faithful view of what will actually run.
     """
-    out, bare = {}, {"nommap", "nocontbat", "fit"}
+    out, bare = {}, {"nocontbat"}
     # values a launcher sets up first and refers to later, e.g. $modelPath = "D:\\...gguf"
     vars_ = {}
     for vm in re.finditer(r'\$([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"', text):
@@ -4269,12 +5175,25 @@ def parse_launcher_params(text):
     out["vision"] = grab("--mmproj") or "N/A"
     # a draft model is named by either flag depending on which llama.cpp is in use
     out["draft"] = grab("--model-draft") or grab("--spec-draft-model") or grab("-md") or "N/A"
+    if out["draft"] == "N/A" and "draft-mtp" in (grab("--spec-type") or ""):
+        # a launcher that asks for MTP with no draft file is running the model's
+        # own head - the card must say so, or its next write strips the type
+        out["draft"] = DRAFT_BUILTIN
     # the kwarg is written with single quotes when it holds JSON, so it is read
     # with its own matcher rather than grab()'s double-quoted one
     # the kwarg may be single-quoted, double-quoted, or backtick-escaped inside
     # double quotes depending on who wrote it: the NAME is what anchors the read
     _rs188 = re.search(r"reasoning_strength[\"'`:\s]+([a-z]+)", text)
     out["reasonStrength"] = _rs188.group(1) if _rs188 else ""
+    _re9 = re.search(r"reasoning_effort[\"'`:\s]+([a-z]+)", text)
+    out["reasonEffort"] = _re9.group(1) if _re9 else ""
+    for _k9, _f9 in (("specNMax", "--spec-draft-n-max"), ("specNMin", "--spec-draft-n-min"),
+                     ("specPMin", "--spec-draft-p-min"), ("specPSplit", "--spec-draft-p-split"),
+                     ("specCtkD", "--spec-draft-type-k"), ("specCtvD", "--spec-draft-type-v")):
+        _v9 = grab(_f9)
+        out[_k9] = _v9 if _v9 is not None else ""
+    out["specSample"] = ("off" if present("--no-spec-draft-backend-sampling")
+                         else "on" if present("--spec-draft-backend-sampling") else "")
     OFF = {"off", "false", "0", "no"}
     for (k, _lab, _kind, _dv, _o, flag, _ref) in SERVER_PARAMS:
         if k in bare:
@@ -4321,13 +5240,15 @@ LAUNCH_FLAGS = {
     "--api-key": "an api key", "--timeout": "request timeout", "--keep": "tokens kept",
     "--rope-scaling": "rope scaling", "--rope-freq-base": "rope scaling",
     "--rope-freq-scale": "rope scaling", "--yarn-ext-factor": "rope scaling",
-    "--mlock": "locks weights in RAM", "--numa": "NUMA placement",
+    "--load-mode": "how weights are read: auto, none, mmap, mlock, mmap+mlock, dio",
+    "--mlock": "DEPRECATED - use --load-mode mlock", "--numa": "NUMA placement",
     "--no-mmproj": "no vision projector for this server",
     "--cache-reuse": "how much of a prompt may be reused",
     "--no-context-shift": "context shifting", "--swa-full": "sliding window attention",
     "--list-devices": "prints the devices and exits", "--props": "serves its own settings",
 
-    "--threads-batch": "batch threads", "--defrag-thold": "kv defragmentation",
+    "--threads-batch": "batch threads",
+    "--defrag-thold": "DEPRECATED - no longer needed, llama.cpp defragments on its own",
     "--slot-save-path": "where slots are saved", "--metrics": "prometheus metrics",
 }
 # Sampling belongs to the proxy: each provider sets its own per request, so whatever a
@@ -4559,16 +5480,27 @@ def api_slot_launcher_revert(body):
 
 APP_REPO = "Pt0l3my/PandorumLLM"
 _APP_UPD = {"t": 0.0, "res": None}
+# What a build is WITHIN one release, in the order such builds are made: the
+# release itself, then any hotfix answering something it shipped with, then the
+# patches that carry it forward. A hotfix and a patch of the same number are not
+# the same build, and text comparison called them equal.
+VER_TIER = {"": 0, "hotfix": 1, "patch": 2}
+
+
 def _ver_tuple(tag):
-    """v3.68-beta-patch4 -> (3, 68, 4); v3.67-beta-hotfix9 -> (3, 67, 9);
-    v3.65-beta -> (3, 65, 0). Comparing the tags as text called an older release
-    newer, because any difference at all counted as a difference."""
+    """v3.75-beta -> (3, 75, 0, 0); v3.75-beta-hotfix1 -> (3, 75, 1, 1);
+    v3.75-beta-patch1 -> (3, 75, 2, 1). Also reads the short forms the header
+    shows, v3.75-h1 and v3.75-p1. Comparing the tags as text called an older
+    release newer, because any difference at all counted as a difference."""
     t = str(tag or "").lower()
     m = re.search(r"v?([0-9]+)\.([0-9]+)", t)
     if not m:
         return None
-    n = re.search(r"(?:patch|hotfix|hf|p)[ _-]*([0-9]+)", t)
-    return (int(m.group(1)), int(m.group(2)), int(n.group(1)) if n else 0)
+    n = re.search(r"(hotfix|patch|hf|h|p)[ _-]*([0-9]+)", t)
+    if not n:
+        return (int(m.group(1)), int(m.group(2)), 0, 0)
+    tier = 1 if n.group(1) in ("hotfix", "hf", "h") else 2
+    return (int(m.group(1)), int(m.group(2)), tier, int(n.group(2)))
 
 PEER = {"t": 0.0, "state": None, "err": "", "addr": "", "ver": ""}
 _PEER_LOCK = threading.Lock()
@@ -5107,7 +6039,7 @@ def tts_pause_secs(text):
         return 0.0
 
 
-def tts_measure_row(text, secs, est=0, wall=0):
+def tts_measure_row(text, secs, est=0, wall=0, vt=""):
     """One spoken line as a measurement - pure, so the gate can hold it still.
 
     `est` is the BARE estimate that was in force for this line - before any
@@ -5116,6 +6048,17 @@ def tts_measure_row(text, secs, est=0, wall=0):
     """
     t = str(text or "")
     return {"at": time.strftime("%Y-%m-%d %H:%M:%S"), "chars": len(t),
+            # WHOSE line this was: the lead-in breath, the codec warm-up and the
+            # pace of a read are the speaker's, and they are most of a short line
+            "vt": str(vt or ""),
+            # and how much of it is SPOKEN. Markup is not read aloud, so a fit
+            # trained on raw length would price nineteen characters of
+            # <|emotion:sadness|> as if the speaker said them (patch15)
+            "bare": len(re.sub(r"<\|[^|>]*\|>", "", t).strip()),
+            "spoken": tts_voice_parts(t)[0],
+            "sfx": tts_voice_parts(t)[1], "dots": tts_voice_parts(t)[2],
+            "lex": 1 if tts_line_lexical(t) else 0,
+            "extra": round(tts_voice_extra(t), 1),
             "tags": tts_tag_count(t), "pause_s": round(tts_pause_secs(t), 2),
             "secs": round(float(secs), 2),
             # the seconds the line took to MAKE - secs/wall is the realtime factor,
@@ -5132,7 +6075,7 @@ def tts_measure_row(text, secs, est=0, wall=0):
             "attempt": int((TTS_SAMP_LAST or {}).get("attempt", 1))}
 
 
-def tts_measure_record(text, secs, est=0, wall=0):
+def tts_measure_record(text, secs, est=0, wall=0, vt=""):
     """Append ONE LINE to a record that survives a restart.
 
     patch85 rewrote the whole 500-row list for every line spoken - an O(n) file
@@ -5140,7 +6083,7 @@ def tts_measure_record(text, secs, est=0, wall=0):
     128th append compacts the file back to the last 500 rows.
     """
     try:
-        row = tts_measure_row(text, secs, est, wall)
+        row = tts_measure_row(text, secs, est, wall, vt)
         MEASURE_GEN[0] += 1              # the warm copy is stale from here
         with MEASURE_LOCK:
             with open(TTS_MEASURE_LOG, "a", encoding="utf-8") as f:
@@ -5228,6 +6171,201 @@ def tts_job_think(st, job):
     return str((st or {}).get(key, "off")).strip().lower() == "on"
 
 
+# What a line costs, fitted rather than guessed. From 78 measured takes on
+# 2026-08-17: tokens = 25.2 + 1.065 x chars, predicting each length's median to
+# within a token, with p95 only 1.03-1.10x the median once runaways are excluded.
+# The SLOPE belongs to the model and the language - it is pooled across every
+# voice. The INTERCEPT belongs to the speaker: breath, codec warm-up, trailing
+# silence and pace, which are most of a two-word line and vanish in a long one.
+# That split is why a voice needs only a handful of takes to be useful, while a
+# per-voice slope would sit degenerate until it had seen a spread of lengths.
+VOICE_SLOPE0 = 1.065         # tokens per character, cold start
+VOICE_BASE0 = 25.2           # tokens of overhead, cold start
+VOICE_SFX_TOK = 12           # a rendered sound effect is audio the text never counts
+VOICE_DOTS_TOK = 12          # an authored ellipsis is a pause the model performs
+VOICE_MIN_N = 4              # fewer takes than this and a voice has not spoken up
+VOICE_WIDE = 1.9             # margin while a voice is still new
+VOICE_TIGHT = 1.25           # and once its own spread is known
+VOICE_SD_K = 3.0             # standard deviations of its own residual, on top
+
+
+def tts_voice_key(ref_path):
+    """The voicetype a reference stands for. The vault stores <voicetype>.wav, so
+    the name IS the key; an unadopted upload still gives a stable one. (patch15)"""
+    b = os.path.basename(str(ref_path or "")).strip()
+    return os.path.splitext(b)[0].lower()
+
+
+def tts_voice_parts(text):
+    """(spoken_chars, n_sfx, n_dots, pause_s) - the one decomposition of a line.
+
+    Spoken characters exclude markup AND ellipsis runs: dots are performed as a
+    pause, not read as three characters, and pricing them both ways was quietly
+    double-charging every trailing "...". Everything that prices, fits, records
+    or exempts a line starts from this tuple. (patch16)
+    """
+    t = str(text or "")
+    bare = re.sub(r"<\|[^|>]*\|>", "", t).strip()
+    n_dots = len(re.findall(r"\.{2,}|\u2026", bare))
+    spoken = len(re.sub(r"\.{2,}|\u2026", "", bare).strip())
+    n_sfx = len(re.findall(r"<\|sfx:", t))
+    try:
+        pause = float(tts_pause_secs(t))
+    except Exception:
+        pause = 0.0
+    return spoken, n_sfx, n_dots, pause
+
+
+def tts_line_lexical(text):
+    """Is this line WORDS, or a performance? "Ahh...", a sigh tag, an "Mmm" - the
+    detectors have no business judging those: their length is legitimately
+    unpredictable and a recogniser hears no words in them because there are
+    none. They pass unjudged, and they do not teach the fit. (patch16)"""
+    spoken, n_sfx, n_dots, _p = tts_voice_parts(text)
+    if spoken >= 15:
+        return True
+    if n_sfx or n_dots:
+        return False
+    # a wordless vocalisation is breathy letters WITH a stretch: "Ahh", "Mmm",
+    # "Ooh". "Run. Now." shares some letters and none of the shape - the first
+    # rule here was a charset, and a charset cannot tell an order from a moan
+    words = re.findall(r"[a-z']+", str(text or "").lower())
+    return not (words
+                and all(re.fullmatch(r"[aeiouhmw]+", w) for w in words)
+                and any(re.search(r"(.)\1", w) for w in words))
+
+
+def tts_tag_costs(rows=None):
+    """(sfx_tokens, dots_tokens) - what a performed tag actually costs, measured.
+
+    Learned from lines that carried them, as the median residual per tag over
+    the pooled fit, clamped to a range a performance can plausibly occupy - one
+    poisoned row must not teach a 500-token sigh. Until enough tagged lines
+    exist the shipped constants answer. (patch16)
+    """
+    rows = tts_measure_rows() if rows is None else rows
+    def learn(key, other_key, other_cost, prior):
+        vals = []
+        for r in rows:
+            try:
+                k = float(r.get(key) or 0)
+                if k <= 0 or int(r.get("lex", 1)) == 0:
+                    continue
+                sp = float(r.get("spoken") if r.get("spoken") is not None
+                           else (r.get("bare") or r.get("chars") or 0))
+                tk = float(r.get("tok") or 0)
+                oth = float(r.get(other_key) or 0)
+            except Exception:
+                continue
+            if tk <= 0:
+                continue
+            v = (tk - VOICE_BASE0 - VOICE_SLOPE0 * sp - other_cost * oth) / k
+            if -20 < v < 200:
+                vals.append(v)
+        if len(vals) < 6:
+            return float(prior)
+        vals.sort()
+        return float(max(3.0, min(60.0, vals[len(vals) // 2])))
+    dots = learn("dots", "sfx", VOICE_SFX_TOK, VOICE_DOTS_TOK)
+    sfx = learn("sfx", "dots", dots, VOICE_SFX_TOK)
+    return sfx, dots
+
+
+def tts_voice_extra(text, rows=None):
+    """Tokens this line costs beyond its spoken characters.
+
+    A sound effect is performed, an ellipsis is held, an authored pause is waited
+    out - none of them are characters the speaker reads. This is written INTO the
+    record and subtracted when fitting, so what the model learns and what it
+    predicts are computed by the same code. Two separate versions of this
+    arithmetic is exactly how the first two fits went wrong. (patch15)
+    """
+    _sp, n_sfx, n_dots, pause = tts_voice_parts(text)
+    sfx_tok, dots_tok = tts_tag_costs(rows)
+    return float(sfx_tok * n_sfx + dots_tok * n_dots
+                 + pause * TTS_ACPP_FRAME_RATE)
+
+
+def tts_voice_stats(rows=None, vt=""):
+    """(n, base, sd, slope) for one voicetype - its own overhead and spread.
+
+    A runaway must never teach this: rows whose token count is wildly past what
+    the fit already expected are left out, or one bad take inflates every cap
+    that voice is ever given afterwards. (patch15)
+    """
+    rows = tts_measure_rows() if rows is None else rows
+    n = sx = sy = sxx = sxy = 0.0
+    for r in rows:                       # the slope is pooled over every voice
+        try:
+            if int(r.get("lex", 1)) == 0:
+                continue                 # a performance teaches pricing nothing
+            c = float(r.get("spoken") if r.get("spoken") is not None
+                      else (r.get("bare") or r.get("chars") or 0))
+            tk = float(r.get("tok") or 0) - float(r.get("extra") or 0)
+        except Exception:
+            continue
+        if c <= 0 or tk <= 0:
+            continue
+        n += 1; sx += c; sy += tk; sxx += c * c; sxy += c * tk
+    slope = VOICE_SLOPE0
+    den = n * sxx - sx * sx
+    if n >= 12 and den > 0:
+        cand = (n * sxy - sx * sy) / den
+        if 0.3 <= cand <= 4.0:           # a fit outside this is not speech
+            slope = cand
+    key = str(vt or "").strip().lower()
+    m = k = ssq = 0.0
+    for r in rows:
+        if str(r.get("vt") or "").strip().lower() != key or not key:
+            continue
+        try:
+            if int(r.get("lex", 1)) == 0:
+                continue
+            c = float(r.get("spoken") if r.get("spoken") is not None
+                      else (r.get("bare") or r.get("chars") or 0))
+            tk = float(r.get("tok") or 0)
+        except Exception:
+            continue
+        if c <= 0 or tk <= 0:
+            continue
+        try:
+            resid = tk - slope * c - float(r.get("extra") or 0)
+        except Exception:
+            resid = tk - slope * c
+        if resid > VOICE_BASE0 * 6:      # a runaway, not an overhead
+            continue
+        k += 1; m += resid; ssq += resid * resid
+    if k < VOICE_MIN_N:
+        return int(k), VOICE_BASE0, 0.0, slope
+    base = m / k
+    var = max(0.0, ssq / k - base * base)
+    return int(k), base, var ** 0.5, slope
+
+
+def tts_voice_tokens(text, vt="", rows=None):
+    """(predicted tokens, n, sd, slope) for this line in this voice."""
+    n, base, sd, slope = tts_voice_stats(rows, vt)
+    spoken = tts_voice_parts(text)[0]
+    pred = base + slope * spoken + tts_voice_extra(text, rows)
+    return max(1.0, pred), n, sd, slope
+
+
+def tts_voice_cap(text, vt="", rows=None, st=None):
+    """The cap this line should carry, from what this voice has actually cost.
+
+    A cap is a stop-loss, not a target: too low turns a good line into a failure
+    (audio.cpp answers a cap-hit with 500 and NO audio - the speech generated so
+    far is discarded), too high only means a runaway burns longer before it is
+    stopped. So the margin is wide while a voice is new and narrows to its own
+    measured spread once it has spoken enough. (patch15)
+    """
+    pred, n, sd, _slope = tts_voice_tokens(text, vt, rows)
+    mult = VOICE_TIGHT if n >= VOICE_MIN_N else VOICE_WIDE
+    cap = pred * mult + VOICE_SD_K * sd
+    return int(max(acpp_tok_floor(len(str(text or "")), st),
+                   min(int(cap), TTS_CAP_CEILING)))
+
+
 def autocal_mode(st):
     """off / proxy / llm, understanding the names earlier versions wrote.
 
@@ -5264,8 +6402,11 @@ def autocal_every(st):
 def _samp_key(samp):
     """One configuration, as a single comparable string."""
     s = samp or {}
+    # the key set comes from the one definition, never a copy of it here: three
+    # separate hard-coded lists of these names existed, and top-k reached only the
+    # ones that did not carry their own (patch23)
     return "  ".join("%s %s" % (k, _num_str(s[TTS_SAMP_FIELD[k]]))
-                     for k in ("temp", "top_p", "min_p", "rep")
+                     for k in TTS_SAMP_KEYS
                      if TTS_SAMP_FIELD[k] in s and str(s[TTS_SAMP_FIELD[k]]) != "")
 
 
@@ -5419,7 +6560,16 @@ def tts_autocal_fit(rows=None, fails=None):
 
 
 AUTOCAL_HEAD_MIN = 1.08        # never cap below a rounding error over the estimate
-AUTOCAL_HEAD_MAX = 1.60        # beyond this the guard is the better bound anyway -
+# 1.60 for a long time, and it never once stopped binding: every session the owner
+# sent printed "headroom 1.60" while the fit was asking for 2.65. That is not a
+# margin converging, it is a margin pinned. Worse, it was self-justifying - a line
+# that hits an estimate-decided cap enters the fit at cap/est, which IS the current
+# headroom by construction, so 452 of 1124 scored lines entered at exactly 1.60 and
+# held p95 down where the clamp was satisfied. The cap is already bounded by the
+# guard (`min(want, guard)`), which is what the old comment here claimed was the
+# better bound - so the headroom now defers to it instead of pre-empting it. What
+# remains is a sanity stop against a corrupted fit, not a working limit. (patch20)
+AUTOCAL_HEAD_MAX = 4.00        # beyond this the guard is the better bound anyway -
                                # and 2.5 was the pinned-bug era's smell, not a margin
 AUTOCAL_HEAD_PAD = 1.10        # over the worst seen: the next line can be worse
 AUTOCAL_HEAD_SEED = 1.35       # until the fit has lines to speak from
@@ -5484,7 +6634,7 @@ def _autocal_parse(text):
     return {"cps": round(cps, 2), "lead": round(lead, 2)}
 
 
-def tts_auto_cap(text, st, cfg=None, rows=None):
+def tts_auto_cap(text, st, cfg=None, rows=None, vt=""):
     """The per-line token cap, by whichever estimator the user chose.
 
     Returns (cap, note, est). Off returns the runaway guard unchanged - byte-identical
@@ -5502,6 +6652,18 @@ def tts_auto_cap(text, st, cfg=None, rows=None):
     guard = acpp_token_cap(text, st)
     mode = autocal_mode(st)
     if mode == "off":
+        # patch15: a voice that has spoken enough prices its own lines. Nothing
+        # here is a target - see WHAT THE CAP IS below - so the fitted number
+        # replaces a constant that was too tight on short lines and too loose on
+        # long ones. A voice with no record falls back to that same constant.
+        if vt:
+            _rows15 = tts_measure_rows() if rows is None else rows
+            _n15, _b15, _sd15, _sl15 = tts_voice_stats(_rows15, vt)
+            if _n15 >= VOICE_MIN_N:
+                _c15 = tts_voice_cap(text, vt, _rows15, st)
+                _p15 = tts_voice_tokens(text, vt, _rows15)[0]
+                return _c15, ("\U0001F5E3 %s: %d takes, cap %d (expects %d)"
+                              % (vt, _n15, _c15, int(_p15))), _p15
         return guard, "", 0.0
     _t0 = time.time()
     t = str(text or "")
@@ -5576,7 +6738,8 @@ def api_tts_meter(body=None):
     with TTS_METER_LOCK:
         return {"ok": True, "line": dict(TTS_METER),
                 "samp": {k: str(st.get(TTS_SAMP_KEYS[k], "") or "") for k in TTS_SAMP_KEYS},
-                "sampSent": tts_samp_now(st)}
+                "sampSent": tts_samp_now(st),
+                "sampKeys": {k: 1 for k in TTS_SAMP_KEYS}}
 AUTOCAL_EST = [0.0]             # and the bare estimate it produced, for the record
 AUTOCAL_CAP = [0]               # and the cap that estimate became
 AUTOCAL_BOUND = [""]            # and which of estimate/floor/guard settled it
@@ -5685,8 +6848,19 @@ TTS_ORDER = {"emotion": 0, "prosody": 1, "style": 2}
 # Uppercase only, and the separator may be anything the mod left behind, so
 # EMOTION-FEAR, EMOTION_FEAR, EMOTION FEAR and EMOTIONFEAR all land the same
 # way. Caps matter: "emotion" and "style" are ordinary English words.
+# The four families, written any way a model or the mod writes them: SkyrimNet's
+# own [EMOTION-ANGER], the lowercase [emotion-anger] its prompt asks the model for,
+# and the damaged forms that come back when something upstream splits a line
+# through a tag - a missing closing bracket, a stray full stop. The panel is the
+# last thing between the text and a voice, so it recognises all of them.
 TTS_CAPS_RX = re.compile(
-    r"\[?\s*(?<![A-Za-z0-9])(EMOTION|PROSODY|STYLE|SFX)((?:[ \t\-_]*[A-Z]+){1,3})(?![A-Za-z])\s*\]?")
+    r"\[?\s*(?<![A-Za-z0-9])(EMOTION|PROSODY|STYLE|SFX)((?:[ \t\-_]*[A-Za-z]+){1,3})(?![A-Za-z])\s*\]?",
+    re.I)
+# Anything still SHAPED like one of those tags after the pass above ran - an
+# unknown value, a truncation, a family the catalog has since grown. Never spoken.
+TTS_TAGSHAPE_RX = re.compile(
+    r"\[?\s*(?<![A-Za-z0-9])(?:emotion|prosody|style|sfx)[ \t\-_][A-Za-z][A-Za-z \t\-_]{0,30}\]?",
+    re.I)
 TTS_TAG_ANY_RX = re.compile(r"<\|[^|>]{0,40}\|>")
 
 
@@ -5896,10 +7070,10 @@ def _tts_sentence(sentence, blocked=frozenset()):
         if m is None:
             break
         fam = m.group(1).lower()
-        words = list(re.finditer(r"[A-Z]+", m.group(2)))
+        words = list(re.finditer(r"[A-Za-z]+", m.group(2)))
         value, end = None, m.end()
         for n in range(len(words), 0, -1):      # longest value wins
-            key = _TTS_SQUASH("".join(w.group(0) for w in words[:n]))
+            key = _TTS_SQUASH("".join(w.group(0) for w in words[:n]).upper())
             if key in TTS_LOOKUP[fam]:
                 value, end = TTS_LOOKUP[fam][key], m.start(2) + words[n - 1].end()
                 if sentence[end:end + 1] == "]":
@@ -5919,7 +7093,7 @@ def _tts_sentence(sentence, blocked=frozenset()):
             else:
                 piece = "<|sfx:%s|>%s" % (value, word)
                 if rest and rest[0] not in ".,!?;:":
-                    piece += ","
+                    piece += ", "
                 out.append(piece)
         elif value in TTS_INLINE.get(fam, ()):
             out.append("<|%s:%s|>" % (fam, value))
@@ -5939,8 +7113,6 @@ def _tts_render(tags, blocked=frozenset()):
     """
     kept = {}
     for fam, value in tags:
-        if fam == "emotion" and value in TTS_EMOTION_BLOCK:
-            continue               # measured to break the voice - see TTS_EMOTION_BLOCK
         if "%s:%s" % (fam, value) in blocked:
             continue               # the user's final gate - see ttsTagsFinalOff
         group = (fam, value.split("_")[0] if fam == "prosody" else "")
@@ -5995,6 +7167,11 @@ _TAG_SKIP = frozenset()
 # time; the template now lists every one Higgs has, including anger, fear and disgust -
 # which is what makes an aggressive line labellable at all. Every name here is a real
 # Higgs tag, which the gate checks.
+# The board offers EVERY emotion the engine has. What ships off is a SETTING, seeded
+# below into ttsTagsOff and ttsTagsFinalOff, and the prompt builder already drops
+# whatever that board has turned off - so PTI and PME are not offered these without
+# any prompt surgery, and the user can put any of them back. patch41 subtracted them
+# here instead, which removed the switch along with the tag. (patch42)
 _EMOTION_OFFER = frozenset(TTS_TAGS.get("emotion", ()))
 
 # TWO kinds, not four. Higgs has four tag families, but sfx, style and prosody are all
@@ -6177,7 +7354,16 @@ TAG_EXAMPLES = (
      "Excuse me. [SFX-COUGH] Dusty in here."),
     ("The bridge is just past the mill.",
      "The bridge is just past the mill."),
+    # the observed failure, verbatim: a flat test sentence was returned as
+    # singing. Neutral examples now outnumber tagged ones. (patch22)
+    ("This is a test of the text-to-speech system.",
+     "This is a test of the text-to-speech system."),
+    ("I will meet you at the gate at dawn.",
+     "I will meet you at the gate at dawn."),
 )
+
+
+_PTI_DOWN_SAID = [False]     # the skip is said once per outage, not per line
 
 
 def tts_tag_prompt(custom="", off=frozenset()):
@@ -6193,9 +7379,12 @@ def tts_tag_prompt(custom="", off=frozenset()):
               for label, words in TAG_OFFER}
     lines = [
         "Mark up one line of Skyrim dialogue for a voice actor. Return it word for word",
-        "with tags added - add nothing, change nothing.",
+        "- add nothing, change nothing.",
         "",
-        "At most one EMOTION and one AUDIO tag, either optional.",
+        "MOST LINES NEED NO TAGS: a plain statement is returned exactly as it came.",
+        "Add a tag only when the words themselves clearly call for one - a laugh",
+        "written out, an obvious outburst, a named feeling. When in doubt, no tag.",
+        "At most one EMOTION and one AUDIO tag.",
         "An EMOTION, STYLE or PROSODY tag goes at the START of the sentence it applies",
         "to - never at the end of the line. An SFX tag or a pause goes exactly where it",
         "happens.",
@@ -6293,6 +7482,28 @@ def tts_player_tag(text, cfg=None, timeout=2.0):
     rt = panel_route("pti", cfg)
     if not rt:
         return ""                   # not wired to a slot in Live Network yet
+    # the server it hangs off must actually be SERVING: without this check a
+    # stopped server cost every player line a full timeout before failing open,
+    # silently - two seconds of prep attributed to nothing. The probe is the
+    # cached one the fleet cards use, so this costs microseconds. (patch22)
+    # PTI and PME hang off a server without a listener of their own - Live Network
+    # shows them as "Proxy", not a port - so rt["port"] is empty for them and
+    # slot_status("") answers "unknown" forever. Every player line then went out
+    # untagged with the server sitting there serving perfectly. Ask about the
+    # SERVER, which is the thing that has to be up. (patch36)
+    _port22 = rt.get("port") or rt.get("server") or ""
+    _st22 = slot_status(_port22).get("state", "")
+    if _st22 != "serving":
+        if not _PTI_DOWN_SAID[0]:
+            _PTI_DOWN_SAID[0] = True
+            panel_log("[tts] player tags skipped - the PTI server (%s, port %s) "
+                      "is %s; lines go out untagged until it serves"
+                      % (rt.get("server", "?"), _port22 or "?",
+                         _st22 or "down"))
+        return ""
+    if _PTI_DOWN_SAID[0]:
+        _PTI_DOWN_SAID[0] = False
+        panel_log("[tts] the PTI server is back - player tags resume")
     line = str(text or "").strip()
     if not line or TTS_TAG_ANY_RX.search(line):     # already tagged by hand - leave it
         return ""
@@ -6310,11 +7521,12 @@ def tts_player_tag(text, cfg=None, timeout=2.0):
         sys_p += ("\n\nThe exchange so far might invite one of these:\n" + scene
                   + "\nThat is background, NOT what the player said. Decide from the "
                     "line itself; if it carries none of them, return it unchanged.")
-    if _spk_player[0]:
+    _pn = player_name_setting() or _spk_player[0]
+    if _pn:
         # the line under the tagger is the player's own; naming them lets the model
-        # read "I" and "my" as a person, not a blank - the name is the one the proxy
-        # learned from SkyrimNet's own prompts, never typed in here
-        sys_p += "\n\nThe line is spoken by the player, %s." % _spk_player[0]
+        # read "I" and "my" as a person, not a blank - the name typed on the TTS page
+        # where there is one, otherwise the one the proxy read from SkyrimNet's prompts
+        sys_p += "\n\nThe line is spoken by the player, %s." % _pn
     think = bool(rt.get("thinking"))
     _t0 = time.time()
     with _GateHeld(route_gate_key(rt)):
@@ -6698,6 +7910,12 @@ _MOOD_LOCK = threading.Lock()
 TTS_TURNS = collections.deque(maxlen=250)
 # each speaker's last WORKING reference sample - what a thought is voiced with
 TTS_REF_BY_NAME = {}
+# Tags whose chunk carried no words. SkyrimNet splits a reply into spoken chunks
+# and a tag can land alone in one - the model wrote a full stop straight after it,
+# and the split fell there. The tag was still MEANT for the words that follow, so
+# it waits here for the next chunk of that speaker's reply rather than being read
+# out or thrown away.
+TAG_CARRY = {}
 # each speaker's freshest UNVOICED thought: (text, when). Consumed by the auto
 # thought-audio pass so a thought is voiced once, for its own spoken line.
 THOUGHT_FRESH = {}
@@ -6776,8 +7994,9 @@ def mood_evaluate(cfg=None):
         _think = bool(rt.get("thinking"))
         _offp = tags_off(st)
         _sys = mood_prompt(n, st.get("ttsPmePrompt"), _offp)
-        if _spk_player[0]:
-            _sys += "\nThe player is %s." % _spk_player[0]
+        _pn2 = player_name_setting() or _spk_player[0]
+        if _pn2:
+            _sys += "\nThe player is %s." % _pn2
         _t0 = time.time()
         with _GateHeld(route_gate_key(rt)):
             said, reason, timings, usage = _chat(
@@ -6816,17 +8035,11 @@ def mood_context():
     return ""
 
 
-# Emotions this build refuses to send to Higgs, whoever asks for them.
-#
-# EMPTY, deliberately. Elation was blocked here after eight takes were judged to be in
-# the wrong voice; a four-voice sweep judged by ear then found every one of them to be
-# the right speaker, simply delivered with more energy. The Pitch Guard that replaced
-# the block was removed for the same reason in patch33 - pitch and low-band energy move
-# with FEELING, not with identity, so nothing measurable separated the two.
-#
-# The mechanism stays: if a tag is ever found to be reliably destructive rather than
-# occasionally, this is where it goes.
-TTS_EMOTION_BLOCK = frozenset()
+def tts_wordless(text):
+    """Is there anything here for a voice to say? Control tokens and punctuation
+    are not words. One rule, so the decision to hold a chunk and the gate that
+    checks it cannot drift apart."""
+    return not TTS_TAG_ANY_RX.sub("", str(text or "")).strip(" .,!?;:\"'\u2019\u2014-")
 
 
 def tts_apply_tags(text, keep, engine="audiocpp", final_off=frozenset()):
@@ -6858,8 +8071,6 @@ def tts_apply_tags(text, keep, engine="audiocpp", final_off=frozenset()):
         """
         word = " ".join(m.group(1).split()).lower()
         hit = TTS_ALIAS.get(word)
-        if hit and hit[0] == "emotion" and hit[1] in TTS_EMOTION_BLOCK:
-            return ""              # measured to break the voice - see TTS_EMOTION_BLOCK
         if hit and higgs:
             return "[%s-%s]" % (hit[0].upper(), hit[1].upper())
         if hit or word in TTS_ALIAS_DROP:
@@ -6906,6 +8117,18 @@ def tts_apply_tags(text, keep, engine="audiocpp", final_off=frozenset()):
     # tts_normalize punctuated the line, but a tag can land after that full stop -
     # an sfx at the end brings its onomatopoeia with it and leaves the SPOKEN text
     # unpunctuated again, which is how a model is invited to keep talking.
+    # THE LAST DOOR. Everything above converts what it recognises; this deletes what
+    # is merely tag-SHAPED and would otherwise be read out as words. A tag damaged in
+    # transit - "[prosody-expressive_low." arrived exactly so, its closing bracket
+    # lost upstream - is markup whatever state it reaches us in, and a voice must
+    # never say it. The engine's own tokens are hidden from the sweep first so their
+    # family words are not mistaken for stray markup.
+    _kept = TTS_TAG_ANY_RX.findall(text)
+    _guard = TTS_TAG_ANY_RX.sub("\x00", text)
+    _guard = TTS_TAGSHAPE_RX.sub("", _guard)
+    _it = iter(_kept)
+    text = re.sub("\x00", lambda _m: next(_it), _guard)
+    text = re.sub(r"\s{2,}", " ", text).strip()
     spoken = TTS_TAG_ANY_RX.sub("", text).strip()
     if spoken and spoken[-1] not in ".!?,;\"'":
         text += "."
@@ -7382,14 +8605,18 @@ class TtsWrapper:
         try:
             self._run_inner(eid, text, ref_path, ahead)
         finally:
+            tts_inflight_drop(eid)           # nor one of its speaker's open chunks
             with self._lock:                 # however it ends, it is no longer in flight
                 self._inflight = max(0, getattr(self, "_inflight", 1) - 1)
 
     def _run_inner(self, eid, text, ref_path, ahead=0):
         ev = self._events.get(eid)
         t0 = time.time()
+        spend_reset()          # this line's ledger starts empty (patch17)
         cfg = load_config_cached()      # read-only here; one parse per edit
         st = cfg.get("settings", {})
+        player_name_setting(cfg)             # the typed name, refreshed from this cfg
+        asked_ref = ref_path                 # what SkyrimNet named, before resolution
         local = tts_local_sample(ref_path, cfg)
         if local:
             ref_path = local
@@ -7397,7 +8624,16 @@ class TtsWrapper:
         # the words it is about to speak, not by whichever request came first.
         tts_pin_speaker(ref_path, text)
         if ref_path:
-            TTS_REF_BY_NAME[tts_speaker_label(ref_path)] = ref_path
+            _lbl8 = tts_speaker_label(ref_path)
+            with _spk_lock:
+                _audio_cache_load(cfg)
+                _new8 = TTS_REF_BY_NAME.get(_lbl8) != ref_path
+                TTS_REF_BY_NAME[_lbl8] = ref_path
+            if _new8:
+                _audio_cache_save(cfg)
+        # WHY this line is about to carry this name, recorded before anything speaks it
+        _idk = os.path.splitext(re.split(r"[\\/]", str(ref_path or ""))[-1])[0]
+        _idname, _idrule, _idcand = speaker_for_voice_ex(_idk)
         raw = tts_normalize(text)
         # The line EXACTLY as SkyrimNet sent it, before anything here touches it. Whether
         # a performance tag survived the mod or was never sent is not answerable from the
@@ -7468,10 +8704,24 @@ class TtsWrapper:
                 # a LIMITED tag must not be armed either: the wire gate would
                 # strip it anyway, but the face and the log would still say it -
                 # exactly the "did the limit even fire?" doubt the owner named
-                raw = tts_npc_mood_arm(tts_speaker_label(ref_path), raw, cool=_cool)
+                raw = tts_npc_mood_arm(tts_speaker_label(ref_path), raw,
+                                       cool=tags_off(st, "ttsTagsFinalOff") | _cool)
             _banset = tags_off(st, "ttsTagsFinalOff")
             processed = tts_apply_tags(raw, keep_tags, tts_engine(cfg),
                                        _banset | _cool)
+            _carryWho = tts_speaker_label(ref_path)
+            if tts_engine(cfg) == "audiocpp" and not ping:
+                _held = TAG_CARRY.pop(_carryWho, None)
+                if _held and time.time() - _held[1] < 30.0:
+                    processed = _held[0] + processed
+                if tts_wordless(processed):
+                    # words: none. This chunk exists only to colour what comes
+                    # next, so it is not spoken - the tokens wait for the words.
+                    TAG_CARRY[_carryWho] = ("".join(TTS_TAG_ANY_RX.findall(processed)),
+                                            time.time())
+                    TTSW.log("\U0001F3A8 %s: tag with no words - held for the next line"
+                             % _carryWho)
+                    return
             _fresh = frozenset()
             if not ping:
                 _fresh = tag_cooldown_note(_ckey, _limits, processed) or frozenset()
@@ -7480,6 +8730,12 @@ class TtsWrapper:
             # the spoken line - BEFORE holds the line's delivery until the thought
             # has had its playtime (capped), AFTER follows the line's own length.
             _thWho = tts_speaker_label(ref_path)
+            # from here the speaker is settled, so this line counts as one of theirs
+            # that is still open. Registered by the line's own id and cleared in
+            # _run's finally, so an early return or a raise cannot leak it and hold
+            # a thought back for the rest of the session. (patch39)
+            if (not tts_is_player(ref_path)) and not ping:
+                tts_inflight_add(eid, _thWho)
             _thTxt = None
             if (not tts_is_player(ref_path)) and not ping \
                     and str(st.get("ttsThoughtAudio", "off")).lower() == "on":
@@ -7518,18 +8774,109 @@ class TtsWrapper:
                     THOUGHT_FRESH[_thWho] = (_thTxt, time.time())
                     _thTxt = None
             if _thTxt and _thSeq != "after":
-                _teid, _tsec = tts_thought_make(_thWho, _thTxt, cfg)
+                with spend_step("thought audio"):
+                    _teid, _tsec = tts_thought_make(_thWho, _thTxt, cfg)
                 if _teid:
                     sse_notify("replay", {"id": _teid})
                     _thEnd = time.time() + min(float(_tsec or 0.0), 12.0)
             if tts_engine(cfg) == "audiocpp":
                 self.log("")
+                # what actually goes to the engine is verified FIRST: a dead path
+                # or another voicetype's bytes never reach it (patch6)
+                with spend_step("sample gate"):
+                    ref_path, _gatev = tts_sample_gate(ref_path, _idk, cfg)
                 self.say_line(ref_path, processed, ahead=ahead, eid=eid, mood_src=raw)
+                with spend_step("identity note"):
+                    tts_identity_note(cfg, eid=eid, key=_idk, name=_idname, rule=_idrule,
+                                      cand=_idcand, sent=ref_path, asked=asked_ref,
+                                      text=processed, gate=_gatev,
+                                      prev=(_WARM_LAST[0]
+                                            if _WARM_LAST[0] != _idk else ""))
+                if not ref_path:
+                    self.log("\u274C the line is refused: no trustworthy sample "
+                             "for %s (%s)" % (_idname or _idk or "?", _gatev))
+                    ev["err"] = "no trustworthy sample for %s" % (_idk or "?")
+                    return
                 mid = st.get("ttsAcppModelId") or "higgs"
                 base = "http://127.0.0.1:%d" % tts_server_port(cfg)
+                # The voice warm-up is gone (patch29). It synthesised a whole
+                # discarded take on every speaker change, and the measurement was
+                # unambiguous: 33 ms of preparation when the speaker was unchanged,
+                # 1459 ms when it changed - a 22x cost that bought a carryover fix
+                # the samplers had already made unnecessary.
+                tts_conditioned(_idk)
+                # BEFORE the wall: a store read is not synthesis, and a second
+                # model's inference certainly is not - the learner runs behind
+                # this line, never in front of it (patch10)
+                with spend_step("transcript"):
+                    _rt8 = tts_ref_text(ref_path, cfg)
+                    tts_ref_learn(ref_path, cfg)
                 _t_post = time.time()
                 body, hdrs = tts_acpp_speak(base, mid, processed,
-                                            tts_ref_canonical(ref_path) if ref_path else "")
+                                            tts_ref_canonical(ref_path) if ref_path else "",
+                                            _rt8)
+                if str(st.get("ttsRunawayMode") or "detect").lower() == "detect" and body:
+                    _rv13, _sec13, _exp13 = tts_runaway_verdict(
+                        body, processed, st, vt=tts_voice_key(ref_path))
+                    if _rv13 == "runaway":
+                        # the engine missed its stop and said something ELSE. One
+                        # more ask; whichever take sits closer to the estimate
+                        # speaks, and both are on record. (patch13)
+                        self.log("\u26A0\uFE0F runaway take: %.1fs of audio for a "
+                                 "%.1fs line - asking once more" % (_sec13, _exp13))
+                        panel_log("[tts] runaway: %.1fs vs %.1fs expected  %s"
+                                  % (_sec13, _exp13, processed[:80]))
+                        try:
+                            _b2, hdrs = tts_acpp_speak(base, mid, processed,
+                                                       tts_ref_canonical(ref_path)
+                                                       if ref_path else "", _rt8)
+                            _s2 = tts_wav_seconds(_b2)
+                            if _b2 and abs(_s2 - _exp13) < abs(_sec13 - _exp13):
+                                body = _b2
+                                self.log("   \u21BA the retry speaks: %.1fs" % _s2)
+                            else:
+                                self.log("   \u21BA the retry was no better "
+                                         "(%.1fs) - keeping the first" % _s2)
+                        except Exception as _re13:
+                            self.log("   \u21BA retry failed (%s) - keeping the "
+                                     "first take" % str(_re13)[:60])
+                    elif _rv13 == "short":
+                        # the duration only SUSPECTS; the recogniser can KNOW.
+                        # Words provably missing earn one retry - a suspicion
+                        # alone stays a log line, as before. (patch16)
+                        _vfy = tts_take_verify(body, processed, cfg)
+                        if _vfy == "dropped":
+                            self.log("\u26A0\uFE0F short take VERIFIED: %.1fs and "
+                                     "the words are not in it - asking once more"
+                                     % _sec13)
+                            panel_log("[tts] dropped words confirmed: %.1fs  %s"
+                                      % (_sec13, processed[:80]))
+                            try:
+                                _b2, hdrs = tts_acpp_speak(
+                                    base, mid, processed,
+                                    tts_ref_canonical(ref_path)
+                                    if ref_path else "", _rt8)
+                                if _b2 and tts_take_verify(_b2, processed,
+                                                           cfg) != "dropped":
+                                    body = _b2
+                                    self.log("   \u21BA the retry speaks the "
+                                             "words: %.1fs"
+                                             % tts_wav_seconds(_b2))
+                                else:
+                                    self.log("   \u21BA the retry did not "
+                                             "either - keeping the first")
+                            except Exception as _re16:
+                                self.log("   \u21BA retry failed (%s) - keeping "
+                                         "the first take" % str(_re16)[:60])
+                        elif _vfy == "spoken":
+                            self.log("\u2713 short take verified: brief, but the "
+                                     "words are all there (%.1fs)" % _sec13)
+                        else:
+                            self.log("\u26A0\uFE0F short take: %.1fs of audio for "
+                                     "a %.1fs line - words may have been dropped"
+                                     % (_sec13, _exp13))
+                            panel_log("[tts] short take: %.1fs vs %.1fs expected  %s"
+                                      % (_sec13, _exp13, processed[:80]))
                 srv_s = time.time() - _t_post
                 if not body:
                     raise RuntimeError("no audio returned by audio.cpp")
@@ -7537,14 +8884,21 @@ class TtsWrapper:
                 with open(out, "wb") as f:
                     f.write(body)
                 self.prune()
-                if _thEnd:
-                    # the requested rule, verbatim: dialogue playback begins once
-                    # the THOUGHT's realtime length plus half a second has passed
-                    _thw = _thEnd - time.time() + 0.5
-                    if _thw > 0:
-                        _hold_s = min(_thw, 12.0)
-                        time.sleep(_hold_s)
-                        t0 += _hold_s          # the hold is not synthesis - the wall
+                # the requested rule, verbatim: dialogue playback begins once the
+                # THOUGHT's realtime length plus half a second has passed. The floor
+                # applies that same rule to the thought of the turn BEFORE this one,
+                # which nothing used to wait for - the next character talked over it.
+                # Whichever is later wins; the player's own voice and the startup
+                # ping are never held. (patch39)
+                _thw = max((_thEnd - time.time() + 0.5) if _thEnd else 0.0,
+                           0.0 if (_isp or ping) else TTS_FLOOR[0] - time.time())
+                if _thw > 0:
+                    _hold_s = min(_thw, TTS_FLOOR_CAP_S)
+                    if not _thEnd:
+                        TTSW.log("\u23F8 held %.1fs - a thought was still being spoken"
+                                 % _hold_s)
+                    time.sleep(_hold_s)
+                    t0 += _hold_s              # the hold is not synthesis - the wall
                                                # splits at the POST and stays honest
                 ev["path"] = out
                 wall = time.time() - t0
@@ -7579,12 +8933,21 @@ class TtsWrapper:
                                        "x-codec-seconds"))
                 toks = secs * TTS_ACPP_FRAME_RATE
                 tts_measure_record(processed, secs, AUTOCAL_EST[0],
-                                   wall=synth)                         # right lines
+                                   vt=tts_voice_key(ref_path),
+                                   # the take, not the ladder - the realtime factor
+                                   # this record feeds is about one synthesis (p18)
+                                   wall=(float(TTS_TAKE.get("final_s") or 0.0)
+                                         or synth))
                 autocal_tick(st)      # and one towards the next automatic fit
                 with self.blk:   # the whole report writes as ONE block (patch171)
                     self.log("")   # and stands apart from the receipt group (patch174)
+                    # the TAKE, not the ladder: a discarded attempt is not part of
+                    # how fast this line was made, and counting it made a healthy
+                    # engine read as a slow one (patch18)
+                    _fin18 = float(TTS_TAKE.get("final_s") or 0.0) or synth
+                    _wst18 = float(TTS_TAKE.get("wasted_s") or 0.0)
                     self.log("\u26A1 %.2fx realtime (%.2fs \u2192 %.1fs audio)" % (
-                        (secs / synth) if synth else 0.0, synth, secs))
+                        (secs / _fin18) if _fin18 else 0.0, _fin18, secs))
                     # Everything the panel spent before the engine was asked, itemised:
                     # a feature that costs time should be readable as that feature, not
                     # as the transport being slow.
@@ -7601,7 +8964,16 @@ class TtsWrapper:
                             _bits.append("mood %.0f" % _mood_ms)
                         if _est_ms >= 0.5:
                             _bits.append("token estimate %.0f" % _est_ms)
-                        _bits.append("panel %.0f" % _rest_ms)
+                        _known = 0.0
+                        for _st17, _ms17 in spend_bits(
+                                ("thought audio", "SenseVoice", "sample gate",
+                                 "transcript", "identity note")):
+                            if _ms17 >= 0.5:
+                                _bits.append("%s %.0f" % (_st17, _ms17))
+                                _known += _ms17
+                        _left = max(0.0, _rest_ms - _known)
+                        if _left >= 0.5 or not _bits:
+                            _bits.append("panel %.0f" % _left)
                         self.log("   %-9s%6.0f ms   (%s)"
                                  % ("prep:", (prep + est_s) * 1000.0, " + ".join(_bits)))
                     _ran = tts_runaway_note(processed, secs)
@@ -7614,10 +8986,54 @@ class TtsWrapper:
                                  % ("codec:", dec_s * 1000.0, nframes, (toks / dec_s) if dec_s else 0.0))
                     else:                   # it did not, so split what WE can measure
                         self.log("   %-9s%6.0f ms   %7.1f audio tok   %7.1f tps"
-                                 % ("server:", srv_s * 1000.0, toks, (toks / srv_s) if srv_s else 0.0))
+                                 % ("server:", _fin18 * 1000.0, toks,
+                                    (toks / _fin18) if _fin18 else 0.0))
                         self.log("   %-9s%13d samples @ %d Hz" % ("audio:", nframes, rate))
                     self.log("   %-9s%6.0f ms   (http + wav)"
-                             % ("overhead:", max(0.0, (synth - (gen_s + dec_s or srv_s)) * 1000.0)))
+                             % ("overhead:",
+                                max(0.0, (_fin18 - (gen_s + dec_s or _fin18)) * 1000.0)))
+                    # the calibration log carries the spend too: its per-line tree
+                    # is written BEFORE the take, so it could never show where the
+                    # time went. One line after, in the same terminal. (patch24)
+                    _sp24 = [(_k, _v) for _k, _v in
+                             _meter_ms(_pti_s, _mood_s, est_s, prep,
+                                       gen_s, dec_s, srv_s, synth).items()]
+                    if _sp24:
+                        calterm_log(["%s spent  %s"
+                                     % (TREE_PAD + TREE_END,
+                                        "  ".join("%s %.0fms" % (_k, _v)
+                                                  for _k, _v in _sp24))],
+                                    blank=False)
+                    _rs18, _rb18 = tts_ref_facts(ref_path)
+                    tts_timing_row(
+                        at=time.strftime("%H:%M:%S"),
+                        voice=os.path.splitext(os.path.basename(str(ref_path or "")))[0],
+                        chars=len(str(processed or "")), tokens=round(toks, 1),
+                        audio_s=round(secs, 2), final_ms=round(_fin18 * 1000.0),
+                        wasted_ms=round(_wst18 * 1000.0),
+                        tries=int(TTS_TAKE.get("tries") or 1),
+                        prep_ms=round((prep + est_s) * 1000.0),
+                        gen_ms=round(gen_s * 1000.0), dec_ms=round(dec_s * 1000.0),
+                        ref_s=_rs18, ref_bytes=_rb18,
+                        ref_text_chars=len(str(_rt8 or "")), cap=AUTOCAL_CAP[0],
+                        queued_ms=round(engine_wait_get() * 1000.0))
+                    if not (gen_s or dec_s):
+                        # 0.6 does not return its own split; say so once so nobody
+                        # reads the panel's single number as the engine's own
+                        _srv_once = TTS_TAKE.get("said_split")
+                        if not _srv_once:
+                            TTS_TAKE["said_split"] = True
+                            self.log("   note:     the server returns no generate/"
+                                     "codec split, so the figure above is the whole "
+                                     "request as the panel sees it")
+                    _wait19 = engine_wait_get()
+                    if _wait19 >= 0.005:
+                        self.log("   %-9s%6.0f ms   waiting for the engine - another "
+                                 "line held it" % ("queued:", _wait19 * 1000.0))
+                    if _wst18 >= 0.005:
+                        self.log("   %-9s%6.0f ms   %d attempt(s) thrown away before "
+                                 "this one" % ("discard:", _wst18 * 1000.0,
+                                               max(0, int(TTS_TAKE.get("tries") or 1) - 1)))
                     if _hold_s > 0.05:
                         self.log("   %-9s%6.0f ms   (thought fronted this line)"
                                  % ("hold:", _hold_s * 1000.0))
@@ -7636,13 +9052,8 @@ class TtsWrapper:
                         chars=len(processed), tags=tts_tag_count(processed),
                         pause_s=round(tts_pause_secs(processed), 2),
                         audio_s=round(secs, 2), realtime=round((secs / synth) if synth else 0.0, 2),
-                        ms={"player tags": round(_pti_s * 1000.0),
-                            "mood": round(_mood_s * 1000.0),
-                            "token estimate": round(est_s * 1000.0),
-                            "panel": round(max(0.0, prep - _pti_s - _mood_s) * 1000.0),
-                            "generate": round((gen_s or srv_s) * 1000.0),
-                            "codec": round(dec_s * 1000.0),
-                            "http + wav": round(max(0.0, (synth - (gen_s + dec_s or srv_s))) * 1000.0)},
+                        ms=_meter_ms(_pti_s, _mood_s, est_s, prep,
+                                     gen_s, dec_s, srv_s, synth),
                         tok={"used": round(toks), "estimate": round(AUTOCAL_EST[0]),
                              "cap": AUTOCAL_CAP[0],
                              "guard": acpp_token_cap(processed, st)},
@@ -7727,20 +9138,33 @@ class TtsWrapper:
 # Female Redguard in Skyrim." The bracket is not in the name class, so the match failed
 # outright and every such character was spoken under its voicetype instead. The tag is
 # matched and discarded; the name alone is captured.
-SPEAKER_RX = re.compile(rb"You are ([A-Z][A-Za-z' \-]{1,28}?)(?:\s*\[[^\]]{1,24}\])?, a ")
+# 29 characters was the ceiling on a character's name, and it failed SILENTLY: a
+# longer one simply did not match, note_speaker returned "", and FOUR stores guarded
+# by `if who:` were skipped - the mood queue, the kept reply the last-chunk matcher
+# compares against, the reply ring, and the freshest thought. ACTOR_RXS capped the
+# same way, so the action too. The owner's "Ertzebet the Librarian's Assistant" is 34
+# characters: she had no emotion tags, no reply text, no thought audio, no name in the
+# ledger, and the dashboard wrote her thoughts as a bare "thought:". Skyrim titles
+# characters by their job - "the Librarian's Assistant", "the Steward of Whiterun" -
+# and a mod may go further, so the bound now matches the listener's 40 rather than
+# sitting under it. What actually stops a capture running away is the character class,
+# which crosses neither a comma, a full stop nor a line break. (patch39)
+SPEAKER_RX = re.compile(rb"You are ([A-Z][A-Za-z' \-]{1,59}?)(?:\s*\[[^\]]{1,24}\])?, a ")
 # The player is named by the PARTY, which is always theirs whoever is speaking:
 #   ## Maxxor's Party's Active Quests
 # NOT by "You are speaking to ...", which names the LISTENER - when one NPC addresses
 # another, that line holds the other NPC and the player's own voice took their name.
 # patch116: "'s Party's" also matched only that one heading. Anything possessive on the
 # party names the player, whatever follows it - the party is theirs whoever is speaking.
-PLAYER_RX = re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,28}?)'s Party\b")
-# patch123: a second, independent naming. SkyrimNet's standalone thought prompt is the
-# PLAYER's - "You are Maxxor ... Think internally as Maxxor" - while an NPC's thought
-# rides inside a dialogue reply as <internal_thought>, never as its own request. Both
-# sessions' field captures show it, and the two names must AGREE: the speaker of that
-# request and the "Think internally as" name are the same person or nothing is learned.
-PLAYER_THINK = b"Think internally as "
+PLAYER_RX = re.compile(rb"##\s+([A-Z][A-Za-z' \-]{1,59}?)'s Party\b")
+# patch123 read a standalone "Think internally as <n>" request as the PLAYER's, on the
+# evidence that an NPC's thought rides inside a dialogue reply and never arrives as its
+# own request. SkyrimNet now sends NPC think tasks in exactly that shape - "You are
+# Mirabelle Ervine, a ... Think internally as Mirabelle Ervine" - and the agreement test
+# that was meant to make it safe passes for those too. The rule stopped discriminating,
+# so it is GONE (patch4): a session that learned an NPC there had every spoken line of
+# the player's wearing her name from that moment on, and a wrong name is worse than no
+# name. What is left cannot invent one: the setting, then the party heading.
 # What the request DID head its sections with, kept only while the name is unknown. A
 # fallback that says "Player" and nothing else cannot be fixed by whoever reads the log:
 # the fix needs the heading this prompt actually uses, and only the prompt has it.
@@ -7752,16 +9176,89 @@ _spk_heads = []                # the last request's headings, for one honest mes
 PLAYER_VOICES = frozenset(("player", "playervoice", "playerdialogue"))
 SPEAKER_SCAN = 4096            # the speaker sits in the first few hundred bytes
 SPEAKER_PAIR_S = 15.0          # a TTS call this soon after a request is that character
-SPEAKER_TEXT_S = 25.0          # a reply this fresh can still name the voice speaking it
+SPEAKER_TEXT_MIN = 24          # and only words long enough to belong to one of them
 SPEAKER_PIN_S = 10.0           # and it names it for the rest of that line's chunks
 _spk_lock = threading.Lock()
 _spk_recent = []               # [(when, name)], newest last
 _spk_voices = {}               # voicetype -> name, learned
 _spk_pin = {}                  # voicetype -> (name, when), named by its own words
 _spk_player = [""]             # the player's own name, from the same line
+_spk_player_src = [""]         # and WHERE it came from, so a weak read cannot pin it
+_spk_known = set()             # every character a prompt has ever opened with (patch5)
+_spk_listen = {}               # listener -> the set of speakers seen addressing them
 
 
-def note_speaker(body):
+def _nm_norm(n):
+    """A name reduced to what survives a voicetype filename: letters and digits."""
+    return re.sub(r"[^a-z0-9]", "", str(n or "").lower())
+
+
+LISTENER_RX = re.compile(rb"You are speaking to ([^,.\r\n]{2,40}?)\s*[,.]")
+
+
+def _listener_note(name, listener):
+    """The player is the one everyone talks to and nobody ever IS.
+
+    A dialogue prompt names its listener - "You are speaking to Maxxor, a Male
+    Dark Elf" - and that name was deliberately refused as a source: the listener
+    is usually just the other NPC. But one name, and only one, keeps appearing
+    as the listener under DIFFERENT speakers while never once being the "You
+    are" of any prompt. Two distinct speakers is the bar; a name that has ever
+    spoken is out, whatever it is heard. Caller holds _spk_lock. (patch5)
+    """
+    ln = " ".join(str(listener or "").split())
+    if not ln or _spk_player[0] or ln in _spk_known:
+        return
+    _spk_listen.setdefault(ln, set()).add(name)
+    if len(_spk_listen[ln]) >= 2:
+        _player_name_learn(ln, "being everyone's listener")
+
+
+def _player_name_learn(name, source):
+    """Take a name for the player, or say why it was refused. Caller holds _spk_lock.
+
+    ONE character has ONE voice, and the player is a character: a name already bound to
+    a voicetype belongs to somebody who has spoken through that sample, and handing it
+    to the player's voice as well is the fault this guard exists for. speaker_for_voice
+    has enforced that for NPCs since patch183; the player was the one voice it did not
+    cover. (patch4)
+    """
+    nm = str(name or "").strip()
+    if not nm or _spk_player[0]:
+        return False
+    bound = {v: k for k, v in _spk_voices.items()}.get(nm)
+    if bound:
+        panel_log("[tts] not taking \"%s\" as the player from %s - that name already "
+                  "speaks through %s" % (nm, source, bound))
+        return False
+    _spk_player[0] = nm
+    _spk_player_src[0] = source
+    panel_log("[tts] the player is %s - from %s" % (nm, source))
+    return True
+
+
+_spk_typed = [""]              # the typed name, kept where the naming path can see it
+
+
+def player_name_setting(cfg=None):
+    """The name typed into the TTS page, which outranks anything read from a prompt.
+
+    NO config read of its own. Naming a voice happens on every spoken line and from
+    callers that hold no cfg, and a lookup that loads the config there both costs a
+    parse per line and CREATES a default config on a tree that has none - which is how
+    a gate run started leaving one behind. The value is refreshed by whoever already
+    holds a cfg (the speak path, and a settings save) and read from here. (patch4)
+    """
+    if cfg is not None:
+        try:
+            _spk_typed[0] = str((cfg.get("settings", {}) or {})
+                                .get("ttsPlayerName") or "").strip()
+        except Exception:
+            pass
+    return _spk_typed[0]
+
+
+def note_speaker(body, enqueue=True):
     """Remember the character named in a dialogue request. Cheap and best-effort."""
     if not body:
         return ""
@@ -7776,27 +9273,35 @@ def note_speaker(body):
         # look - but only until it is found once. A regex over 45 KB is microseconds;
         # it is JSON parsing that would have cost something.
         pm = heads = None
-        pthink = ""
         if not _spk_player[0]:
             # the WHOLE body, not the first 256 KB: the marker sits ~17 KB in on the
             # stock prompt, but a longer memory block pushes it past any fixed window,
             # and a name that is never read is a name that is never right. Only until
             # it is found once, and a regex over a few hundred KB is microseconds.
             pm = PLAYER_RX.search(body)
-            if not pm and PLAYER_THINK + name.encode("utf-8", "replace") in body:
-                pthink = name          # this request thinks AS its own speaker: player
-            if not pm and not pthink:
+            if not pm:
                 heads = [h.decode("utf-8", "replace").strip()
                          for h in HEADING_RX.findall(body)[:14]]
         with _spk_lock:
-            _spk_recent.append((time.time(), name))
-            del _spk_recent[:-12]
+            _spk_known.add(name)
+            _lm = LISTENER_RX.search(body[:SPEAKER_SCAN])
+            if _lm:
+                _listener_note(name, _lm.group(1).decode("utf-8", "replace"))
             if pm:
-                _spk_player[0] = pm.group(1).decode("utf-8", "replace").strip()
-            elif pthink:
-                _spk_player[0] = pthink
+                _player_name_learn(pm.group(1).decode("utf-8", "replace").strip(),
+                                   "the party heading")
             elif heads is not None:
                 _spk_heads[:] = heads
+            if not enqueue:
+                # this request will never be followed by a spoken line - GM,
+                # Combat, Charbio, a Meta pick - so its name must not sit in the
+                # queue a TTS call consumes. Every route used to push here, and
+                # the NEXT spoken line took whatever was waiting. The player
+                # learns above this line: their name is a fact from ANY route,
+                # the queue is a promise only a Dialogue request can make. (patch5)
+                return name
+            _spk_recent.append((time.time(), name))
+            del _spk_recent[:-12]
         return name
     except Exception:
         pass
@@ -7818,22 +9323,44 @@ def speaker_for_text(text):
     a wrong name is worse than a voicetype. (patch183)
     """
     nc = _th_norm(text)
-    if len(nc) < 6:
+    if len(nc) < SPEAKER_TEXT_MIN:
+        # "Morning." matched the ONE kept reply that happened to contain it and put that
+        # character's name on a passing stranger's greeting. A line this short is not
+        # evidence of who said it - dozens of characters say it every session - and the
+        # older rules, which at least know which requests are outstanding, have it.
         return ""
     now = time.time()
     hits = []
-    for who, ent in list(REPLY_FULL.items()):
-        try:
-            nf, when = ent
-        except Exception:
-            continue
-        if not who or not nf or now - when > SPEAKER_TEXT_S:
-            continue
-        if _th_member(nc, nf):
-            hits.append(who)
-            if len(hits) > 1:
-                return ""
+    # the ring, plus REPLY_FULL for anyone not (yet) in it: the writers keep both,
+    # so at runtime the union is the ring - but a reply seeded directly into
+    # REPLY_FULL still counts, and a character is one HIT however many of their
+    # replies contain the words. Ring entries live RING_LIFE_S: a chunk held back
+    # by a deep TTS queue is late, not somebody else's.
+    for who in set(list(REPLY_RING) + list(REPLY_FULL)):
+        ents = list(REPLY_RING.get(who) or [])
+        _rf = REPLY_FULL.get(who)
+        if _rf is not None and _rf not in ents:
+            ents.append(_rf)
+        for ent in ents:
+            try:
+                nf, when = ent
+            except Exception:
+                continue
+            if not who or not nf or now - when > RING_LIFE_S:
+                continue
+            if _th_member(nc, nf):
+                hits.append(who)
+                if len(hits) > 1:
+                    return ""
+                break
     return hits[0] if hits else ""
+
+
+_spk_run = {}                  # voicetype -> [name, when, anchored] - one utterance's
+                               # chunks arrive back-to-back on one voicetype, and a
+                               # chunk too short to match anything is still a piece of
+                               # the SAME line the previous chunk anchored. (patch5)
+RUN_GAP_S = 12.0
 
 
 def tts_pin_speaker(path, text):
@@ -7850,7 +9377,17 @@ def tts_pin_speaker(path, text):
     if not who:
         return ""
     with _spk_lock:
+        # ONE character, ONE voice - the rule speaker_for_voice already applies to the
+        # pending-name queue, applied here as well. Without it the words could move a
+        # name onto a second sample, which is how a male NPC's "Morning." came out
+        # under the name of the woman who had said the same word five seconds before.
+        _bound4 = {v: k for k, v in _spk_voices.items()}.get(who)
+        if _bound4 and _bound4 != key:
+            panel_log("[tts] voice %s: not naming it %s from the line - that name "
+                      "already speaks through %s" % (key, who, _bound4))
+            return ""
         _spk_pin[key] = (who, time.time())
+        _spk_run[key] = [who, time.time(), True]   # this utterance is anchored
         if _spk_voices.get(key) != who:
             _spk_voices[key] = who
             panel_log("[tts] voice %s is %s - named by the line itself" % (key, who))
@@ -7861,27 +9398,149 @@ def tts_pin_speaker(path, text):
     return who
 
 
+_spk_unique_pos = {}           # voicetype -> character, proven by the filename itself
+
+
+def _spk_unique_bind(key):
+    """femaleuniquemirabelleervine IS Mirabelle Ervine - the filename says so.
+
+    Skyrim's unique-voiced characters carry their name in the voicetype, so once
+    that character has opened any prompt, the binding is a fact: no window, no
+    queue, no ambiguity, and it never expires. Caller holds _spk_lock. (patch5)
+    """
+    hit = _spk_unique_pos.get(key)
+    if hit:
+        return hit
+    if "unique" not in key:
+        return ""
+    suf = _nm_norm(key.split("unique", 1)[1])
+    if len(suf) < 4:
+        return ""
+    for n in _spk_known:
+        if _nm_norm(n) == suf:
+            _spk_unique_pos[key] = n
+            panel_log("[tts] voice %s is %s - the filename itself says so" % (key, n))
+            return n
+    return ""
+
+
+# ---- the Meta selector's pick, held loosely: its format is an LLM's promise ----
+META_LAST = ["", 0.0]
+META_FRESH_S = 30.0
+
+
+def meta_note(said):
+    """[speaker]>[listener] from the Meta route, kept only if it resolves.
+
+    The format drifts - brackets come and go, "Aela" for "Aela the Huntress" -
+    so the left side is normalised and accepted only when it lands on exactly
+    one character a prompt has already opened with. A pick that resolves breaks
+    ties in the pairing queue; it never names a line by itself. (patch5)
+    """
+    s = str(said or "").strip()
+    if ">" not in s:
+        return
+    left = _nm_norm(s.split(">", 1)[0])
+    if not left:
+        return
+    with _spk_lock:
+        hits = [n for n in _spk_known if _nm_norm(n) == left]
+        if len(hits) != 1:
+            hits = [n for n in _spk_known if _nm_norm(n).startswith(left)]
+        if len(hits) == 1:
+            META_LAST[0], META_LAST[1] = hits[0], time.time()
+
+
 def speaker_for_voice(voicetype):
     """The character behind a voicetype, learned from what the proxy has carried."""
+    return speaker_for_voice_ex(voicetype)[0]
+
+
+def speaker_for_voice_ex(voicetype):
+    """(name, rule, candidates) - the same decision, with its reasoning kept.
+
+    Five rules can answer this and the answer alone never said which did. A name that
+    turns out wrong is then unattributable: the pin, the queue and the cache all look
+    identical in a log. The ledger records the rule and what the others were holding at
+    that moment, so a bad transition names itself. (patch4)
+    """
     key = str(voicetype or "").strip().lower()
+    cand = {}
     if not key:
-        return ""
+        return "", "no voicetype", cand
     if key in PLAYER_VOICES:
         # named by the prompt where it says so, otherwise just "Player". Never learned,
         # and never a name taken from a conversation - the player's own voice speaks
         # BEFORE the next dialogue request, so pairing it with one hands them the
         # previous character's name.
+        typed = player_name_setting()
+        cand["typed"] = typed
+        cand["read"] = "%s (%s)" % (_spk_player[0], _spk_player_src[0] or "?") \
+            if _spk_player[0] else ""
+        if typed:
+            return typed, "the name typed on the TTS page", cand
         if _spk_player[0]:
-            return _spk_player[0]
+            return _spk_player[0], "the player name read from %s" % (
+                _spk_player_src[0] or "a prompt"), cand
         player_name_unread()
-        return "Player"
+        return "Player", "no player name known", cand
+    # The player's own names, read before the lock (neither call takes one). They
+    # are needed by the queue guard below and cannot be fetched from inside it.
+    _pnames = set()
+    for _pn in (player_name_setting(), _spk_player[0]):
+        if _pn:
+            _pnames.add(_pn)
     now = time.time()
     with _spk_lock:
+        ub = _spk_unique_bind(key)
+        cand["unique"] = ub
         # a name the line's own words gave outranks both the queue and the cache
         pin = _spk_pin.get(key)
-        if pin and now - pin[1] <= SPEAKER_PIN_S:
-            return pin[0]
         known = _spk_voices.get(key)
+        run = _spk_run.get(key)
+        cand["pin"] = pin[0] if pin else ""
+        cand["cache"] = known or ""
+        cand["run"] = run[0] if run else ""
+        cand["meta"] = META_LAST[0] if now - META_LAST[1] <= META_FRESH_S else ""
+        cand["queue"] = [nm for _w, nm in _spk_recent if now - _w <= SPEAKER_PAIR_S]
+        # Who already owns a sample, this one included. Built ONCE: the queue loop
+        # below needs the same fact, and two copies could disagree. The player is
+        # added here rather than there because both readers need them. (patch40)
+        taken = {v: k for k, v in _spk_voices.items()}
+        for _pn in _pnames:
+            taken.setdefault(_pn, "player")
+        # A waiting request can only name THIS sample if its character does not
+        # already speak through another one. An entry that fails that test is not
+        # competition - it is somebody else's line, still queued.
+        _elig = [nm for _w, nm in _spk_recent
+                 if now - _w <= SPEAKER_PAIR_S and taken.get(nm, key) == key]
+        if pin and now - pin[1] <= SPEAKER_PIN_S:
+            return pin[0], "the words of the line itself", cand
+        if ub:
+            # The filename is a fact about the SAMPLE, not about who is speaking
+            # through it now. SkyrimNet lends a unique sample to other characters -
+            # the owner's Ertzebet the Librarian's Assistant speaks through
+            # femaleuniquemirabelleervine - and while this answered FIRST, every
+            # line of hers was named Mirabelle Ervine, her own words included. It
+            # still outranks the queue, the cache and the run, which are all guesses
+            # from timing; it now yields to the one rule that reads THIS line's text
+            # against a reply the proxy actually saw. (patch41)
+            _spk_run[key] = [ub, now, True]
+            return ub, "bound to this unique voicetype", cand
+        if run and run[2] and now - run[1] <= RUN_GAP_S and not _elig:
+            # chunks of one utterance arrive back-to-back on one voicetype; a
+            # chunk too short to match anything is still a piece of the line a
+            # sibling already anchored. But only while nothing ELIGIBLE waits: a
+            # live dialogue request means a new utterance is about to speak,
+            # and a shared voicetype takes the character who just spoke - the
+            # patch116 rule the run must not override. What changed in patch40 is
+            # which requests count. A request whose character already speaks
+            # through a different sample was never a claim on this one, and
+            # counting it stood the run down for nothing: Colette's own run, one
+            # second old, lost to a queued Maxxor line that could not have been
+            # hers, and the line printed as "Femaleshrill".
+            run[1] = now
+            return run[0], "carried by its own utterance's run", cand
         # CONSUME the request it pairs with. Without that, a second voicetype asked
         # inside the same window inherited the same name.
         # A FRESH pairing wins over the cached one. Generic voicetypes - femalecommoner,
@@ -7894,7 +9553,26 @@ def speaker_for_voice(voicetype):
         # and Serana's was - she already owned `serana`. A name already bound elsewhere
         # is not available, so the line falls back to its voicetype instead of wearing
         # somebody else's name.
-        taken = {v: k for k, v in _spk_voices.items()}
+        _live = [i for i in range(len(_spk_recent))
+                 if now - _spk_recent[i][0] <= SPEAKER_PAIR_S]
+        if len(_live) > 1 and cand["meta"]:
+            for i in _live:
+                if _spk_recent[i][1] == cand["meta"]:
+                    _mname = _spk_recent[i][1]
+                    del _spk_recent[i]
+                    _spk_voices[key] = _mname
+                    _spk_run[key] = [_mname, now, True]
+                    panel_log("[tts] voice %s is %s - the Meta selector's pick "
+                              "among %d waiting requests" % (key, _mname, len(_live)))
+                    return _mname, "the Meta selector's pick among waiting requests", cand
+        # `taken` and the player's names are built above, where the run rule reads
+        # them too. The player was the one name this guard could never see: it is
+        # built by inverting _spk_voices, and the player branch of this function
+        # returns long before _spk_voices is written - so "Maxxor" owned nothing,
+        # the guard let it through, and Colette's line was named for the player
+        # while a Maxxor request sat in the queue. SkyrimNet writes the player's
+        # dialogue too, so that request is queued as often as anyone's. The player
+        # HAS a voicetype by definition and it is never an NPC's. (patch40)
         # OLDEST first. Lines are spoken in the order their dialogue was generated, so the
         # first line to arrive belongs to the first request that came in. Taking the newest
         # handed two NPCs speaking in quick succession each other's names - which is what
@@ -7908,19 +9586,36 @@ def speaker_for_voice(voicetype):
                 # are missing" looked the same from a log. Say which rule fired.
                 panel_log("[tts] voice %s: not naming it %s - that name already belongs "
                           "to %s" % (key, name, taken.get(name)))
+                if name in _pnames:
+                    # loud, because this one reached the terminal for a whole session
+                    # before anyone could say which rule had done it
+                    tts_identity_alarm(
+                        "refused to name %s after the player (%s) - the player speaks "
+                        "through their own sample, so this line is somebody else's"
+                        % (key, name))
                 continue
             if True:
                 del _spk_recent[idx]
                 if name != known:
                     _spk_voices[key] = name
+                    # NOT alarmed: a shared voicetype changing hands is the patch116
+                    # design working. The contradiction worth shouting about is one
+                    # NAME on two samples, and tts_identity_note watches for that.
                     panel_log("[tts] voice %s is %s" % (key, name))
                 else:
                     _spk_voices[key] = name
-                return name
+                _spk_run[key] = [name, now, True]
+                return name, "paired with a waiting dialogue request", cand
         if not known:
             panel_log("[tts] voice %s: no character named it - no dialogue request "
                       "arrived within %ds" % (key, int(SPEAKER_PAIR_S)))
-        return known or ""
+            return "", "nothing named it", cand
+        # A generic voicetype with no live evidence prints as ITSELF. The cache
+        # used to answer here, and femaledarkelf handing Nelysa's name to the
+        # next dark elf who spoke five seconds later is what that bought. The
+        # last-known name stays in cand for the ledger, and the one-voice guards
+        # still read it - it is knowledge, not an answer. (patch5)
+        return "", "no live evidence - the voicetype stands", cand
 
 
 _PLAYER_SAID = [False]         # the message below is worth saying once, not per line
@@ -7943,6 +9638,800 @@ def player_name_unread():
               "Party\" heading has been seen in a dialogue request yet."
               + (("  The last one headed its sections: " + "  |  ".join(heads))
                  if heads else "  No dialogue request has been carried yet."))
+
+
+_ID_HASH = {}                  # path -> (mtime, size, sha12) - a reference is read once
+_ID_SEEN = {}                  # name -> voicetype, for the contradiction alarm
+_ID_LOCK = threading.Lock()
+
+
+def tts_ref_fingerprint(path):
+    """(exists, bytes, sha12) for the sample about to be sent.
+
+    The name in a log line is the PATH's, not the file's: a reference that is missing,
+    empty or carrying somebody else's audio prints exactly like a good one, which is
+    why "the log looked right and the voice was wrong" was unanswerable. Hashed once
+    per file and re-hashed only when it changes on disk. (patch4)
+    """
+    p = str(path or "")
+    if not p:
+        return False, 0, ""
+    try:
+        stt = os.stat(p)
+    except Exception:
+        return False, 0, ""
+    with _ID_LOCK:
+        hit = _ID_HASH.get(p)
+        if hit and hit[0] == stt.st_mtime and hit[1] == stt.st_size:
+            return True, stt.st_size, hit[2]
+    try:
+        with open(p, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()[:12]
+    except Exception:
+        return True, stt.st_size, ""
+    with _ID_LOCK:
+        _ID_HASH[p] = (stt.st_mtime, stt.st_size, h)
+        for k in list(_ID_HASH)[:-300]:
+            _ID_HASH.pop(k, None)
+    return True, stt.st_size, h
+
+
+_VT_SHA = {}                   # voicetype -> sha12 first seen this session
+_SHA_VT = {}                   # sha12 -> voicetype - the reverse, for cross-wiring
+_WARM_LAST = [""]              # the voicetype the engine conditioned on last - the
+                               # engine keeps ONE session, so this is engine state
+                               # mirrored, not panel bookkeeping. Every synthesis
+                               # path updates it: a voiced THOUGHT conditions the
+                               # session exactly like a spoken line, and a change
+                               # detector blind to thoughts misses half the changes.
+
+
+def tts_conditioned(voicetype):
+    """The engine just synthesized on this voicetype: remember it, return the last."""
+    vt = str(voicetype or "").strip().lower()
+    prev = _WARM_LAST[0]
+    if vt:
+        _WARM_LAST[0] = vt
+    return prev
+
+
+def tts_sample_dir(cfg=None):
+    """Where repaired samples live. Blank means a folder beside the panel's own.
+
+    A setting nobody filled in is still a working setting: the vault has a
+    default place, is created on demand, and the field only moves it. (patch11)
+    """
+    d = ((cfg or load_config_cached()).get("settings", {})
+         .get("ttsSampleDir") or "").strip()
+    if d:
+        return d
+    new = os.path.join(STACK, "Sample Vault")
+    old = os.path.join(log_dir(cfg), "voice-samples")
+    # patch11 grew the vault beside the logs; a populated one there keeps working
+    # until the setting says otherwise ("voice-samples" is that legacy home)
+    if not os.path.isdir(new) and os.path.isdir(old) and os.listdir(old):
+        return old
+    return new
+
+
+def tts_sample_trim(raw, max_sec=10.0):
+    """A canonical mono WAV of at most max_sec, with the leading silence gone.
+
+    A reference is an EXAMPLE of a voice, not a performance: three seconds of
+    speech clone as well as thirty and encode faster, while a leading second of
+    room tone is three seconds of the example spent on nothing. Frames are read
+    through the wave module, which reports the bytes it actually has rather than
+    the length a broken header claims - which is what makes the 0xFFFFFFFF files
+    readable here at all. (patch11)
+    """
+    try:
+        with _wave.open(io.BytesIO(raw), "rb") as w:
+            nch, sw, fr = w.getnchannels(), w.getsampwidth(), w.getframerate()
+            # ask for everything and take what comes back: the reader hands over
+            # the bytes that are ACTUALLY there, and a header claiming 0xFFFFFFFF
+            # cannot conjure more. That is what makes the broken clips readable
+            # here - not the number asked for.
+            frames = w.readframes(0x7FFFFFFF)
+    except Exception:
+        return b""
+    if not frames or not fr or sw != 2:
+        # 16-bit is what every voicetype clip in play is; anything else is
+        # handed back whole rather than guessed at
+        return tts_wav_normalize(raw) if frames else b""
+    a = array.array("h")
+    a.frombytes(frames[:len(frames) - (len(frames) % (2 * nch))])
+    if nch > 1:
+        a = array.array("h", [int(sum(a[i:i + nch]) / nch)
+                              for i in range(0, len(a), nch)])
+        nch = 1
+    # leading silence: the first sample that clears a floor well under speech
+    lead = 0
+    for i, s in enumerate(a):
+        if s > 900 or s < -900:
+            lead = max(0, i - int(fr * 0.05))       # keep 50ms of run-up
+            break
+    keep = a[lead:lead + max(1, int(fr * float(max_sec or 10)))]
+    if len(keep) < int(fr * 0.5):
+        keep = a[:int(fr * float(max_sec or 10))]   # too short to trim: take the front
+    out = io.BytesIO()
+    with _wave.open(out, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(fr)
+        w.writeframes(keep.tobytes())
+    return out.getvalue()
+
+
+def _vault_index_path(d):
+    return os.path.join(d, "vault-index.json")
+
+
+def _vault_index_get(d, vt):
+    try:
+        with open(_vault_index_path(d), "r", encoding="utf-8") as f:
+            return str((json.load(f) or {}).get(vt) or "")
+    except Exception:
+        return ""
+
+
+def _vault_index_set(d, vt, sha):
+    try:
+        idx = {}
+        try:
+            with open(_vault_index_path(d), "r", encoding="utf-8") as f:
+                idx = json.load(f) or {}
+        except Exception:
+            pass
+        idx[str(vt)] = str(sha or "")
+        with open(_vault_index_path(d), "w", encoding="utf-8") as f:
+            json.dump(idx, f, indent=1, sort_keys=True)
+    except Exception as e:
+        panel_log("[tts] vault index: %s" % str(e)[:60])
+
+
+def tts_sample_adopt(src_path, voicetype, cfg=None):
+    """Repair one voicetype's reference into the vault, once. Returns the path.
+
+    SkyrimNet's own clips are the source and are never touched: what lands in the
+    vault is a rewritten copy with a header that says what the file contains. The
+    engine reads it, the recogniser reads it, and the fault that made 160 of them
+    unplayable stops mattering. An adopted copy is used from then on - so the
+    hash the ledger records is the copy's, which is why this runs BEFORE any
+    fingerprinting. (patch11)
+    """
+    cfg = cfg or load_config_cached()
+    vt = str(voicetype or "").strip().lower()
+    src = str(src_path or "")
+    if not vt or not src or not os.path.isfile(src):
+        return ""
+    d = tts_sample_dir(cfg)
+    dst = os.path.join(d, "%s.wav" % vt)
+    _ex, _sz, src_sha = tts_ref_fingerprint(src)
+    vdir = ((cfg.get("settings", {}) or {}).get("ttsVoiceDir") or "").strip()
+    is_local = bool(vdir) and os.path.normcase(os.path.abspath(src)).startswith(
+        os.path.normcase(os.path.abspath(vdir)))
+    if os.path.isfile(dst):
+        # a LOCAL clip is the owner's explicit choice: when its bytes change, the
+        # vault follows. SkyrimNet's uploads are per-session copies of the same
+        # clip, so for those the vault stands once built. (patch13)
+        if not (is_local and src_sha and _vault_index_get(d, vt) != src_sha):
+            return dst
+    try:
+        with open(src, "rb") as f:
+            raw = f.read()
+    except Exception as e:
+        panel_log("[tts] sample adopt: cannot read %s (%s)" % (src, str(e)[:60]))
+        return ""
+    try:
+        sec = float((cfg.get("settings", {}) or {}).get("ttsSampleSec") or 10)
+    except Exception:
+        sec = 10.0
+    fixed = tts_sample_trim(raw, max(2.0, min(30.0, sec)))
+    if not fixed:
+        panel_log("[tts] sample adopt: %s is not readable as a WAV" % vt)
+        return ""
+    try:
+        os.makedirs(d, exist_ok=True)
+        tmp = dst + ".part"
+        with open(tmp, "wb") as f:
+            f.write(fixed)
+        os.replace(tmp, dst)
+    except Exception as e:
+        panel_log("[tts] sample adopt: cannot write %s (%s)" % (dst, str(e)[:60]))
+        return ""
+    _vault_index_set(d, vt, src_sha)
+    if tts_asr_live(cfg):
+        # what the recogniser makes of the sample, kept beside the vault: a
+        # reference that reads SAD explains a character who always sounds it.
+        # A note for a person - nothing acts on it. (patch16)
+        _heard16 = tts_asr_transcribe(dst, cfg, timeout=8)
+        if _heard16:
+            try:
+                _np16 = os.path.join(d, "vault-notes.json")
+                _nn16 = {}
+                try:
+                    with open(_np16, "r", encoding="utf-8") as _f:
+                        _nn16 = json.load(_f) or {}
+                except Exception:
+                    pass
+                _nn16[vt] = _heard16[:200]
+                with open(_np16, "w", encoding="utf-8") as _f:
+                    json.dump(_nn16, _f, indent=1, sort_keys=True,
+                              ensure_ascii=False)
+            except Exception:
+                pass
+    panel_log("[tts] sample adopted: %s  %d KB -> %d KB (repaired, %.0fs cap%s)"
+              % (vt, len(raw) // 1024, len(fixed) // 1024, sec,
+                 ", local clip" if is_local else ""))
+    return dst
+
+
+def tts_sample_gate(ref_path, voicetype, cfg=None):
+    """(path_to_send, verdict) - the reference is checked BEFORE the engine sees it.
+
+    Three faults, three answers. A MISSING file is recovered from the panel's own
+    copy of that voicetype, or the line fails loudly - a dead path posted anyway
+    leaves the engine cloning whoever it conditioned on last, with a log that
+    looks perfect. CROSS-WIRED bytes - a path claiming X whose hash is the file
+    known as Y - are refused the same way: that is the wrong voice by proof, not
+    by ear. Bytes that are merely NEW under a known voicetype are accepted and
+    alarmed once: a re-recorded sample is legitimate, a swap is not, and the
+    ledger's hash decides which it was. (patch6)
+    """
+    vt = str(voicetype or "").strip().lower()
+    p = str(ref_path or "")
+    _adopted = False
+    if (vt and str((cfg or load_config_cached()).get("settings", {})
+                   .get("ttsSampleAdopt") or "on").strip().lower() == "on"):
+        # the vault copy IS the reference once there is one: repaired, trimmed,
+        # and the same bytes every session - which is what the identity ledger
+        # has been asking for since it started recording hashes (patch11)
+        _had_vault = os.path.isfile(os.path.join(tts_sample_dir(cfg), "%s.wav" % vt))
+        _v = tts_sample_adopt(p, vt, cfg)
+        if _v:
+            # only the FIRST repair is news; after that the vault is simply where
+            # this voice lives and the ledger stays quiet about it
+            _adopted = not _had_vault
+            p = _v
+    ex, _size, sha = tts_ref_fingerprint(p)
+    if not ex:
+        alt = tts_voice_index(cfg).get(vt, "")
+        if alt and os.path.isfile(alt):
+            tts_identity_alarm("the sample for %s is missing - recovered from the "
+                               "panel's own copy" % (vt or "this line"))
+            return alt, "recovered"
+        tts_identity_alarm("the sample for %s is missing and the panel holds no "
+                           "copy - the line is refused, not improvised" % (vt or "?"))
+        return "", "refused-missing"
+    if not vt or not sha:
+        return p, "ok"
+    owner = _SHA_VT.get(sha)
+    if owner and owner != vt:
+        alt = tts_voice_index(cfg).get(vt, "")
+        if alt and os.path.isfile(alt) and alt != p:
+            tts_identity_alarm("%s arrived carrying %s's bytes (sha %s) - the "
+                               "panel's own copy speaks instead" % (vt, owner, sha))
+            return alt, "recovered-crosswired"
+        tts_identity_alarm("%s arrived carrying %s's bytes (sha %s) and the panel "
+                           "holds no copy - the line is refused" % (vt, owner, sha))
+        return "", "refused-crosswired"
+    had = _VT_SHA.get(vt)
+    if had and had != sha:
+        tts_identity_alarm("%s changed its sample mid-session (sha %s -> %s) - "
+                           "accepted; a re-record is legitimate" % (vt, had, sha))
+        _SHA_VT.pop(had, None)
+    _VT_SHA[vt] = sha
+    _SHA_VT[sha] = vt
+    if had and had != sha:
+        return p, "changed"
+    return p, ("adopted" if _adopted else "ok")
+
+
+_WIRE_SEEN = set()
+
+
+def tts_wire_note(j, headers):
+    """The request's SHAPE, on record: top-level keys and header names.
+
+    The panel only ever read data[3] and data[1], so "what else does SkyrimNet
+    send" was unanswerable - an identity field could have been sitting one key
+    over the whole time. Names only, no values, once per distinct shape per
+    session. (patch5)
+    """
+    try:
+        keys = ", ".join(sorted(str(k) for k in (j or {}) if k != "data"))
+        hdrs = ", ".join(sorted(set(str(h) for h in (headers or {}).keys())))
+        sig = keys + "|" + hdrs
+        if sig in _WIRE_SEEN:
+            return
+        _WIRE_SEEN.add(sig)
+        with open(tts_identity_path(load_config_cached()), "a", encoding="utf-8") as f:
+            f.write("[%s] wire: generate_audio\n  body keys : data%s\n"
+                    "  headers   : %s\n\n"
+                    % (time.strftime("%H:%M:%S"),
+                       (", " + keys) if keys else " (nothing else)", hdrs or "-"))
+        panel_log("[tts] wire shape recorded - body keys: data%s"
+                  % ((", " + keys) if keys else " (nothing else)"))
+    except Exception as e:
+        log_error("tts", "wire note: %s" % e)
+
+
+_RT_TAGS = re.compile(r"<\|[^|>]*\|>")   # SenseVoice's <|en|><|HAPPY|><|Speech|>
+_RT_MEM = {}                   # sha12 -> {"text": ..., "voice": ...}, this run
+_RT_FAIL = set()               # sha12 that refused this run - never hammered twice
+_RT_BUSY = set()               # sha12 a background worker is transcribing right now
+_RT_LOADED = [False]           # the store is read from disk once per run
+_RT_LOCK = threading.Lock()
+
+
+def _rt_store_path(cfg=None):
+    return os.path.join(log_dir(cfg), "tts-ref-text.json")
+
+
+def _rt_store_load(cfg=None):
+    """Read the transcript store once per run. Caller holds _RT_LOCK.
+
+    Two shapes are accepted: the flat sha -> text patch8 wrote, and the
+    sha -> {text, voice} written since, which is the one a person can read and
+    correct. A hand-edited file is authority - nothing here overwrites it. (patch10)
+    """
+    if _RT_LOADED[0]:
+        return
+    _RT_LOADED[0] = True
+    try:
+        with open(_rt_store_path(cfg), "r", encoding="utf-8") as f:
+            for k, v in (json.load(f) or {}).items():
+                if isinstance(v, dict):
+                    _RT_MEM[str(k)] = {"text": str(v.get("text") or ""),
+                                       "voice": str(v.get("voice") or "")}
+                else:
+                    _RT_MEM[str(k)] = {"text": str(v), "voice": ""}
+    except Exception:
+        pass
+
+
+def _rt_store_save(cfg=None):
+    """Write-through. Caller holds _RT_LOCK."""
+    try:
+        with open(_rt_store_path(cfg), "w", encoding="utf-8") as f:
+            json.dump(_RT_MEM, f, indent=1, ensure_ascii=False, sort_keys=True)
+    except Exception as e:
+        log_error("tts", "transcript store save: %s" % e)
+
+
+def tts_ref_learn(ref_path, cfg=None):
+    """Learn this sample's transcript in the BACKGROUND, if it is not known.
+
+    Nothing on the speak path waits: the line that first meets a voice goes out
+    without a transcript and every line after it carries one. Transcription is a
+    second model's inference - putting it in front of a line would spend
+    SkyrimNet's budget on work that only has to happen once per voice. (patch10)
+    """
+    cfg = cfg or load_config_cached()
+    st = (cfg.get("settings", {}) or {})
+    if str(st.get("ttsAsrMode") or "on").strip().lower() != "on":
+        return
+    if not (st.get("ttsAcppAsrModel") or "").strip():
+        return
+    ex, _sz, sha = tts_ref_fingerprint(ref_path)
+    if not ex or not sha:
+        return
+    with _RT_LOCK:
+        _rt_store_load(cfg)
+        if sha in _RT_MEM or sha in _RT_FAIL or sha in _RT_BUSY:
+            return
+        _RT_BUSY.add(sha)
+
+    def _work():
+        try:
+            tts_ref_text(ref_path, cfg, learn=True)
+        except Exception as e:
+            panel_log("[tts] transcript worker: %s" % str(e)[:80])
+        finally:
+            with _RT_LOCK:
+                _RT_BUSY.discard(sha)
+    threading.Thread(target=_work, daemon=True).start()
+
+
+def tts_asr_live(cfg=None):
+    """Is the co-hosted recogniser actually there to be asked?"""
+    st = (cfg or load_config_cached()).get("settings", {}) or {}
+    return (str(st.get("ttsAsrMode") or "on").strip().lower() == "on"
+            and bool((st.get("ttsAcppAsrModel") or "").strip())
+            and not _ACPP_NO_ASR[0])
+
+
+def tts_asr_transcribe(path, cfg=None, timeout=12):
+    """(timed) - see _tts_asr_transcribe. SenseVoice inference is a second model
+    on the same card and it was invisible: folded into 'transcript' with the
+    store read, or off the line entirely on the learner thread. It gets its own
+    band now, wherever a band is drawn. (patch24)"""
+    _t24 = time.time()
+    try:
+        return _tts_asr_transcribe(path, cfg, timeout)
+    finally:
+        spend_add("SenseVoice", time.time() - _t24)
+
+
+def _tts_asr_transcribe(path, cfg=None, timeout=12):
+    """One transcription: text on success, None on any failure. The single place
+    the endpoint is spoken to - the reference learner, the take verifier and the
+    adoption note all come through here. (patch16)"""
+    try:
+        req = _ureq.Request(
+            "http://127.0.0.1:%d/v1/audio/transcriptions" % tts_server_port(cfg),
+            data=json.dumps({"model": "sense",
+                             "audio": str(path).replace("\\", "/")}).encode("utf-8"),
+            headers={"Content-Type": "application/json"})
+        with _ureq.urlopen(req, timeout=timeout) as r:
+            return str((json.loads(r.read().decode("utf-8", "replace")) or {})
+                       .get("text") or "").strip()
+    except Exception as e:
+        panel_log("[tts] transcription failed for %s (%s)"
+                  % (os.path.basename(str(path)), str(e)[:60]))
+        return None
+
+
+def tts_words(text):
+    """The comparable words of a line: markup, markers and punctuation gone."""
+    t = _RT_TAGS.sub(" ", str(text or "").lower())
+    return [w for w in re.findall(r"[a-z']+", t) if w]
+
+
+def tts_take_verify(body, text, cfg=None):
+    """Did the take SPEAK the line? "spoken" / "dropped" / "" (could not tell).
+
+    Writes the take to a scratch file the server can read, asks the recogniser,
+    and compares words with words. This is the direct measurement the duration
+    heuristic only approximates: a 1.28s take whose transcript is empty against
+    a two-word line has provably dropped them. Only ever called on a take that
+    is already suspect - never on the hot path. (patch16)
+    """
+    words = tts_words(text)
+    if not tts_asr_live(cfg) or len(words) < 2:
+        return ""
+    tmp = os.path.join(log_dir(cfg), "verify-%d.wav" % (time.time_ns() % 100000))
+    try:
+        with open(tmp, "wb") as f:
+            f.write(body)
+        heard = tts_asr_transcribe(tmp, cfg, timeout=10)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    if heard is None:
+        return ""
+    got = set(tts_words(heard))
+    hit = sum(1 for w in words if w in got)
+    # a strict MAJORITY must be heard: at half, a two-word line whose transcript
+    # holds only the sigh would be acquitted - the exact take this exists to catch
+    return "spoken" if hit * 2 > len(words) else "dropped"
+
+
+def tts_ref_text(ref_path, cfg=None, learn=False):
+    """The reference sample's own transcript, for the cloning request to carry.
+
+    Higgs locks identity better when told what the reference SAYS. audio.cpp 0.6
+    ships SenseVoice as a co-hostable ASR, so each voicetype sample is transcribed
+    ONCE - keyed on the file's hash, persisted across runs - and every later line
+    on that voice carries the transcript for free. No ASR configured, or a failed
+    transcription, and the answer is simply "": the speak path never waits on this
+    and never fails because of it. (patch8)
+    """
+    cfg = cfg or load_config_cached()
+    st = (cfg.get("settings", {}) or {})
+    mode = str(st.get("ttsAsrMode") or "on").strip().lower()
+    if mode == "off":
+        return ""
+    ex, _sz, sha = tts_ref_fingerprint(ref_path)
+    if not ex or not sha:
+        return ""
+    with _RT_LOCK:
+        _rt_store_load(cfg)
+        hit = _RT_MEM.get(sha)
+        if hit:
+            return str(hit.get("text") or "")
+        if not learn or sha in _RT_FAIL:
+            # the SPEAK path never transcribes: it reads what is known and moves on
+            return ""
+    if mode != "on" or not (st.get("ttsAcppAsrModel") or "").strip():
+        return ""
+    txt = tts_asr_transcribe(ref_path, cfg)
+    if txt is None:
+        with _RT_LOCK:
+            _RT_FAIL.add(sha)
+        panel_log("[tts] no transcript for %s - the line goes out without one"
+                  % os.path.basename(str(ref_path)))
+        return ""
+    # the markers are stripped whatever the engine was asked to do: a reference
+    # transcript reading "<|en|><|NEUTRAL|><|Speech|> Some call me nature" tells
+    # the cloning model the sample SAYS that, which is worse than saying nothing
+    txt = _RT_TAGS.sub(" ", txt)
+    txt = re.sub(r"\s+", " ", txt).strip()
+    if not txt:
+        with _RT_LOCK:
+            _RT_FAIL.add(sha)
+        return ""
+    with _RT_LOCK:
+        _RT_MEM[sha] = {"text": txt,
+                        # the voicetype beside the hash, so the file can be
+                        # CORRECTED by hand - which beats any ASR on Tamrielic
+                        # proper nouns, and is the point of keeping it readable
+                        "voice": os.path.splitext(
+                            re.split(r"[\\/]", str(ref_path))[-1])[0]}
+        _rt_store_save(cfg)
+    panel_log("[tts] transcript learned for %s: %s"
+              % (os.path.basename(str(ref_path)), txt[:80]))
+    return txt
+
+
+_AC_LOADED = [False]
+
+
+def _audio_cache_path(cfg=None):
+    return os.path.join(log_dir(cfg), "tts-audio-cache.json")
+
+
+def _audio_cache_load(cfg=None):
+    """Yesterday's characters, back on the list. Caller holds _spk_lock.
+
+    Live learning always wins - the disk only fills names the run has not met
+    yet, so a voicetype that changed hands since last session keeps its new
+    owner. Loaded once per run, on first use. (patch8)
+    """
+    if _AC_LOADED[0]:
+        return
+    _AC_LOADED[0] = True
+    try:
+        with open(_audio_cache_path(cfg), "r", encoding="utf-8") as f:
+            for k, v in (json.load(f) or {}).items():
+                TTS_REF_BY_NAME.setdefault(str(k), str(v))
+    except Exception:
+        pass
+
+
+def _audio_cache_save(cfg=None):
+    """Write-through: the dict is small and a crash must not cost the list."""
+    try:
+        with _spk_lock:
+            snap = dict(TTS_REF_BY_NAME)
+        with open(_audio_cache_path(cfg), "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=1, ensure_ascii=False)
+    except Exception as e:
+        log_error("tts", "audio cache save: %s" % e)
+
+
+def api_tts_ref_text_clear(body):
+    """Forget every learned transcript, in memory and on disk. (patch10)"""
+    with _RT_LOCK:
+        _rt_store_load()
+        n = len(_RT_MEM)
+        _RT_MEM.clear()
+        _RT_FAIL.clear()
+        _RT_LOADED[0] = True          # cleared is a KNOWN state, not an unread one
+        try:
+            os.remove(_rt_store_path())
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log_error("tts", "transcript store clear: %s" % e)
+    panel_log("[tts] transcripts cleared - %d forgotten" % n)
+    return {"ok": True, "cleared": n}
+
+
+# Discovered by an install, not chosen on the page: a revert must not lose them.
+TTS_INSTALL_KEYS = ("ttsAcppDir", "ttsAcppExe", "ttsAcppModelsDir", "ttsAcppModel",
+                    "ttsAcppVersion", "ttsAcppAsrModel", "ttsServerExe")
+
+
+def api_tts_defaults(body=None):
+    """Every tts* setting back to its shipped value, and strays removed.
+
+    Deleting first matters as much as writing: a key this build no longer ships
+    (a removed sampler, a retired switch) would otherwise sit in the config
+    forever, and "defaults" that keep ghost settings are not defaults. Engines,
+    models, samples, transcripts, saved audio and the calibration record are all
+    files, not settings, and are untouched. (patch28)
+    """
+    cfg = load_config()
+    st = cfg.setdefault("settings", {})
+    # Where the engine IS is a discovery, not a preference. Wiping these left an
+    # installed Higgs unreachable and the page demanding a folder the user had
+    # never chosen by hand - so they survive the revert. Everything else goes
+    # back to the shipped value, strays included. (patch29)
+    keep = {k: st[k] for k in TTS_INSTALL_KEYS if st.get(k)}
+    for k in [k for k in st if k.startswith("tts")]:
+        del st[k]
+    for k, v in DEF_SETTINGS.items():
+        if k.startswith("tts"):
+            st[k] = v
+    st.update(keep)
+    save_config(cfg)
+    sse_notify("state")
+    return {"ok": True, "reset": sum(1 for k in DEF_SETTINGS if k.startswith("tts"))}
+
+
+def api_tts_cal_clear(body):
+    """Forget every measured line and every recorded cap-hit. (patch20)
+
+    The fit is only ever as good as what it has seen, and a long run under a
+    binding clamp leaves a record full of censored lines that cannot say what
+    they truly needed. Starting empty converges faster on the truth than
+    unlearning does. Voice samples, transcripts, audio takes and settings are
+    untouched - this is the estimator's memory and nothing else.
+    """
+    n_rows = len(tts_measure_rows_unlocked())
+    n_eoc = len(eoc_rows())
+    gone = []
+    for p in (TTS_MEASURE_LOG, TTS_MEASURE_LEGACY, EOC_LOG):
+        try:
+            os.remove(p)
+            gone.append(os.path.basename(p))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            log_error("tts", "calibration clear (%s): %s" % (os.path.basename(p), e))
+    MEASURE_GEN[0] += 1                  # the warm copy is stale the moment this runs
+    _MEASURE_CACHE["gen"] = -1
+    _MEASURE_CACHE["rows"] = []
+    panel_log("[tts] calibration data cleared - %d measured line(s), %d cap-hit(s)"
+              % (n_rows, n_eoc))
+    TTSW.log("\U0001F9F9 calibration data cleared: %d measured line(s) and %d "
+             "cap-hit(s) forgotten. The estimator starts from its seed headroom "
+             "and learns again as lines are spoken." % (n_rows, n_eoc))
+    return {"ok": True, "rows": n_rows, "eoc": n_eoc, "files": gone}
+
+
+def api_tts_audio_cache_clear(body):
+    """Forget every learned character - sample pairing, on disk too."""
+    with _spk_lock:
+        _audio_cache_load()
+        n = len(TTS_REF_BY_NAME)
+        TTS_REF_BY_NAME.clear()
+    try:
+        os.remove(_audio_cache_path())
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        log_error("tts", "audio cache clear: %s" % e)
+    panel_log("[tts] audio cache cleared - %d association%s forgotten"
+              % (n, "" if n == 1 else "s"))
+    return {"ok": True, "cleared": n}
+
+
+_TAKE_RX = re.compile(r"^(\d{8})_(\d{6})(-\d+)?\.wav$")
+
+
+def tts_takes_for(name, cfg=None):
+    """Every generated line kept for one character, newest first.
+
+    Takes live in the user's own output folder as <Safe>_<YYYYMMDD_HHMMSS>.wav.
+    The prefix alone is ambiguous - "Urag" is a prefix of "Urag_gro-Shub" - so a
+    file counts only when what follows the name is EXACTLY a timestamp. (patch8)
+    """
+    out = ((cfg or load_config_cached()).get("settings", {})
+           .get("ttsOutDir") or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(name or "")).strip("_")
+    rows = []
+    if not out or not safe or not os.path.isdir(out):
+        return rows
+    pre = safe + "_"
+    try:
+        for leaf in os.listdir(out):
+            if not leaf.startswith(pre) or not _TAKE_RX.match(leaf[len(pre):]):
+                continue
+            p = os.path.join(out, leaf)
+            try:
+                stt = os.stat(p)
+            except Exception:
+                continue
+            rows.append({"file": leaf, "kb": round(stt.st_size / 1024.0, 1),
+                         "when": time.strftime("%Y-%m-%d %H:%M:%S",
+                                               time.localtime(stt.st_mtime)),
+                         "ts": stt.st_mtime})
+    except Exception:
+        return rows
+    rows.sort(key=lambda r: r["ts"], reverse=True)
+    return rows
+
+
+def api_tts_audio_cache(body):
+    """Every character the panel has met, with the sample that speaks them.
+
+    The associations are the live ones - TTS_REF_BY_NAME as the speak path filled
+    it - joined with the fingerprint and the take count from the output folder.
+    Alphabetical, because that is how a person finds a name. (patch8)
+    """
+    cfg = load_config_cached()
+    out = []
+    with _spk_lock:
+        _audio_cache_load(cfg)
+        pairs = dict(TTS_REF_BY_NAME)
+    for name, ref in pairs.items():
+        vt = os.path.splitext(re.split(r"[\\/]", str(ref or ""))[-1])[0]
+        ex, size, sha = tts_ref_fingerprint(ref)
+        out.append({
+            "name": name, "voicetype": vt,
+            "sample": os.path.basename(str(ref or "")),
+            "present": bool(ex), "sha": sha,
+            "kb": round(size / 1024.0, 1) if ex else 0,
+            "takes": len(tts_takes_for(name, cfg)),
+        })
+    out.sort(key=lambda r: str(r["name"]).lower())
+    return {"rows": out,
+            "outDir": (cfg.get("settings", {}).get("ttsOutDir") or "").strip()}
+
+
+def api_tts_audio_takes(body):
+    """The kept lines for ONE character, for the second page of the popup."""
+    name = str((body or {}).get("name") or "").strip()
+    if not name:
+        return {"error": "no name"}
+    return {"name": name, "rows": tts_takes_for(name)}
+
+
+def tts_identity_path(cfg=None):
+    return os.path.join(log_dir(cfg), "tts-identity.log")
+
+
+def tts_identity_alarm(msg):
+    """A contradiction, said where it will be seen as it happens."""
+    panel_log("[tts] IDENTITY: %s" % msg)
+    try:
+        TTSW.log("\u26A0\uFE0F identity: %s" % msg)
+    except Exception:
+        pass
+
+
+def tts_identity_note(cfg, **kw):
+    """One block per spoken line: who it was called, why, and what actually went out.
+
+    Everything the panel knows at the moment of synthesis, in one place, because the
+    spoken record carried the NAME and the PATH and neither could show a bad
+    transition: the name's rule was invisible and the sample was identified by its
+    filename. A line here is answerable on its own. (patch4)
+    """
+    try:
+        ex, size, sha = tts_ref_fingerprint(kw.get("sent") or "")
+        rows = [
+            "[%s] %s" % (time.strftime("%H:%M:%S"), kw.get("eid") or "-"),
+            "  name      : %s" % (kw.get("name") or "(none)"),
+            "  by        : %s" % (kw.get("rule") or "?"),
+            "  voicetype : %s" % (kw.get("key") or "-"),
+            "  sent      : %s" % (kw.get("sent") or "(none)"),
+            "  file      : %s" % ("%d bytes  sha %s" % (size, sha) if ex
+                                  else "MISSING - nothing to clone from"),
+        ]
+        if kw.get("gate") and kw.get("gate") != "ok":
+            rows.append("  gate      : %s" % kw["gate"])
+        if kw.get("prev"):
+            # the one fact a wrong-voice case turns on: what the engine's single
+            # session was conditioned on before THIS take. Empty on a cold start,
+            # and a cold start in the wrong voice is the engine's own doing.
+            rows.append("  engine was: %s" % kw["prev"])
+        if (kw.get("asked") or "") and kw.get("asked") != kw.get("sent"):
+            rows.append("  asked     : %s" % kw["asked"])
+        cnd = kw.get("cand") or {}
+        if cnd:
+            rows.append("  others    : %s" % "  |  ".join(
+                "%s=%s" % (k, v) for k, v in sorted(cnd.items()) if v))
+        rows.append("  said      : %s" % " ".join(str(kw.get("text") or "").split()))
+        with open(tts_identity_path(cfg), "a", encoding="utf-8") as f:
+            f.write("\n".join(rows) + "\n\n")
+    except Exception as e:
+        log_error("tts", "identity ledger: %s" % e)
+    # the contradictions, live: one character with two samples, one sample with two
+    # characters. Both were only ever visible by reading a whole session afterwards.
+    nm, key = str(kw.get("name") or ""), str(kw.get("key") or "")
+    if not nm or not key:
+        return
+    with _ID_LOCK:
+        was = _ID_SEEN.get(nm)
+        _ID_SEEN[nm] = key
+    if was and was != key:
+        tts_identity_alarm("%s spoke through %s before and through %s now"
+                           % (nm, was, key))
 
 
 def tts_voice_name(path):
@@ -8079,9 +10568,11 @@ def _mk_tts_handler(mgr):
                 return
             if "/gradio_api/call/generate_audio" in self.path:
                 try:
-                    data = (json.loads(body.decode("utf-8")) or {}).get("data") or []
+                    _j = json.loads(body.decode("utf-8")) or {}
                 except Exception:
-                    data = []
+                    _j = {}
+                data = _j.get("data") or []
+                tts_wire_note(_j, self.headers)
                 if not data:
                     self._json(400, {"error": "no data"}); return
                 self._json(200, {"event_id": mgr.submit(data)})
@@ -8166,8 +10657,13 @@ TTS_HINTS = (
     ("missing model package file",
      "the model path points at the wrong place - select a model folder or .gguf, not the "
      "folder above it"),
+    ("failed to allocate",
+     "the card refused this buffer - the TTS-E01 line above shows what was actually "
+     "free. A refusal with ample free memory is not a shortage, and a bigger cap "
+     "would only ask for more"),
     ("out of memory",
-     "not enough VRAM - try a shorter reference voice, a smaller model, or another card"),
+     "the card refused the allocation - see the card figures on the TTS-E01 line: "
+     "if free memory is ample this is not a VRAM shortage"),
     ("failed to read WAV data chunk",
      "the reference voice is not a plain WAV the server can read"),
 )
@@ -8190,6 +10686,11 @@ def _num_or(hdrs, names):
 
 
 ACPP_EXE_NAME = "audiocpp_server.exe"
+_ACPP_NO_OPTS = [False]        # the server refused a session option this panel run:
+                               # every later start writes the config without them
+_ACPP_NO_ASR = [False]         # and the same for the co-hosted ASR model: a build
+                               # that does not know sense_asr exits on it, so the
+                               # start ladder drops it rather than losing the server
 ACPP_REPO = "0xShug0/audio.cpp"
 _acpp_find = {"root": "", "t": 0.0, "exe": ""}
 
@@ -8293,6 +10794,9 @@ HIGGS_ENGINE_ASSETS = (
 ACPP_PROFILES = ("balance", "fast")
 HIGGS_GGUF_REPO = "audio-cpp/audio.cpp-gguf"
 HIGGS_GGUF_PATH = "Higgs-Audio-v3-TTS-4B-GGUF/higgs-audio-v3-tts-4b-q8_0.gguf"
+# the recogniser audio.cpp's own sense_asr documentation names for this release
+SENSE_GGUF_REPO = "FunAudioLLM/SenseVoiceSmall-GGUF-audiocpp"
+SENSE_GGUF_PATH = "sensevoice-small-q8-audiocpp-v1.gguf"
 HIGGS_NEED_BYTES = 8 * 1024 * 1024 * 1024        # ~5.1 GB model plus room to unzip
 HIGGS_INSTALL = {"running": False, "cancel": False, "step": "", "pct": 0.0,
                  "error": "", "done": False, "engine": "", "model": "",
@@ -8536,6 +11040,26 @@ def higgs_install_worker():
             _hi_download(url, gguf, "model")
             _hi_log("\u2705 Model ready: %s" % os.path.basename(gguf))
 
+        # ---- 2b. the recogniser that writes reference transcripts. Optional
+        # in the truest sense: a miss here is LOGGED and the install proceeds -
+        # the panel works exactly as before with the field simply left empty.
+        sv = os.path.join(paths["model_dir"], SENSE_GGUF_PATH)
+        if os.path.isfile(sv) and os.path.getsize(sv) > 2e8:
+            _hi_log("\u2705 SenseVoice already here: %s" % SENSE_GGUF_PATH)
+        else:
+            try:
+                url = ("https://huggingface.co/%s/resolve/main/%s?download=true"
+                       % (SENSE_GGUF_REPO, SENSE_GGUF_PATH))
+                _hi_log("\u2B07 %s (about 254 MB - the transcript recogniser)"
+                        % SENSE_GGUF_PATH)
+                _hi_download(url, sv, "sensevoice")
+                _hi_log("\u2705 SenseVoice ready: %s" % SENSE_GGUF_PATH)
+            except Exception as e:
+                sv = ""
+                _hi_log("   SenseVoice could not be fetched (%s) - reference "
+                        "transcripts stay idle until a model is picked"
+                        % str(e)[:80])
+
         # ---- 3. point the panel at what was just installed
         #
         # Everything is on disk by now. If only this last step fails - a locked config
@@ -8549,6 +11073,18 @@ def higgs_install_worker():
                 st["ttsAcppDir"] = paths["engine"]
                 st["ttsAcppModelsDir"] = paths["models"]
                 st["ttsAcppModel"] = gguf
+                st["ttsSampleSec"] = "10"    # the shipped default; an install
+                                             # must not undercut it (patch28)
+                if sv:
+                    st["ttsAcppAsrModel"] = sv
+                # an install is a fresh start for the engine's own settings: the
+                # reference samplers are restored even where a field already held
+                # something, because a value carried over from a tuning session is
+                # exactly what a reinstall is meant to undo (patch21)
+                for _k21, _v21 in HIGGS_REF_SAMPLERS.items():
+                    st[_k21] = _v21
+                _hi_log("      samplers            reset to Boson's reference: "
+                        "temperature 0.8, top_k 50, nothing else sent")
                 st["ttsAcppVersion"] = tag        # audiocpp_server has no --version
                 # the panel answers SkyrimNet itself - an install that leaves this
                 # pointing at a wrapper the user does not have produces silence
@@ -8572,6 +11108,16 @@ def higgs_install_worker():
             TTSW.log("")
             return
         _tts_models_cache["t"] = 0.0
+        try:
+            # the model select matches on the FULL path - a basename here left
+            # the dropdown on "(none selected)" beside an installed model (p32)
+            _p31 = tts_write_install_paths(paths["engine"], paths["models"], gguf)
+            _hi_log("      audio.cpp folder    %s" % _p31["engine"])
+            _hi_log("      TTS models folder   %s" % _p31["models"])
+            _hi_log("      Sample Vault        %s" % _p31["vault"])
+        except Exception as _ev13:
+            _hi_log("      Sample Vault        could not be created (%s)"
+                    % str(_ev13)[:60])
         HIGGS_INSTALL.update(done=True, engine=paths["engine"],
                              model=os.path.basename(gguf))
         _hi_log("\U0001F389 Higgs Audio v3 is installed and selected. Press Start TTS.")
@@ -8615,6 +11161,45 @@ def higgs_present(cfg=None):
             "adoptable": bool(exe and models and not wired)}
 
 
+def tts_write_install_paths(engine, models_dir, model_file=""):
+    """Every path an install or an adoption discovered, written in one place.
+
+    The engine folder, the models folder, the chosen model and the Sample Vault
+    were each written by whichever branch happened to run, so an ADOPTED install
+    filled some and left the rest, and the page showed empty folder fields next
+    to a banner promising they were set. One writer, both callers, and the vault
+    is created rather than merely named. (patch31)
+    """
+    vault = os.path.join(STACK, "Sample Vault")
+    with CFG_LOCK:
+        c = load_config()
+        st = c.setdefault("settings", {})
+        st["ttsEngine"] = "audiocpp"
+        if engine:
+            st["ttsAcppDir"] = engine
+        if models_dir:
+            st["ttsAcppModelsDir"] = models_dir
+        if model_file:
+            st["ttsAcppModel"] = model_file
+        try:
+            os.makedirs(vault, exist_ok=True)
+            st["ttsSampleDir"] = vault
+        except OSError:
+            pass
+        if not str(st.get("ttsOutDir") or "").strip():
+            st["ttsOutDir"] = DEF_SETTINGS["ttsOutDir"]
+        save_config(c)
+    _tts_models_cache["t"] = 0.0
+    # A DEDICATED event, not the general one. The general state repaint yields to
+    # focus inside the TTS pane - correct while someone types, useless here,
+    # because the button that started the install still holds focus and nothing
+    # blurs it. Adoption never runs the install poller either, so this was the
+    # only route left and it was the one being deferred. (patch33)
+    sse_notify("tts-installed")
+    sse_notify("state")
+    return {"engine": engine, "models": models_dir, "vault": vault}
+
+
 def api_higgs_adopt(body=None):
     """Point the settings at an install that is already on disk. Host only."""
     found = higgs_present()
@@ -8625,15 +11210,11 @@ def api_higgs_adopt(body=None):
     with CFG_LOCK:
         c = load_config()
         st = c.setdefault("settings", {})
-        st["ttsEngine"] = "audiocpp"
-        st["ttsAcppDir"] = paths["engine"]
-        st["ttsAcppModelsDir"] = paths["models"]
-        st["ttsAcppModel"] = found["models"][0]
         ver = acpp_local_version(c)              # from a README if there is one
         if ver:
             st["ttsAcppVersion"] = ver
         save_config(c)
-    _tts_models_cache["t"] = 0.0
+    tts_write_install_paths(paths["engine"], paths["models"], found["models"][0])
     TTSW.log("\u2705 Adopted the install already in %s" % paths["engine"])
     return {"ok": True, "model": os.path.basename(found["models"][0])}
 
@@ -8646,11 +11227,14 @@ def api_higgs_install(body):
         return {"ok": True}
     if HIGGS_INSTALL["running"]:
         return {"error": "an install is already running"}
-    if not (body or {}).get("confirm"):
-        return {"error": "not confirmed"}
+    # dismiss FIRST: it hides a finished banner and destroys nothing, so gating
+    # it behind confirm meant every click bounced with "not confirmed" while the
+    # client, told ok-or-not nothing it looked at, repainted the same banner
     if str((body or {}).get("action", "")) == "dismiss":
         HIGGS_INSTALL.update(done=False, error="", step="", warn="")
         return {"ok": True}
+    if not (body or {}).get("confirm"):
+        return {"error": "not confirmed"}
     HIGGS_INSTALL.update(running=True, cancel=False, step="", pct=0.0, error="",
                          done=False, engine="", model="", warn="", at=time.time())
     threading.Thread(target=higgs_install_worker, daemon=True).start()
@@ -8788,6 +11372,9 @@ def tts_save_named(src_bytes, npc, cfg=None):
     out = (( cfg or load_config()).get("settings", {}).get("ttsOutDir") or "").strip()
     if not out:
         return ""
+    if not os.path.isabs(out):
+        # a bare name lands beside the panel, wherever the panel was started from
+        out = os.path.join(STACK, out)
     try:
         os.makedirs(out, exist_ok=True)
         safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(npc or "voice")).strip("_") or "voice"
@@ -8849,7 +11436,9 @@ SN_TTS_FIELDS = (
 # What audio.cpp's speech endpoint takes. The REQUEST ignores a name it does not know -
 # established by patch60 - so a value here is either honoured or dropped, never fatal.
 # pace and expressiveness have no counterpart and are observed but not forwarded.
-SN_TTS_FORWARD = ("temperature", "top_p", "min_p", "repetition_penalty")
+# what SkyrimNet sends AND this engine can use. A top_p arriving from SkyrimNet is
+# dropped rather than forwarded: Higgs does not want it (patch23)
+SN_TTS_FORWARD = ("temperature", "top_k")
 _SN_TTS_SEEN = {}
 
 
@@ -9045,8 +11634,26 @@ def tts_engine(cfg=None):
     return str((cfg or load_config()).get("settings", {}).get("ttsEngine", "moss")).lower()
 
 
-def tts_acpp_config(cfg=None):
-    """The server.json audio.cpp is started with.
+def acpp_retry_rung(cfg=None):
+    """Which rung to take when the server exits at once - or "" for none left.
+
+    The decision lives here rather than inside the spawn because a rung that is
+    never exercised is a rung nobody can trust: welded into _api_tts_server it
+    could only be pinned by its own source text, which a broken condition still
+    satisfies. Order matters - session options first, because dropping the ASR
+    entry for a fault that was really an option would disable a feature the
+    person asked for. (patch10)
+    """
+    cfg = cfg or load_config()
+    if not _ACPP_NO_OPTS[0] and '"session_options"' in tts_acpp_config(cfg):
+        return "opts"
+    if not _ACPP_NO_ASR[0] and '"sense_asr"' in tts_acpp_config(cfg):
+        return "asr"
+    return ""
+
+
+def tts_acpp_config(cfg=None, no_opts=False):
+    """The server.json audio.cpp is started with. (no_opts: leave session options out)
 
     The panel owns this file - a user editing it by hand would be overwritten on the
     next Start, which is why the GPU is pinned by env instead of the "device" key:
@@ -9060,38 +11667,76 @@ def tts_acpp_config(cfg=None):
     cfg = cfg or load_config()
     st = cfg.get("settings", {})
     fam = (st.get("ttsAcppFamily") or "higgs_audio_tts")
+    no_opts = bool(no_opts) or bool(_ACPP_NO_OPTS[0])
     try:
-        slots = max(1, min(int(str(st.get("ttsAcppRefSlots", "64")).strip() or 64), 1024))
+        slots = max(1, min(int(str(st.get("ttsAcppRefSlots", "1024")).strip() or 1024), 1024))
     except Exception:
-        slots = 64
+        slots = 1024
     try:
         busy_ms = max(2000, min(int(str(st.get("ttsAcppBusyMs", "9000")).strip() or 9000),
                                 60000))
     except Exception:
         busy_ms = 9000
+    if str(st.get("ttsRunawayMode") or "detect").strip().lower() == "detect":
+        # the token cap is the bound in detect mode; a tight clock here would cut
+        # the very takes the detector needs to see whole, and the retry after them
+        busy_ms = max(busy_ms, 30000)
+    tts = {
+        "id": (st.get("ttsAcppModelId") or "higgs"),
+        "family": fam,
+        "path": (st.get("ttsAcppModel") or "").replace("\\", "/"),
+        "task": "tts",
+        "mode": "offline",
+        # SkyrimNet gives TTS about 15s. The server queues a second request behind
+        # the first, so without a bound a slow line stalls every line after it.
+        "busy_timeout_ms": busy_ms,
+    }
+    if not no_opts:
+        # The engine keeps encoded references in a cache whose default size is ONE.
+        # A conversation alternates speakers, so at one slot practically every line
+        # re-encodes its reference. One entry per voice you actually meet.
+        # audio.cpp 0.6 dropped this option from the Higgs family, and the server
+        # EXITS on an option it does not know - which is what no_opts is for: the
+        # start retries once without any session options and remembers. (patch8)
+        tts["session_options"] = {"%s.reference_cache_slots" % fam: slots}
+    models = [tts]
+    asr = (st.get("ttsAcppAsrModel") or "").strip()
+    if (str(st.get("ttsAsrMode") or "on").strip().lower() == "on"
+            and asr and os.path.isfile(asr) and not _ACPP_NO_ASR[0]):
+        # a co-hosted SenseVoice: tiny beside Higgs, and it turns every voicetype
+        # sample into a reference transcript the cloning request can carry (patch8).
+        # Only in "on" mode: "stored" reads transcripts already learned or written
+        # by hand and loads no model at all, which costs no VRAM. (patch10)
+        models.append({
+            "id": "sense",
+            "family": "sense_asr",
+            "path": asr.replace("\\", "/"),
+            "task": "asr",
+            "mode": "offline",
+            "busy_timeout_ms": 15000,
+            # what this family actually takes, from its own documentation. The
+            # chunker is told NOT to segment: a voicetype sample is seconds long,
+            # one pass is right, and it needs no VAD model to be present.
+            "default_request_options": {
+                "language": (str(st.get("ttsAsrLang") or "en").strip().lower()
+                             or "en"),
+                "enable_itn": (str(st.get("ttsAsrItn") or "words").strip().lower()
+                               == "digits"),
+                # never asked for: markers describe what the recogniser HEARD,
+                # a transcript states what the sample SAYS, and the panel strips
+                # them unconditionally anyway. The dial that chose was wired to
+                # nothing visible, so it is gone. (patch16)
+                "keep_tags": False,
+                "audio_chunk_mode": "none",
+            },
+        })
     return json.dumps({
         "host": "0.0.0.0",
         "port": tts_server_port(cfg),
         "backend": "cuda",
         "device": 0,
         "threads": 1,
-        "models": [{
-            "id": (st.get("ttsAcppModelId") or "higgs"),
-            "family": fam,
-            "path": (st.get("ttsAcppModel") or "").replace("\\", "/"),
-            "task": "tts",
-            "mode": "offline",
-            # SkyrimNet gives TTS about 15s. The server queues a second request behind
-            # the first, so without a bound a slow line stalls every line after it.
-            "busy_timeout_ms": busy_ms,
-            # The engine keeps encoded references in a cache whose default size is ONE.
-            # A conversation alternates speakers, so at one slot practically every line
-            # re-encodes its reference. One entry per voice you actually meet.
-            # reference_cache_slots is the ONLY option this family accepts. Anything
-            # else and the server exits before it loads - which is why there are no
-            # sampling controls here any more.
-            "session_options": {"%s.reference_cache_slots" % fam: slots},
-        }],
+        "models": models,
     }, indent=2)
 
 
@@ -9104,16 +11749,46 @@ def tts_acpp_speak(url_base, model_id, text, ref_path, ref_text=""):
     panel starts the process.
     """
     last = None
+    _ACPP_HOLD_CAP[0] = False
+    engine_wait_reset()
+    TTS_TAKE.update(final_s=0.0, wasted_s=0.0, tries=0)
     for _try in range(3):
         _t0 = time.time()
         try:
-            data, hdrs = _tts_acpp_once(url_base, model_id, text, ref_path, ref_text,
-                                        attempt=_try + 1)
+            _tw19 = time.time()
+            with _ENGINE_LOCK:
+                try:
+                    ENGINE_WAIT.s = getattr(ENGINE_WAIT, "s", 0.0) + (time.time() - _tw19)
+                except Exception:
+                    pass
+                data, hdrs = _tts_acpp_once(url_base, model_id, text, ref_path,
+                                            ref_text, attempt=_try + 1)
         except RuntimeError as e:
             _spent = time.time() - _t0
+            TTS_TAKE["wasted_s"] += _spent
             # "reached max_tokens before EOC" is the model failing to stop, not a bad
             # request - it is sampled, so the same line usually succeeds next time.
             _msg = str(e)
+            # "failed to allocate ... graph" is the card being momentarily full,
+            # not a bad request. It used to raise straight through and the line
+            # was simply never spoken. A short wait lets whatever held the memory
+            # release, and the same line then usually succeeds. (patch17)
+            _alloc = ("allocate" in _msg or "out of memory" in _msg
+                      or "bad allocation" in _msg)
+            if _alloc and _try < 2:
+                TTS_TAKE["wasted_s"] += 0.6 * (_try + 1)
+                # the AR prefill graph scales with max_tokens, so the escalation
+                # meant to help an EOC failure asked the card for a LARGER buffer
+                # than the one that had just been refused - 271 -> 406 -> 609 in
+                # the field, each attempt worse than the last (patch19)
+                _ACPP_HOLD_CAP[0] = True
+                TTSW.log("   \u21BA %s" % tts_err("ALLOC", "attempt %d, waiting %.1fs"
+                                                  % (_try + 1, 0.6 * (_try + 1)),
+                                                  tts_gpu_uuid()))
+                time.sleep(0.6 * (_try + 1))
+                continue
+            if _alloc:
+                log_error("tts", tts_err("ALLOC", _msg, tts_gpu_uuid()))
             if _try >= 2 or not ("max_tokens" in _msg or "EOC" in _msg):
                 if "max_tokens" in _msg or "EOC" in _msg:
                     # the final failure was invisible to the record: attempts one
@@ -9135,16 +11810,174 @@ def tts_acpp_speak(url_base, model_id, text, ref_path, ref_text=""):
                      "(cap %d tokens, server limit %s) - trying again"
                      % (_spent, AUTOCAL_CAP[0] or acpp_token_cap(text, _st1),
                         _st1.get("ttsAcppBusyMs", "?")))
-            _nxt = tts_samplers(_cfg0.get("settings", {}) or {}, _try + 2)
-            if str((_cfg0.get("settings", {}) or {}).get("ttsRetrySafe", "on")).lower() == "on":
-                TTSW.log("      steadier for the retry: %s" % tts_samp_note(_nxt))
             time.sleep(0.2)
             continue
+        TTS_TAKE["final_s"] = time.time() - _t0
+        TTS_TAKE["tries"] = _try + 1
         return data, hdrs
     return last
 
 
+# The take that actually played, and the attempts that did not. srv_s used to be
+# the whole ladder, so a line that failed once and succeeded once was reported as
+# one very slow synthesis - and the realtime figure, the tps and the fit all read
+# a number no single take ever took. (patch18)
+# Higgs keeps its reference prompt state in the MODEL SESSION - audio.cpp says so
+# in its own documentation - and the panel was letting a dialogue line and a
+# thought reach that session at the same time. A hash-verified male reference came
+# back in a female voice, one take ran 15.2s for 3.1s of audio, and two reports
+# interleaved mid-write in the log. Nothing serialised access to a stateful
+# engine. Now one request holds it at a time, and the wait is measured rather
+# than hidden. (patch19)
+_ENGINE_LOCK = threading.Lock()
+# an allocation failure holds the cap where it is: raising it makes the very
+# buffer that was just refused larger (patch19)
+_ACPP_HOLD_CAP = [False]
+ENGINE_WAIT = threading.local()
+
+
+def engine_wait_reset():
+    ENGINE_WAIT.s = 0.0
+
+
+def engine_wait_get():
+    try:
+        return float(ENGINE_WAIT.s)
+    except AttributeError:
+        return 0.0
+
+
+# the take that played, per THREAD: two lines in flight shared one dict and
+# overwrote each other's timings (patch19)
+_TAKE = threading.local()
+
+
+def _take():
+    try:
+        return _TAKE.d
+    except AttributeError:
+        d = _TAKE.d = {"final_s": 0.0, "wasted_s": 0.0, "tries": 0}
+        return d
+
+
+class _TakeProxy(object):
+    """TTS_TAKE kept as a name, backed by per-thread storage."""
+    def get(self, k, default=None):
+        return _take().get(k, default)
+    def __getitem__(self, k):
+        return _take()[k]
+    def __setitem__(self, k, v):
+        _take()[k] = v
+    def update(self, **kw):
+        _take().update(kw)
+
+
+TTS_TAKE = _TakeProxy()
+
+TTS_TIMING_CSV = "tts-timing.csv"
+TTS_TIMING_COLS = ("at", "voice", "chars", "tokens", "audio_s", "final_ms",
+                   "wasted_ms", "tries", "prep_ms", "gen_ms", "dec_ms",
+                   "ref_s", "ref_bytes", "ref_text_chars", "cap", "queued_ms")
+
+
+def tts_timing_row(**kw):
+    """Append one line's numbers, machine-readable, for fitting later.
+
+    The panel's own report is for reading; this is for arithmetic. Six requests
+    clustered at one length cannot separate a per-request cost from a per-token
+    one - that takes hundreds of lines across the range play actually produces,
+    which is exactly what this accumulates while you play. (patch18)
+    """
+    try:
+        p = os.path.join(log_dir(), TTS_TIMING_CSV)
+        new = not os.path.isfile(p)
+        with open(p, "a", encoding="utf-8", newline="") as f:
+            if new:
+                f.write(",".join(TTS_TIMING_COLS) + "\n")
+            f.write(",".join(str(kw.get(c, "")) for c in TTS_TIMING_COLS) + "\n")
+    except Exception as e:
+        panel_log("[tts] timing row: %s" % str(e)[:60])
+
+
+def tts_ref_facts(path):
+    """(seconds, bytes) of a reference sample - the two numbers that decide
+    whether encoding it is what a request is paying for."""
+    try:
+        b = os.path.getsize(path)
+    except OSError:
+        return 0.0, 0
+    try:
+        with wave.open(path, "rb") as w:
+            return round(w.getnframes() / float(w.getframerate() or 1), 2), b
+    except Exception:
+        return 0.0, b
+
 TTS_SAMP_LAST = {}              # what the last request carried, for the record
+
+
+def tts_wav_seconds(body):
+    """Seconds of audio in a WAV body, trusting the frames over the header."""
+    try:
+        if not body or len(body) < 44 or body[:4] != b"RIFF":
+            return 0.0
+        rate = int.from_bytes(body[24:28], "little") or 24000
+        ch = int.from_bytes(body[22:24], "little") or 1
+        bits = int.from_bytes(body[34:36], "little") or 16
+        bps = rate * ch * max(1, bits // 8)
+        return max(0.0, (len(body) - 44) / float(bps))
+    except Exception:
+        return 0.0
+
+
+RUNAWAY_SHORT = 0.5          # under half the expectation, words have gone missing
+
+
+def tts_runaway_expect(text, vt="", rows=None):
+    """Seconds a take of this text, in this voice, should plausibly run.
+
+    The SAME per-voice model that sets the cap - one expectation for pricing and
+    judging, so they can never disagree (patch16). It stays
+    deliberately independent of the auto-cal estimator, whose estimate is 0.0
+    whenever calibration is off; an expectation that collapses with a setting
+    would flag every long take.
+    With no voicetype the shipped fit answers, which is the patch13 line within
+    a token or two.
+    """
+    return tts_voice_tokens(text, vt, rows)[0] / TTS_ACPP_FRAME_RATE
+
+
+def tts_runaway_verdict(body, text, st=None, vt="", rows=None):
+    """(verdict, seconds, expected) - did the engine say the LINE, or something else?
+
+    The engine's stop token is unreliable: the same two words came back once as
+    27 seconds of audio and once as a sigh with the words dropped - both HTTP
+    200, both invisible to status codes. The only witness is the audio itself,
+    held against what the TEXT should take. RUNAWAY is audio far past that;
+    SHORT is audio far under it on a line long enough that a legitimate take
+    cannot be that brief - noted, never retried, until the rate is known.
+    (patch13)
+    """
+    st = st or {}
+    sec = tts_wav_seconds(body)
+    if sec <= 0:
+        return "", 0.0, 0.0
+    if not tts_line_lexical(text):
+        # a performance - "Ahh...", a lone sigh - is legitimately unpredictable
+        # in BOTH directions, and judging it retries good takes (patch16)
+        return "", sec, 0.0
+    exp = tts_runaway_expect(text, vt, rows)
+    try:
+        ratio = max(1.2, min(5.0, float(str(st.get("ttsRunawayRatio") or "1.7"))))
+    except Exception:
+        ratio = 1.7
+    if sec > max(3.5, exp * ratio):
+        return "runaway", sec, exp
+    bare = re.sub(r"<\|[^|>]*\|>", "", str(text or "")).strip()
+    if len(bare) >= 15 and sec < exp * RUNAWAY_SHORT:
+        # the field failure this hunts came back at 0.42x - a sigh where the
+        # words should be. Half is the line both sweeps' legitimate takes clear.
+        return "short", sec, exp
+    return "", sec, exp
 
 
 def _tts_acpp_once(url_base, model_id, text, ref_path, ref_text="", attempt=1):
@@ -9153,14 +11986,22 @@ def _tts_acpp_once(url_base, model_id, text, ref_path, ref_text="", attempt=1):
     # Sent under every name the server might read it as. A build that knows none of them
     # ignores all of them, which is why busy_timeout_ms is the bound that has to work.
     _st0 = load_config_cached().get("settings", {}) or {}   # read-only here
-    _cap, _capnote, _est = tts_auto_cap(text, _st0)
-    if attempt > 1:
+    _cap, _capnote, _est = tts_auto_cap(text, _st0, vt=tts_voice_key(ref_path))
+    if attempt > 1 and not _ACPP_HOLD_CAP[0]:
         # resending the SAME cap can only fail the same way - the owner's 12:12
         # log: three identical requests, three identical failures. Half again
         # per attempt, bounded well above any real line. (patch181)
+        #
+        # NOT after an allocation failure: the AR prefill graph is sized from
+        # max_tokens, so escalating asks the card for a bigger buffer than the
+        # one it just refused. The field log climbed 271 -> 406 -> 609 and
+        # failed three times for it. (patch19)
         _cap = int(min(TTS_CAP_CEILING, _cap * (1.5 ** (attempt - 1))))
         if _capnote:
             _capnote += "  \u21BA retry cap \u2192 %d" % _cap
+    elif attempt > 1 and _capnote:
+        _capnote += ("  \u21BA cap held at %d - the card refused a buffer, "
+                     "not a size" % _cap)
     AUTOCAL_EST[0] = _est          # the bare estimate this line was judged against
     AUTOCAL_CAP[0] = _cap
     if _capnote:
@@ -9471,19 +12312,29 @@ CAL_KNOBS = (
      "how long one line may generate before the server gives up"),
     ("temperature", "ttsCalTemp", float, 0.1, 1.5,
      "overrides SkyrimNet's, on the request"),
-    ("top_p", "ttsCalTopP", float, 0.1, 1.0, "overrides SkyrimNet's, on the request"),
-    ("repetition_penalty", "ttsCalRepPen", float, 1.0, 2.0,
-     "overrides SkyrimNet's, on the request"),
-    ("min_p", "ttsCalMinP", float, 0.0, 0.5, "overrides SkyrimNet's, on the request"),
+    ("top_k", "ttsCalTopK", int, 1, 200, "overrides SkyrimNet's, on the request"),
 )
-CAL_REQUEST_KEYS = {"ttsCalTemp": "temperature", "ttsCalTopP": "top_p",
-                    "ttsCalRepPen": "repetition_penalty", "ttsCalMinP": "min_p"}
+# Two. Boson's reference for higgs-tts-3-4b is temperature 0.8 with top_k 50 and
+# nothing else; audio.cpp documents repetition_penalty as accepted-but-unconsumed
+# for this family, and top_p/min_p only ever narrowed the distribution toward the
+# degenerate repeat this project spent days chasing. Shipping a control that
+# cannot help and can hurt is worse than shipping none. max_tokens is absent
+# because the proxy decides it per line - see tts_auto_cap. (patch23)
+CAL_REQUEST_KEYS = {"ttsCalTemp": "temperature", "ttsCalTopK": "top_k"}
+# Boson AI's own voice-clone example for higgs-tts-3-4b, verbatim:
+#     "temperature": 0.8, "top_k": 50, "max_new_tokens": 1024
+# No top_p, no min_p, no repetition_penalty - unfiltered apart from top-k. That
+# matters more than it looks: NARROWING these is what produces the degenerate
+# repeat. A 27-second take caught in the field was one 40 ms frame repeated ~650
+# times, bit-identical - the signature of a distribution collapsed to a single
+# token. The retry ladder was reaching that state deliberately, stepping
+# temperature 0.5 -> 0.4 -> 0.32 with min_p rising, which is near-greedy
+# decoding. Blank means "do not send it", so the engine's own default stands.
+HIGGS_REF_SAMPLERS = {"ttsCalTemp": "0.8", "ttsCalTopK": "50"}
 # The chip key the page shows, and the setting behind it. Same four the engine is
 # sent, named the way the provider cards name theirs.
-TTS_SAMP_KEYS = {"temp": "ttsCalTemp", "top_p": "ttsCalTopP",
-                 "min_p": "ttsCalMinP", "rep": "ttsCalRepPen"}
-TTS_SAMP_FIELD = {"temp": "temperature", "top_p": "top_p",
-                  "min_p": "min_p", "rep": "repetition_penalty"}
+TTS_SAMP_KEYS = {"temp": "ttsCalTemp", "top_k": "ttsCalTopK"}
+TTS_SAMP_FIELD = {"temp": "temperature", "top_k": "top_k"}
 
 
 def tts_samplers(st, attempt=1):
@@ -9509,25 +12360,18 @@ def tts_samplers(st, attempt=1):
     # a calibrated value wins over SkyrimNet's, because it was chosen against this
     # machine's own record of what went wrong
     out.update(cal_overrides(st))
-    if attempt > 1 and str((st or {}).get("ttsRetrySafe", "on")).lower() == "on":
-        # each retry steps FURTHER: the owner's 12:12 log showed attempts two and
-        # three carrying byte-identical samplers, which is not a retry but a
-        # repeat. Cooler by 0.8 per step, nucleus tighter by 0.05 per step, the
-        # floor firmer - always toward the stop token.
-        _k = attempt - 1
-        out = dict(out)
-        if "temperature" in out:
-            out["temperature"] = round(max(0.1, float(out["temperature"]) * (0.8 ** _k)), 3)
-        out["repetition_penalty"] = 1.0
-        out["top_p"] = round(max(0.7, min(0.9, float(out.get("top_p", 0.9) or 0.9)) - 0.05 * (_k - 1)), 3)
-        out["min_p"] = round(max(float(out.get("min_p", 0.05) or 0.05), 0.05 + 0.03 * (_k - 1)), 3)
+    # A retry carries the SAME samplers. Stepping them colder walked the engine
+    # toward greedy decoding, and greedy decoding is what produces the endless
+    # repeated-token take - the rescue was feeding the fault. The retry belongs
+    # to the token cap, which the ladder still escalates; sampling is not a
+    # failure mode sampling can fix. (patch23)
     return out
 
 
 def tts_samp_note(samp):
     """The sampler values on one readable line, in the page's own chip order."""
     bits = []
-    for k in ("temp", "top_p", "min_p", "rep"):
+    for k in ("temp", "top_k"):
         v = samp.get(TTS_SAMP_FIELD[k])
         if v is not None and str(v) != "":
             bits.append("%s %s" % (k, _num_str(v)))
@@ -9554,7 +12398,7 @@ def cal_overrides(st):
         if not v:
             continue
         try:
-            out[name] = float(v)
+            out[name] = int(float(v)) if name == "top_k" else float(v)
         except Exception:
             pass
     return out
@@ -9777,83 +12621,6 @@ def autocal_derive_arith(cfg=None, why="every-N"):
     return {"ok": True, "cps": ols["cps"], "lead": ols["lead"]}
 
 
-def autocal_sampler_arith(cfg=None):
-    """Sampler auto-optimisation without a model: the failure record IS the diagnosis.
-
-    Runs only when the user has switched sampler calibration on - that switch is the
-    delegation. One bounded step at a time, with the numbers that drove it in the
-    feed, and never more than one step per fresh window of lines (the window must
-    postdate the last change, so a bad patch of lines is acted on once, not forty
-    times).
-    """
-    cfg = load_config() if cfg is None else cfg
-    st = cfg.get("settings", {}) or {}
-    if str(st.get("ttsSampAutoCal", "on")).lower() != "on":
-        return None
-    rows = tts_measure_rows()[-40:]
-    if len(rows) < 12:
-        return None
-    since = str(rows[0].get("at") or "")
-    mark = str(st.get("ttsCalSampAt") or "")
-    if mark and since <= mark:
-        return None                       # this window overlaps the last change
-    failed = {str(e.get("at") or "") for e in eoc_rows()
-              if str(e.get("at") or "") >= since}
-    rate = len(failed) / float(len(rows))
-    obs = sn_tts_observed()
-    cur = cal_overrides(st)
-
-    def _f(name, dflt):
-        if name in cur:
-            return float(cur[name])
-        try:
-            return float(obs.get(name, dflt))
-        except Exception:
-            return dflt
-    t0, p0 = _f("temperature", 0.7), _f("top_p", 0.95)
-    changed = []
-    if rate >= 0.08:
-        t1 = max(0.5, round(t0 - 0.07, 2))
-        p1 = max(0.85, round(min(p0, 0.95) - 0.02, 2))
-        if t1 < t0:
-            st["ttsCalTemp"] = str(t1); changed.append("temperature %.2f\u2192%.2f" % (t0, t1))
-        if p1 < p0:
-            st["ttsCalTopP"] = str(p1); changed.append("top_p %.2f\u2192%.2f" % (p0, p1))
-        if str(st.get("ttsCalRepPen") or "") != "1.0":
-            st["ttsCalRepPen"] = "1.0"; changed.append("repetition_penalty\u21921.0")
-        verdict = "%d of %d lines ran past end-of-content - steadier" \
-                  % (len(failed), len(rows))
-    elif rate == 0.0 and len(rows) >= 40 and cur:
-        # a clean window relaxes ONE notch back towards what SkyrimNet asked for -
-        # the calibrated grip is loosened only by evidence, the same way it was taken
-        tb, pb = _f("temperature", t0), _f("top_p", p0)
-        ot = float(obs.get("temperature", tb) or tb)
-        op = float(obs.get("top_p", pb) or pb)
-        if "temperature" in cur and ot > tb:
-            t1 = min(ot, round(tb + 0.05, 2))
-            if abs(ot - t1) < 0.02:
-                st.pop("ttsCalTemp", None); changed.append("temperature back to %.2f" % ot)
-            else:
-                st["ttsCalTemp"] = str(t1); changed.append("temperature %.2f\u2192%.2f" % (tb, t1))
-        elif "top_p" in cur and op > pb:
-            p1 = min(op, round(pb + 0.01, 2))
-            if abs(op - p1) < 0.005:
-                st.pop("ttsCalTopP", None); changed.append("top_p back to %.2f" % op)
-            else:
-                st["ttsCalTopP"] = str(p1); changed.append("top_p %.2f\u2192%.2f" % (pb, p1))
-        verdict = "0 of %d lines failed - relaxing one notch" % len(rows)
-    else:
-        return None
-    if not changed:
-        return None
-    st["ttsCalSampAt"] = time.strftime("%Y-%m-%d %H:%M:%S")
-    cfg["settings"] = st
-    save_config(cfg)
-    calterm_log(["sampler calibration  [proxy arithmetic]",
-                 "   " + verdict + ": " + ", ".join(changed)])
-    return {"rate": round(rate, 3), "changed": changed}
-
-
 def autocal_lines_since(st):
     """How many lines have been measured since the last fit ATTEMPT.
 
@@ -9896,7 +12663,6 @@ def autocal_tick(st):
         AUTOCAL_GEN[0] = 0
         _cfgp = load_config()
         autocal_derive_arith(_cfgp, why="every %d lines" % every)
-        autocal_sampler_arith(_cfgp)
         return
 
 def api_tts_diag(body=None):
@@ -9939,7 +12705,7 @@ def _tts_diag_facts():
         "busyMs": str(st.get("ttsAcppBusyMs", "")),
         "samp": {k: str(st.get(TTS_SAMP_KEYS[k], "") or "") for k in TTS_SAMP_KEYS},
         "sampSent": tts_samp_now(st),
-        "retrySafe": str(st.get("ttsRetrySafe", "on")).lower() == "on",
+        "sampKeys": {k: 1 for k in TTS_SAMP_KEYS},
         "eoc": eoc_summary(),
         "measured": tts_measure_summary(),
         "fit": tts_autocal_fit(),
@@ -9964,6 +12730,192 @@ def api_proxy_payload(body=None):
 
 def api_acpp_report(body=None):
     return {"ok": True, "text": acpp_report()}
+
+
+# Stable codes for the failures worth naming. A code survives rewording, greps
+# cleanly out of a log, and can be quoted in a report without pasting a
+# paragraph. Add codes; never renumber them. (patch17)
+TTS_ERR = {
+    "ALLOC": ("TTS-E01", "the card could not find room for this line"),
+    "EOC": ("TTS-E02", "the model ran past the end of the line"),
+    "NOSAMPLE": ("TTS-E03", "no trustworthy voice sample for this speaker"),
+    "DEAD": ("TTS-E04", "the server is not answering"),
+    "HTTP": ("TTS-E05", "the server refused the request"),
+    "DECODE": ("TTS-E06", "the reply was not audio this panel can read"),
+}
+
+
+# Every step on the audio path books its own milliseconds here, so "panel" stops
+# being a residual that quietly contained a 2.6-second thought synthesis. Keyed
+# per thread because dialogue and thoughts run on their own. (patch17)
+_SPEND = threading.local()
+
+
+def spend_reset():
+    _SPEND.d = {}
+
+
+def spend_add(step, secs):
+    try:
+        d = _SPEND.d
+    except AttributeError:
+        d = _SPEND.d = {}
+    if secs and secs >= 0.0005:
+        d[step] = d.get(step, 0.0) + float(secs)
+
+
+class spend_step(object):
+    """with spend_step("sample gate"): ..."""
+    def __init__(self, step):
+        self.step = step
+    def __enter__(self):
+        self.t = time.time()
+        return self
+    def __exit__(self, *a):
+        spend_add(self.step, time.time() - self.t)
+        return False
+
+
+def _meter_ms(pti_s, mood_s, est_s, prep, gen_s, dec_s, srv_s, synth):
+    """Every band the bar draws, from the ledger - never a fixed list.
+
+    The bar used to name seven bands in its own code, so a step the ledger had
+    been measuring since patch17 (thought audio, the sample gate, the recogniser)
+    could not appear on it however long it ran. The bands ARE what was spent.
+    'panel' stays the remainder, so the bar still sums to the wall. (patch24)
+    """
+    out = {"player tags": round(pti_s * 1000.0),
+           "mood": round(mood_s * 1000.0),
+           "token estimate": round(est_s * 1000.0)}
+    known = 0.0
+    for step, ms in spend_bits():
+        if ms >= 0.5:
+            out[step] = round(ms)
+            known += ms
+    out["panel"] = round(max(0.0, (prep - pti_s - mood_s) * 1000.0 - known))
+    out["generate"] = round((gen_s or srv_s) * 1000.0)
+    out["codec"] = round(dec_s * 1000.0)
+    out["http + wav"] = round(max(0.0, (synth - (gen_s + dec_s or srv_s))) * 1000.0)
+    return {k: v for k, v in out.items() if v > 0}
+
+
+def spend_bits(order=()):
+    """[(step, ms)] biggest first, with the named steps kept in their own order."""
+    try:
+        d = dict(_SPEND.d)
+    except AttributeError:
+        return []
+    out = [(k, v * 1000.0) for k, v in d.items()]
+    rank = {k: i for i, k in enumerate(order)}
+    out.sort(key=lambda kv: (rank.get(kv[0], 99), -kv[1]))
+    return out
+
+
+def tts_gpu_uuid(cfg=None):
+    """The UUID of the card TTS is pinned to, resolved the one way the launcher
+    resolves it - by id against the config's card list. (patch17)"""
+    cfg = cfg or load_config_cached()
+    gid = (cfg.get("settings", {}) or {}).get("ttsGpuId") or ""
+    gpu = next((g for g in cfg.get("gpus", []) if g.get("id") == gid), None)
+    return (gpu or {}).get("uuid") or ""
+
+
+def tts_err(kind, detail="", uuid_=""):
+    """'TTS-E01 the card could not find room for this line - <detail>' plus, for
+    the memory codes, what was actually resident when it happened."""
+    code, say = TTS_ERR.get(kind, ("TTS-E00", "something went wrong"))
+    out = "%s %s" % (code, say)
+    if detail:
+        out += " - %s" % str(detail)[:160]
+    if kind == "ALLOC":
+        v = tts_vram_line(uuid_, "card")
+        if v:
+            out += "  |  %s" % v
+    return out
+
+
+def tts_vram_probe(uuid_=""):
+    """(used_MiB, total_MiB, [(pid, name, MiB)]) for one card, or (0,0,[]).
+
+    nvidia-smi is already a dependency for clock holding and card listing; this
+    asks it the one question every allocation failure raises and none of our
+    logs could answer - what was actually resident. (patch17)
+    """
+    if not uuid_:
+        return 0, 0, []
+    used = total = 0
+    procs = []
+    try:
+        q = subprocess.run(["nvidia-smi", "-i", uuid_,
+                            "--query-gpu=memory.used,memory.total",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=6, **NOWIN)
+        parts = (q.stdout or "").strip().splitlines()[0].split(",")
+        used, total = int(float(parts[0])), int(float(parts[1]))
+    except Exception:
+        pass
+    try:
+        q = subprocess.run(["nvidia-smi", "-i", uuid_,
+                            "--query-compute-apps=pid,process_name,used_memory",
+                            "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=6, **NOWIN)
+        for ln in (q.stdout or "").strip().splitlines():
+            bits = [b.strip() for b in ln.split(",")]
+            if len(bits) >= 3:
+                procs.append((bits[0], os.path.basename(bits[1]), int(float(bits[2]))))
+    except Exception:
+        pass
+    return used, total, procs
+
+
+def tts_vram_line(uuid_="", label="TTS card"):
+    """One readable line about a card, or empty when nvidia-smi cannot say."""
+    used, total, procs = tts_vram_probe(uuid_)
+    if not total:
+        return ""
+    who = ", ".join("%s %d MiB" % (n, m) for _p, n, m in
+                    sorted(procs, key=lambda x: -x[2])[:4])
+    return ("%s: %d of %d MiB used, %d free%s"
+            % (label, used, total, total - used, ("  [%s]" % who) if who else ""))
+
+
+def tts_launch_banner(cfg, args, uuid_=""):
+    """Write what the PANEL is launching, before the server gets a chance not to.
+
+    Every model, its family, its size on disk, the card it is pinned to and what
+    is already resident there. A server that dies silently, or one that loads
+    something other than what was intended, is then still diagnosable from our
+    own log alone. (patch17)
+    """
+    lines = ["", "=" * 72,
+             "PandorumLLM %s launching audio.cpp at %s"
+             % (APP_RELEASE_TAG, time.strftime("%Y-%m-%d %H:%M:%S")),
+             "=" * 72]
+    try:
+        conf = json.loads(tts_acpp_config(cfg))
+    except Exception:
+        conf = {}
+    for m in (conf.get("models") or []):
+        p = str(m.get("path") or "")
+        try:
+            mb = os.path.getsize(p) / (1024.0 * 1024.0)
+        except OSError:
+            mb = 0.0
+        lines.append("  model  id=%-8s family=%-18s task=%-5s  %8.1f MiB  %s"
+                     % (m.get("id") or "?", m.get("family") or "?",
+                        m.get("task") or "?", mb, p))
+        for k, v in sorted((m.get("session_options") or {}).items()):
+            lines.append("           session_option %s = %s" % (k, v))
+    if not conf.get("models"):
+        lines.append("  model  (none in the config - the server will have nothing to do)")
+    lines.append("  gpu    %s" % (uuid_ or "(not pinned - every visible card)"))
+    v = tts_vram_line(uuid_, "  vram  ")
+    if v:
+        lines.append(v)
+    lines.append("  argv   %s" % " ".join(str(a) for a in args))
+    lines.append("=" * 72)
+    with open(tts_server_log_path(cfg), "ab") as f:
+        f.write(("\n".join(lines) + "\n").encode("utf-8", "replace"))
 
 
 def tts_server_log_path(cfg=None):
@@ -10208,11 +13160,19 @@ def _api_tts_server(body, _retry=False):
                 f.write(tts_acpp_config(cfg).encode("utf-8"))
         except Exception as e:
             return {"error": "cannot write the audio.cpp config: %s" % e}
-        args = [exe, "--config", cfgp]
+        # --log streams the framework's own logs: which models loaded, which
+        # families, what each allocation cost. Without it audio.cpp says almost
+        # nothing, and a session that OOMs leaves a log that cannot say what was
+        # resident - the state this patch exists to end. (patch17)
+        args = [exe, "--config", cfgp, "--log"]
     else:
         args = [exe, "--model", model, "--main-gpu", "0", "--host", "127.0.0.1",
                 "--port", str(port), "--no-webui"]
 
+    try:
+        tts_launch_banner(cfg, args, uuid_ or tts_gpu_uuid(cfg))
+    except Exception as _eb:
+        panel_log("[tts] launch banner failed: %s" % str(_eb)[:80])
     try:
         logf = open(tts_server_log_path(cfg), "ab")
     except Exception as e:
@@ -10235,9 +13195,11 @@ def _api_tts_server(body, _retry=False):
         TTS_PROC["log_at"] = os.path.getsize(tts_server_log_path(cfg))
     except OSError:
         TTS_PROC["log_at"] = 0
-    # audio.cpp validates its session options and EXITS on one it does not know. It
-    # names the offender, so a refusal is read back, remembered and the start retried
-    # without it - once. A wrong option name must cost a second, not a working server.
+    # audio.cpp validates its session options and EXITS on one it does not know -
+    # 0.6 dropped the Higgs reference-cache option outright. An exit inside the
+    # first seconds with options in the config triggers ONE retry without them,
+    # and the refusal is remembered for the rest of the panel run. A removed
+    # option must cost three seconds, not a working server. (patch8)
     _died = None
     for _ in range(60):                       # ~3s: it refuses long before it loads
         _died = p.poll()
@@ -10253,6 +13215,24 @@ def _api_tts_server(body, _retry=False):
                 _tail = _lf.read()
         except Exception:
             pass
+        _rung = acpp_retry_rung(cfg) if eng == "audiocpp" else ""
+        if _rung == "opts":
+            _ACPP_NO_OPTS[0] = True
+            TTSW.log("\u26A0\uFE0F the server exited at once - retrying without "
+                     "session options (audio.cpp 0.6 removed the Higgs "
+                     "reference-cache option)")
+            panel_log("[tts] server refused the config - retrying without "
+                      "session options")
+            return _api_tts_server(body, _retry=True)
+        if _rung == "asr":
+            # one rung further down: a build that never heard of sense_asr exits
+            # on the co-hosted entry, and a working TTS server beats a transcript
+            _ACPP_NO_ASR[0] = True
+            TTSW.log("\u26A0\uFE0F still exiting - retrying without the ASR model "
+                     "(this build does not know sense_asr; transcripts are off "
+                     "until the engine is updated)")
+            panel_log("[tts] server refused the ASR entry - retrying without it")
+            return _api_tts_server(body, _retry=True)
         return {"error": "the server exited at once - see the TTS server log%s"
                          % ((": " + _tail.strip().splitlines()[-1][:160]) if _tail.strip()
                             else "")}
@@ -10740,6 +13720,9 @@ class ProxyManager:
 
     def report(self, rt, think, usage, timings, ms, wait_ms, said="", speaker="",
                actor="", drill=False, req_body=None, streaming=False):
+        if rt.get("title") == "Meta" and said:
+            # the speaker>listener pick, before the dialogue it predicts arrives
+            meta_note(said)
         met = chat_metrics(timings, usage)      # no secs: a provider line never guessed
         inp, out = met["tok_in"], met["tok_out"]
         pf, dc = met["pf"], met["dc"]
@@ -10893,7 +13876,7 @@ def _mk_handler(mgr, listen_port):
             # the name comes back so the thought in the REPLY can be attributed to the
             # character this request was for. Reading it off the shared queue instead
             # was a race: a spoken line arriving in between takes the entry.
-            speaker = note_speaker(body)
+            speaker = note_speaker(body, enqueue=(rt["title"] == "Dialogue"))
             actor = note_actor(body)    # a different prompt shape, a different name
             drill = is_action_drill(body)   # the second stage of an action pick
             is_chat = wants_stream = False
@@ -10957,30 +13940,59 @@ def _mk_handler(mgr, listen_port):
                 if wants_stream:
                     self._send_head(resp, streaming=True)
                     think, said, usage, timings = [], [], None, None
+                    # only a Dialogue reply is reordered: thoughts ride dialogue,
+                    # and every other provider's format is its own business
+                    rw = ThoughtReorderStream() if rt["title"] == "Dialogue" else None
+                    broke = False
                     while True:
                         line = resp.readline()
                         if not line: break
-                        try:
-                            self.wfile.write(line); self.wfile.flush()
-                        except (ConnectionAbortedError, BrokenPipeError): break
                         s = line.strip()
-                        if not s.startswith(b"data: ") or s == b"data: [DONE]": continue
-                        try: obj = json.loads(s[6:])
-                        except Exception: continue
+                        obj = None
+                        if s.startswith(b"data: ") and s != b"data: [DONE]":
+                            try: obj = json.loads(s[6:])
+                            except Exception: obj = None
+                        outs = rw.feed(line, obj) if rw else [line]
+                        try:
+                            for ln in outs:
+                                self.wfile.write(ln)
+                            self.wfile.flush()
+                        except (ConnectionAbortedError, BrokenPipeError):
+                            broke = True; break
+                        if obj is None: continue
                         if "timings" in obj: timings = obj["timings"]
                         if obj.get("usage"): usage = obj["usage"]
                         ch = obj.get("choices") or []
                         if ch:
                             d = ch[0].get("delta", {})
-                            if d.get("content"): said.append(d["content"])
+                            if not rw and d.get("content"): said.append(d["content"])
                             if rt["thinking"] and d.get("reasoning_content"):
                                 think.append(d["reasoning_content"])
+                    if rw and not broke:
+                        try:
+                            for ln in rw.flush():
+                                self.wfile.write(ln)
+                            self.wfile.flush()
+                        except (ConnectionAbortedError, BrokenPipeError):
+                            pass
+                    if rw:
+                        said = rw.said         # the reply as it actually LEFT
                     mgr.report(rt, "".join(think), usage, timings,
                                round((time.time() - t0) * 1000), wait_ms,
                                said="".join(said), speaker=speaker, actor=actor,
                                drill=drill, req_body=body, streaming=True)
                     return
                 data = resp.read(); ms = round((time.time() - t0) * 1000)
+                if rt["title"] == "Dialogue":
+                    try:
+                        j0 = json.loads(data)
+                        _m0 = j0["choices"][0]["message"]
+                        _new = reorder_leading_thought(_m0.get("content") or "")
+                        if _new != (_m0.get("content") or ""):
+                            _m0["content"] = _new
+                            data = json.dumps(j0).encode("utf-8")
+                    except Exception:
+                        pass
                 self._send_head(resp, streaming=False)
                 self.send_header("Content-Length", str(len(data))); self.end_headers()
                 self.wfile.write(data)
@@ -11714,6 +14726,12 @@ class Handler(BaseHTTPRequestHandler):
             "/api/higgs-adopt": api_higgs_adopt,
             "/api/launch-stack": api_launch_stack, "/api/show-terminal": api_show_terminal,
             "/api/slot-log": api_slot_log, "/api/tts-thought": api_tts_thought,
+            "/api/tts-audio-cache": api_tts_audio_cache,
+            "/api/tts-audio-cache-clear": api_tts_audio_cache_clear,
+            "/api/tts-ref-text-clear": api_tts_ref_text_clear,
+            "/api/tts-cal-clear": api_tts_cal_clear,
+            "/api/tts-defaults": api_tts_defaults,
+            "/api/tts-audio-takes": api_tts_audio_takes,
             "/api/creator-add": api_creator_add, "/api/creator-remove": api_creator_remove,
             "/api/launcher-content": api_launcher_content,
             "/api/provider-add": api_provider_add, "/api/provider-remove": api_provider_remove,
@@ -11973,10 +14991,18 @@ PAGE = """<!doctype html>
           border:none; border-radius:10px; padding:8px 52px 8px 10px; }
   .grip { color:#4a5162; letter-spacing:-2px; user-select:none; cursor:grab; padding:2px 4px; }
   .grip:active { cursor:grabbing; }
-  .uuid { filter:blur(4px); cursor:pointer; user-select:none; transition:filter .15s; }
-  .uuid.show { filter:none; user-select:text; }
+  /* addresses on the setup page are shown plainly - a LAN address is not a
+     secret from the person who configured it, and the blur made checking a
+     typo need a click per value (patch28) */
+  .uuid { user-select:text; }
   .dropzone.over { border-color:var(--acc); box-shadow:0 0 0 1px var(--acc) inset; }
   .mismatch { color:var(--warn); font-size:12px; }
+  .glowbtn { transition: box-shadow .18s ease, border-color .18s ease;
+    box-shadow: 0 0 14px 2px rgba(255,255,255,0); }
+  .glowbtn:hover { box-shadow: 0 0 14px 2px rgba(255,255,255,.35);
+    border-color: rgba(255,255,255,.65); }
+  .vramline { font: 500 12px/1.7 "Cascadia Code", Consolas, monospace; color:var(--ok);
+    background:#0d0f13; border-radius:8px 8px 0 0; padding:7px 12px 5px; margin-top:10px; }
   pre.log { background:#0d0f13; border:none;
             box-shadow:0 0 14px -2px rgba(0,0,0,.8); border-radius:8px;
             padding:8px 10px; font-size:11.5px; white-space:pre-wrap; color:var(--dim);
@@ -12046,6 +15072,13 @@ PAGE = """<!doctype html>
   .slotgrid .card .spd, .slotgrid .card .mismatch { white-space:normal; }
   .slotgrid .pgrid { gap:0; }
   .slotgrid .pcell { margin-bottom:15px; }
+  /* One gap, one line, dead centre. Whatever margin the LAST cell of a group
+     carries (plain 15, tight 4) would land ABOVE the divider and make every
+     boundary a different height - so the cell before a heading gives its margin
+     up, and the heading owns the whole gap: 18px above the line, 18px below it
+     to the heading text, for every group on the card. (patch12) */
+  .slotgrid .pcell:has(+ .pgrp) { margin-bottom:0 !important; }
+  .slotgrid .pgrp { margin:18px 0 12px; padding-top:18px; }
   .slotgrid .pcell.ptight { margin-bottom:4px !important; min-height:22px; }
   .slotgrid .pcell.stack { margin-bottom:30px; }
   .slotgrid .pcell input.pnum { max-width:124px; }
@@ -12325,9 +15358,12 @@ PAGE = """<!doctype html>
      is the text it always was - the button shows itself under the hand, as a pill,
      never by restyling the glyphs */
   .plpay { cursor:pointer; }
-  .plpay:hover { text-shadow:0 0 7px var(--acc),
-                             0 0 16px color-mix(in srgb, var(--acc) 55%, transparent);
-                 filter:drop-shadow(0 0 5px color-mix(in srgb, var(--acc) 75%, transparent)); }
+  /* ONE glow, tight. Three layers were stacked here - a 7px shadow, a 16px
+     shadow, and a drop-shadow FILTER over both - and the filter re-blurs pixels
+     the text-shadows had already blurred, so the provider name read as out of
+     focus rather than lit. A hover should say "clickable", not soften the word
+     it is decorating. (patch23) */
+  .plpay:hover { text-shadow:0 0 6px var(--acc); color:var(--txt); }
   /* styled EXACTLY like the moodic cell on the spoken rows - the one mark cell
      every field screenshot proves tight (spoken rows 27px against record rows 44px
      on the same screen, current page). Two theoretical fixes - a height cap, then
@@ -12531,7 +15567,10 @@ PAGE = """<!doctype html>
     0%,100% { box-shadow:0 0 0 1px var(--err), 0 0 0 0 rgba(0,0,0,0); }
     50%     { box-shadow:0 0 0 1px var(--err), 0 0 15px 3px var(--err); } }
   .provlink { cursor:pointer; transition:color .14s, text-shadow .14s; }
-  .provlink:hover { color:var(--pgl); text-shadow:0 0 10px var(--pgl); }
+  /* a glyph and its own halo in the SAME colour has no edge left: the counters
+     fill and the title reads as blurred. The provider's colour belongs to the
+     halo; the text stays light, as every other glow on the page does. */
+  .provlink:hover { color:var(--txt); text-shadow:0 0 9px var(--pgl); }
   .sampchip { border:none !important; background:transparent !important; padding:2px 5px;
               text-shadow:none; transition:text-shadow .16s; }
   .sampchip:hover { text-shadow:0 0 11px var(--sgl), 0 0 20px var(--sgl); }
@@ -12618,7 +15657,14 @@ PAGE = """<!doctype html>
   .gs-copy { color:var(--acc); cursor:pointer; text-decoration:underline; text-underline-offset:2px; font-weight:600; }
   /* the guide blocks pulse instead; an outline on top of that is two effects at once */
   .copied-flash:not(.gcode) { outline:2px solid var(--acc); outline-offset:2px; border-radius:6px; }
-  .hb { filter: blur(3.5px); cursor: pointer; }
+  /* addresses are shown plainly: a LAN address is not a secret from the person
+     who configured it, and the blur made checking a typo cost a click each
+     (patch29 - patch28 changed .uuid, which is not the class these use) */
+  /* click, not caret: hovering an address used to swap the pointer for an
+     I-beam over a field nobody types into by hand (patch31) */
+  .hb { cursor: pointer; }
+  input.hb { cursor: pointer; }
+  input.hb:focus { cursor: text; }
   input.hb:focus { filter: none; } .hb.show { filter: none; } .pswrap .pshl .hb { pointer-events: auto; position: relative; z-index: 2; }
   /* VS Code style YAML editor */
   .vsc-wrap { border:none; border-radius:6px; background:#1e1e1e; overflow:auto; max-height:460px; margin-top:8px; }
@@ -12783,20 +15829,29 @@ PAGE = """<!doctype html>
    than as competition, which is what the Adjust popovers already do at 4px. The fill has
    to carry alpha or backdrop-filter has nothing to work through. */
 .topanel { display: none; position: absolute; top: 100%; left: auto; right: 0; z-index: 9;
+           width: max-content; max-width: 100%; margin-top: 4px;
            background: rgba(4, 6, 9, .55);
            backdrop-filter: blur(2px) saturate(1.15);
            -webkit-backdrop-filter: blur(2px) saturate(1.15);
-           border: 1px solid var(--line); border-radius: 0 0 8px 8px;
-           padding: 10px 12px; box-shadow: 0 10px 26px -12px #000c; }
+           border: none; border-radius: 10px;
+           padding: 10px 12px; box-shadow: 0 0 14px -2px rgba(0,0,0,.85); }
 .tchrome.optopen .topanel { display: block; }
 .tppanel { display: none; position: absolute; top: 100%; left: auto; right: 0; z-index: 9;
+           width: max-content; max-width: 100%; margin-top: 4px;
            background: rgba(4, 6, 9, .55);
            backdrop-filter: blur(2px) saturate(1.15);
            -webkit-backdrop-filter: blur(2px) saturate(1.15);
-           border: 1px solid var(--line); border-radius: 0 0 8px 8px;
-           padding: 10px 12px; box-shadow: 0 10px 26px -12px #000c; }
+           border: none; border-radius: 10px;
+           padding: 10px 12px; box-shadow: 0 0 14px -2px rgba(0,0,0,.85); }
 .tchrome.provopen .tppanel { display: block; }
 /* a provider reads as on by being LIT, not by a label saying so */
+/* an even grid, not one long row: eighteen providers ran off the right of the
+   panel and the last of them sat under the window edge (patch37) */
+#provfilter { display: grid; grid-template-columns: repeat(auto-fill, minmax(42px, 1fr));
+              gap: 6px; align-items: stretch; }
+.provall { grid-column: 1 / -1; cursor: pointer; font-size: 12px; padding: 5px 9px;
+           border: 1px solid var(--line); border-radius: 8px; background: transparent;
+           justify-self: center; }
 .provpick { cursor: pointer; font-size: 19px; line-height: 1; padding: 5px 7px;
             border: 1px solid var(--line); border-radius: 8px; background: transparent;
             opacity: .35; filter: grayscale(1); transition: opacity .12s, filter .12s; }
@@ -13140,8 +16195,13 @@ const esc = s => String(s ?? "").replace(/&/g,"&amp;").replace(/</g,"&lt;").repl
 const $ = id => document.getElementById(id);
 
 function portProblem(s) {
-  if (s.status && s.status.state === "wedged")
-    return "port already in use by another process - stop it or change the port";
+  if (s.status && s.status.state === "wedged") {
+    const vr = slotVram[s.id];
+    if (vr && vr.exited)
+      return "the server exited during load - see the report above the card terminal";
+    return "port held but nothing answers on it - a server stuck or dying mid-load "
+         + "(out of memory does this), or another process owns the port";
+  }
   const mine = String(s.actualPort || s.port);
   let owners = 0;
   (state.slots || state.routing || []).forEach(x => { if (String(x.actualPort || x.port) === mine) owners++; });
@@ -13153,7 +16213,12 @@ function pill(st) {
   const map = { serving:["serving","HTTP "+(st.http??"?")], loading:["loading","loading ("+(st.http??503)+")"],
                 down:["down","down"], wedged:["wedged","port held, no HTTP"], unknown:["unknown","unknown"] };
   const [cls, txt] = map[st.state] || map.unknown;
-  return '<span class="pill '+cls+'">'+txt+'</span>';
+  // a slot that was asked to start and never answered used to show "down" and
+  // nothing else - the log knows why, and the card can say it (patch25)
+  const why = String(st.fault || "");
+  return '<span class="pill '+cls+'"'+(why ? ' title="'+esc(why)+'"' : "")+'>'+txt+'</span>'
+    + (why ? '<span class="hint" style="margin-left:8px;color:var(--warn)">'
+             + esc(why.length > 96 ? why.slice(0, 96) + "\u2026" : why) + '</span>' : "");
 }
 let curPsub = "tree";
 function renderPerms() {
@@ -13224,6 +16289,8 @@ function permTreeHtml() {
                      "TTS setup, writing its launcher, starting and stopping its server",
                      "One-click Higgs install: fetches audio.cpp and a model from the internet",
                      "Checking for a newer audio.cpp (asks github.com only when pressed)",
+                     "Clear TTS calibration data; revert TTS settings to defaults",
+                     "Reads each slot's own log to say why a launch ended",
                      "Main Guide setup flow"];
   const remoteItems = ["View all terminals (Proxy / Thinking / Split / TTS / PTI-PME)",
                        "Full-window, wrap, background colour",
@@ -13782,12 +16849,14 @@ function renderSlots(force) {
       + paramEditor(s)
       + '<div class="row" style="margin-top:16px">'
       + srvButtons(s, off, running) + term + '</div>'
+      + '<div class="vramline" id="vram-'+s.id+'" style="display:none"></div>'
       + '<pre class="log" id="log-'+s.id+'"></pre></div>';
   }).join("")
   + '</div>'
   + (state.slots.length < 20
       ? '<div class="card addcard" style="margin-top:22px"><button class="stop" onclick="addSlot()">&#10133; Add server</button></div>' : "");
   renderHist();
+  state.slots.forEach(s => vramTick(s.id));
 }
 function renderHist() {
   $("histbody").innerHTML = (state.history||[]).map(h =>
@@ -14888,10 +17957,21 @@ function paintProvFilter() {
   const box = $("provfilter");
   if (!box) return;
   const off = hiddenProvs();
-  box.innerHTML = allProvs().map(p =>
-    '<button class="stop provpick' + (off.has(p.id) ? "" : " on")
-    + '" data-act="provPick" data-id="' + esc(p.id) + '" title="' + esc(p.title || p.id)
-    + '">' + provMark(p, 19) + '</button>').join("");
+  const all = allProvs();
+  // every provider hidden means the button turns them all back on; otherwise it
+  // clears them. Reading the CURRENT state rather than keeping a flag of its own
+  // keeps the label honest when providers are picked one at a time. (patch37)
+  const allOff = all.length > 0 && all.every(p => off.has(p.id));
+  box.innerHTML =
+      '<button class="stop provall" data-act="provAll" data-on="'
+    + (allOff ? "1" : "0") + '" title="'
+    + (allOff ? "show every provider in this terminal"
+              : "hide every provider from this terminal")
+    + '">' + (allOff ? "All on" : "All off") + '</button>'
+    + all.map(p =>
+        '<button class="stop provpick' + (off.has(p.id) ? "" : " on")
+        + '" data-act="provPick" data-id="' + esc(p.id) + '" title="'
+        + esc(p.title || p.id) + '">' + provMark(p, 19) + '</button>').join("");
 }
 // Built ONCE per refresh. It used to build one RegExp per provider per line, so a full
 // tail of a few thousand lines constructed tens of thousands of them and the terminal
@@ -15821,6 +18901,13 @@ async function refreshTail(which) {
 let ttsBusy = "";        // "" | "start" | "stop"
 // A ["##", "Title"] row is a section heading with a rule above it, so the page reads as
 // groups rather than one long column of fields.
+const ASR_LANGS = [
+  ["en", "English"], ["auto", "Auto - let the model decide"],
+  ["zh", "Chinese"], ["yue", "Cantonese"], ["ja", "Japanese"], ["ko", "Korean"],
+  ["de", "German"], ["fr", "French"], ["es", "Spanish"], ["it", "Italian"],
+  ["pt", "Portuguese"], ["ru", "Russian"], ["pl", "Polish"], ["nl", "Dutch"],
+  ["tr", "Turkish"], ["ar", "Arabic"]
+];
 const TTS_FIELDSETS = {
   moss: [
     ["##", "Files"],
@@ -15831,6 +18918,9 @@ const TTS_FIELDSETS = {
     ["##", "Audio Files"],
     ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
     ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
+    ["ttsSampleDir", "Repaired Sample Vault (blank = a folder beside the panel's own)", "folder"],
+    ["ttsSampleSec", "Longest kept sample, in seconds"],
+    ["!!", "audiocache"],
     ["##", "Ports"],
     ["ttsServerPort", "TTS Server Port", null],
     ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null]
@@ -15842,10 +18932,17 @@ const TTS_FIELDSETS = {
     ["##", "Audio Files"],
     ["ttsOutDir", "Saved Audio Folder (blank = a temporary folder)", "folder"],
     ["ttsVoiceDir", "Local Voice Clips (a .wav named after the voicetype replaces the upload)", "folder"],
+    ["ttsSampleDir", "Repaired Sample Vault (blank = a folder beside the panel's own)", "folder"],
+    ["ttsSampleSec", "Longest kept sample, in seconds"],
+    ["!!", "audiocache"],
     ["ttsAcppRefSlots", "Cached Voices (how many speakers stay encoded; raise it if you use many)", null],
     ["##", "TTS Backend Settings"],
     ["ttsChunkChars", "Chunk Size in characters (how much text goes to the engine at once - shorter fails less often and costs less when it does; this is what EOC calibration sweeps)", null],
-    ["ttsAcppBusyMs", "Line Time Limit in ms (how long one line may generate before the server gives up - the only thing that bounds a runaway; the longest chunk sent is 170 characters)", null],
+    ["ttsRunawayMode", "Runaway Handling (a line the engine never stops, or stops too early, returns as ordinary audio - how it is bounded)", "sel",
+      [["detect", "EOC Detection & Retry - measure the audio, retry a runaway"],
+       ["limit", "Line Time Limit - cut generation at a fixed clock"]]],
+    ["ttsRunawayRatio", "Runaway Threshold (audio this many times its estimate counts as a runaway and is retried once; 1.2 - 5)", null, null, "detect"],
+    ["ttsAcppBusyMs", "Line Time Limit in ms (how long one line may generate before the server gives up; the longest chunk sent is 170 characters)", null, null, "limit"],
     ["##", "Ports & Naming"],
     ["ttsServerPort", "Server Port", null],
     ["ttsWrapperPort", "Proxy TTS Port (point the SkyrimNet TTS endpoint here)", null],
@@ -16190,7 +19287,11 @@ function higgsPoll() {
         if (!g.running) {
           stop = true;
           window.__higgsBeat = 0;
-          load();                              // done, failed or cancelled: redraw it
+          // the install just WROTE settings and put models on disk: stale copies
+          // of both are exactly what the page would otherwise keep showing (patch14)
+          ttsModels = null;
+          await load();
+          if (curTab === "tts") renderTts(true);
           return;
         }
         // nothing of ours on screen: ask for the pane, through the one guarded rule
@@ -16586,7 +19687,17 @@ function ttsPlayerTagRow(st) {
     + '<option value="off"' + (on ? "" : " selected") + '>Off</option>'
     + '<option value="on"' + (on ? " selected" : "") + '>On</option>'
     + '</select></div>';
+  const nameBox = ttsTitle("Your character's name",
+      "What your own spoken lines are labelled, and what the tagger is told your name "
+      + "is. Left empty, the panel reads it from SkyrimNet's own prompt - which only "
+      + "works while that prompt heads a section with your party in it. Typed here, it "
+      + "is simply true.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<input class="txt" id="tts-ttsPlayerName" value="' + esc(st.ttsPlayerName || "")
+    + '" placeholder="read from the prompt" onchange="saveTtsMode()"></div>';
+
   let h = ttsPair(main, ttsPromptBox("ttsPtiPrompt", "tagger"), ttsWiredBox("pti"), "1 1 260px");
+  h += nameBox;
   if (!on) return h;
   if (panelProvThinking("pti")) {
     h += moodSlider("ttsPtiBudget", "Thinking Budget", 100, 10000, st.ttsPtiBudget || "2000",
@@ -16595,6 +19706,110 @@ function ttsPlayerTagRow(st) {
   }
   h += '<div class="tsplit"></div>';      // closes PTI, rather than splitting it
   return h;
+}
+
+// Reference transcripts. A cloning model is shown [reference text + reference
+// audio] and asked for [new text] - without the transcript that example is half
+// formed. The controls that exist here are the ones audio.cpp's sense_asr family
+// actually documents; nothing is invented, and the chunker is deliberately absent
+// because a voicetype sample is seconds long and wants one pass. (patch10)
+function ttsAsrRow(st) {
+  const mode = String(st.ttsAsrMode || "off").toLowerCase();
+  const on = mode === "on";
+  let h = '<div class="tsect">Reference Transcripts</div>'
+    + ttsTitle("Voice sample transcripts",
+        "A voice sample alone tells the engine how a character SOUNDS. Paired with "
+        + "what that sample says, it also tells it which sounds are the words - "
+        + "which is how these models are meant to be prompted, and it is worth most "
+        + "on short lines. Stored: send transcripts already known, and load nothing. "
+        + "On: co-host SenseVoice and learn the ones that are missing, in the "
+        + "background - no line ever waits for it.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsAsrMode" onchange="saveTtsMode()">'
+    + '<option value="off"' + (mode === "off" ? " selected" : "") + '>'
+    + 'Off - send no transcripts</option>'
+    + '<option value="stored"' + (mode === "stored" ? " selected" : "") + '>'
+    + 'Stored only - use what is known, load no model</option>'
+    + '<option value="on"' + (on ? " selected" : "") + '>'
+    + 'On - transcribe unknown samples with SenseVoice</option>'
+    + '</select>'
+    + (mode === "off" ? ''
+        : '<button class="stop" data-act="ttsAsrClear" title="forget every learned '
+          + 'transcript, including the file on disk. Voice samples are not touched.">'
+          + 'Clear transcripts</button>')
+    + '</div>';
+  if (!on) return h + (mode === "stored"
+    ? '<div class="hint" style="margin:-4px 0 12px;line-height:1.6">Transcripts are '
+      + 'read from tts-ref-text.json. It is meant to be edited: each entry carries the '
+      + 'voicetype beside its text, and a line you write by hand beats anything a '
+      + 'recogniser makes of Tamrielic names.</div>'
+    : '');
+  h += ttsTitle("SenseVoice model (.gguf)",
+        "A SenseVoice-Small GGUF, the recogniser that turns each voice sample "
+        + "into a transcript once. The Higgs installer fetches it into the "
+        + "models folder; any .gguf there can be picked. Loaded beside the TTS "
+        + "model on the same card for the whole session, about 250 MB.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsAcppAsrModel" onchange="saveTtsMode()">'
+    + ttsAsrModelOptions() + '</select>'
+    + '<button class="stop" data-act="ttsModelRescan" title="rescan the models folder">'
+    + 'Rescan</button></div>'
+    + (String(st.ttsAcppAsrModel || "") !== ""
+        && String(st.ttsAcppAsrModel || "") === String(st.ttsAcppModel || "")
+      ? '<div class="hint chkmsg" style="color:var(--err)">this is the TTS '
+        + 'model itself, not a recogniser - the server will refuse the entry '
+        + 'and the panel will drop it at start. Pick the SenseVoice file '
+        + 'instead.</div>'
+      : "")
+    + '<div class="hint" style="margin:-4px 0 12px;line-height:1.6">'
+    + 'Needs audio.cpp 0.6 or newer, which added the sense_asr family. The Q8 package '
+    + 'is about 250 MB and is loaded beside the TTS model on the same card, for the '
+    + 'whole session. If your build does not know the family, the panel drops it and '
+    + 'starts the server anyway.</div>'
+    + ttsTitle("Recognition language",
+        "the language the recogniser assumes a sample speaks. Voicetype clips "
+        + "are English; Auto lets the model guess, which can misread a short "
+        + "clip.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsAsrLang" onchange="saveTtsMode()">'
+    + ASR_LANGS.map(function(l) {
+        return '<option value="' + l[0] + '"'
+          + (String(st.ttsAsrLang || "en") === l[0] ? " selected" : "") + '>'
+          + esc(l[1]) + '</option>';
+      }).join("")
+    + '</select></div>'
+    + ttsTitle("Numbers",
+        "a reference transcript should match what is HEARD. Digits read back "
+        + "as one token and were spoken as several words, so as-spoken is the "
+        + "safer pairing.")
+    + '<div class="row" style="flex-wrap:nowrap">'
+    + '<select class="txt" id="tts-ttsAsrItn" onchange="saveTtsMode()">'
+    + '<option value="words"' + (String(st.ttsAsrItn || "words") === "digits" ? "" : " selected")
+    + '>As spoken - twenty five</option>'
+    + '<option value="digits"' + (String(st.ttsAsrItn || "words") === "digits" ? " selected" : "")
+    + '>Normalised - 25</option>'
+    + '</select></div>';
+  return h;
+}
+// the same scan the TTS model picker uses - an ASR model is a .gguf in the same folder
+function ttsAsrModelOptions() {
+  const st = (state && state.settings) || {};
+  const sel = st.ttsAcppAsrModel || "";
+  const list = (ttsModels && ttsModels.models) || [];
+  if (!list.length) return '<option value="">(set a models folder below, then Rescan)</option>';
+  // the TTS model is not a recogniser, and offering it is how it got picked once
+  // already. Anything that is plainly the speech model is hidden unless it is
+  // somehow the current choice, which must stay visible to be corrected. (patch17)
+  const tts = String(st.ttsAcppModel || "");
+  const shown = list.filter(m => m.path === sel || (m.path !== tts
+      && !/higgs|vibevoice|indextts|fish-audio|voxcpm/i.test(String(m.name || ""))));
+  const opts = (shown.length ? shown : list);
+  return '<option value="">(none selected)</option>' + opts.map(m =>
+      '<option value="' + esc(m.path) + '"' + (m.path === sel ? " selected" : "") + '>'
+      + esc(m.name) + '</option>').join("")
+      + (shown.length < list.length
+         ? '<option value="" disabled>(' + (list.length - shown.length)
+           + ' speech model(s) hidden - they are not recognisers)</option>' : "");
 }
 
 // NPC thoughts, spoken automatically: the toggle arms it, and the Sequence select
@@ -16774,7 +19989,10 @@ function renderTts(force) {
     + '<select class="txt" id="tts-ttsEngine" data-act="ttsEngineSel">'
     + '<option value="audiocpp"' + (eng === "audiocpp" ? " selected" : "") + '>Higgs Audio v3 (4B) - runs on audio.cpp</option>'
     + '<option value="moss"' + (eng === "moss" ? " selected" : "") + '>MOSS-TTS Local - runs on the MOSS server</option>'
-    + '</select></div>'
+    + '</select>'
+    + '<button class="stop" data-act="ttsDefaults" style="flex:0 0 auto" '
+    + 'title="every TTS setting and path on this page returns to its shipped default">'
+    + 'Revert to default TTS settings</button></div>'
     + '<div class="hint" style="margin:-4px 0 14px;line-height:1.6">'
     + (eng === "audiocpp"
         ? ''
@@ -16787,9 +20005,23 @@ function renderTts(force) {
     + ICO.file + ' Import from a launcher</button>'
     + '<span class="hint" id="tts-imp" style="width:auto">points at your existing .bat and fills these in</span></div>')
         : '')
-    + ttsFields().map(f =>
-        f[0] === "##"
+    + ttsFields().filter(function(f) {
+        // a row tied to a mode exists only while that mode is chosen
+        if (f.length < 5 || !f[4]) return true;
+        return String(st.ttsRunawayMode || "detect").toLowerCase() === f[4];
+      }).map(f =>
+        f[0] === "!!"
+          ? '<div class="row" style="gap:8px;margin:2px 0 12px">' + '<button class="glowbtn" data-act="ttsAudioCache" title="Every character the panel has met - this run and earlier ones - the voice sample that speaks them, and the lines kept in your output folder. Click a name for their takes.">Audio Cache</button>' + '<button class="glowbtn" data-act="ttsAudioCacheClear" title="Forget every learned character-sample pairing, including the saved list on disk. The kept audio files are not touched.">Clear Audio Cache</button>' + '</div>'
+        : f[0] === "##"
           ? '<div class="tsect">' + esc(f[1]) + '</div>'
+          : f[2] === "sel"
+          ? '<label>' + esc(f[1]) + '</label><div class="row" style="flex-wrap:nowrap">'
+            + '<select class="txt" id="tts-' + f[0] + '" onchange="saveTts()">'
+            + (f[3] || []).map(function(o) {
+                return '<option value="' + esc(o[0]) + '"'
+                  + (String(st[f[0]] || (f[3][0] || [""])[0]) === o[0] ? " selected" : "")
+                  + '>' + esc(o[1]) + '</option>';
+              }).join("") + '</select></div>'
           : '<label>' + esc(f[1]) + '</label><div class="row" style="flex-wrap:nowrap">'
             + '<input class="txt" id="tts-' + f[0] + '" onchange="saveTts()" value="'
             + esc(st[f[0]] || "").replace(/"/g, "&quot;") + '">'
@@ -16822,6 +20054,7 @@ function renderTts(force) {
     + PING_MODES.map(p => '<option value="' + p[0] + '"'
         + (ping === p[0] ? " selected" : "") + '>' + esc(p[1]) + '</option>').join("")
     + '</select></div>'
+    + (eng === "audiocpp" ? ttsAsrRow(st) : '')
     + '<div class="tsect">Audio Tags</div><div class="row" style="flex-wrap:nowrap">'
     + '<select class="txt" id="tts-ttsTags" onchange="saveTts()">'
     + '<option value="off"' + (tags === "on" ? "" : " selected") + '>Strip them - speak the words only</option>'
@@ -16963,50 +20196,19 @@ function autoCalMode(st) {
 // were short, well-punctuated lines, one of them a line that had just succeeded a
 // dozen times: a draw inside the sampler, not a property of the text.
 function ttsSampBlock(st) {
-  const safe = String(st.ttsRetrySafe || "on").toLowerCase() === "on";
-  const on = String(st.ttsSampAutoCal || "off").toLowerCase() === "on";
-  // Automatic: who moves the samplers depends on the calibration method above. In
-  // Proxy (the standard) the failure record IS the diagnosis: one bounded arithmetic
-  // step per fresh window, no model asked. In LLM mode a model reads the record.
-  // Manual: you set them yourself. Either way they are sent with every line.
-  const main = ttsTitle("Sampler Calibration",
-      "Sampling is the one lever on how OFTEN a line fails to stop; the cap above only "
-      + "decides what a failure costs.  AUTOMATIC: under the standard Proxy method, "
-      + "each refit takes at most one bounded arithmetic step - steadier when lines "
-      + "in the last window ran past end-of-content, one notch back towards "
-      + "SkyrimNet's values after a clean window, never past fixed bounds, each "
-      + "change logged with the numbers that drove it. Once, under a retired mode, a "
-      + "failure record is handed to a model instead.  MANUAL: you set them below "
-      + "and nothing moves them. Either way what is set here is sent with every "
-      + "line and wins over whatever arrived with it; left empty, the value that "
-      + "arrived passes through untouched.")
-    + '<div class="row" style="flex-wrap:nowrap">'
-    // the same exact fit as the menu in the row above it, for the same reason
-    + '<select class="txt calsel setsel" id="tts-ttsSampAutoCal" onchange="saveTtsMode()">'
-    + '<option value="off"' + (on ? "" : " selected") + ">Manual</option>"
-    + '<option value="on"' + (on ? " selected" : "") + ">Automatic</option>"
-    + "</select></div>";
-  // the model-reading job needs a server; the arithmetic needs nothing
-  return ttsCalRow(main, "", "")
-    + ttsTitle("Samplers",
-          "Click a value to set or clear it. Accent means set here and sent with every "
-          + "line; green means the value that arrived with the line is passing through, "
-          + "which is what it shows.  A sampler nobody has set anywhere shows a dash: "
-          + "nothing is sent for it and the engine uses its own default.  top_p 1.0 "
-          + "truncates nothing, and repetition_penalty pushes away from the wind-down "
-          + "tokens that come before the stop token - both are worth testing against "
-          + "the record.")
-    // Steady Retry sits with the SAMPLERS, not with their title: it is the other thing
-    // that decides what a request carries, and it was a row of its own two settings down
-    + '<div class="row" style="gap:18px;align-items:center;flex-wrap:wrap;margin-bottom:8px">'
-    + '<div class="row" id="tts-samp-chips" style="gap:6px;flex-wrap:wrap"></div>'
-    + '<span style="flex:0 0 auto;display:flex;align-items:center;gap:8px">'
-    + swToggle(safe, 'data-act="ttsRetrySafe" title="a retry aims to finish, not to perform"')
-    + ttsTitle("Steady Retry",
-          "A retry drops to a steadier sampler - cooler, no repetition penalty, nucleus "
-          + "truncated - so a second attempt aims to finish rather than to perform. The "
-          + "player hears the retry, not the attempt that failed.")
-    + "</span></div>";
+  // No calibration dial and no retry switch: both moved these values, and moving
+  // them was the fault. What is here is what Higgs v3 actually takes, set by
+  // hand, sent with every line. The token cap is NOT a sampler - the proxy sets
+  // it per line, on the calibration above. (patch23)
+  return ttsTitle("TTS Samplers",
+        "The values sent to Higgs with every line. Boson's reference for this model "
+        + "is temperature 0.8 with top_k 50 and nothing else, which is what a fresh "
+        + "install writes here.  Click a value to set or clear it. Accent means set "
+        + "here and sent; green means the value that arrived with the line is passing "
+        + "through; a dash means nothing is sent and the engine uses its own default."
+        + "  The per-line token limit is not here - the calibration above sets it.")
+    + '<div class="row" id="tts-samp-chips" style="gap:6px;flex-wrap:wrap;'
+    + 'margin-bottom:8px"></div>';
 }
 // A job the panel gives to a model: which server// A job the panel gives to a model: which server, and whether it may think. The
 // two jobs are different questions - fitting a speech rate, and reading failures -
@@ -17020,7 +20222,10 @@ function fixedTokPerChar(st) {
 }
 function ttsSampChips(d) {
   const ov = (d && d.samp) || {}, sent = (d && d.sampSent) || {};
-  return ["temp", "top_p", "min_p", "rep"].map(k => {
+  // the keys come from the panel, never a second list here: top-k was added to
+  // TTS_SAMP_KEYS and did not appear on the page because this line held its own
+  // copy of the set (patch23)
+  return Object.keys((d && d.sampKeys) || {}).map(k => {
     const set = String(ov[k] || "") !== "";
     const v = set ? ov[k] : (sent[k] !== undefined ? sent[k] : "-");
     const col = set ? "var(--acc)" : (sent[k] !== undefined ? "var(--ok)" : "var(--dim)");
@@ -17228,7 +20433,7 @@ function ttsAutoCalBlock(st) {
     const rate = everyBlock(
             "How many spoken lines between arithmetic refits. Each refit is least "
             + "squares over the measured record - free, instant, and run on the "
-            + "line that makes it due; with Sampler Calibration on it also takes "
+            + "line that makes it due; it also takes "
             + "one bounded sampler step when the failure record calls for one.")
       + '<div class="row" style="flex-wrap:nowrap;margin-top:8px">'
       + '<button class="stop" data-act="ttsAutoInfo" title="Every step of the'
@@ -17281,6 +20486,10 @@ function ttsAutoCalBlock(st) {
     + 'overflow:hidden;border:1px solid var(--line);background:var(--card)"></div>'
     + '<div class="hint" id="tts-meter-samp" style="margin-top:8px;line-height:1.6"></div>'
     + '<div class="hint" id="tts-meter-foot" style="margin-top:4px;line-height:1.6"></div></div>';
+  h += '<div class="row" style="margin-top:10px">'
+     + '<button class="stop" data-act="ttsCalClear" title="forget every measured '
+     + 'line and every recorded cap-hit, so the estimator learns again from '
+     + 'nothing">Clear calibration data</button></div>';
   return '<div class="tsect">TTS Calibration</div>' + h;
 }
 function ttsDiagBlock() {
@@ -17330,6 +20539,13 @@ const METER_WHY = {
   "mood": "recording the line for the scene reader (the reading itself runs behind)",
   "token estimate": "working out this line\u2019s token cap - the automatic calibration",
   "panel": "config, normalising, tag handling, writing the record",
+  "SenseVoice": "the recogniser transcribing a voice sample - a second model on "
+    + "the same card, and the only band here that is not the panel or audio.cpp",
+  "thought audio": "synthesising an NPC\u2019s inner line, which runs in front of "
+    + "the spoken one",
+  "sample gate": "checking the voice sample is the right one and readable",
+  "transcript": "reading a stored sample transcript (the recogniser has its own band)",
+  "identity note": "writing who spoke and which sample went out",
   "generate": "audio.cpp generating the audio tokens - the GPU",
   "codec": "turning those tokens into samples",
   "http + wav": "the request, the response and reading the WAV header",
@@ -17341,6 +20557,8 @@ let meterPin = "";              // a band clicked open, until it is clicked agai
 const METER_COL = {
   "player tags": "#ff5dc8", "mood": "#c07ffb", "token estimate": "#f0c674",
   "panel": "#8b93a3", "generate": "#2ef2ff", "codec": "#4dd8e6",
+  "SenseVoice": "#7ee081", "thought audio": "#b06cf5", "sample gate": "#e0a34d",
+  "transcript": "#5fa8d3", "identity note": "#9aa7b8",
   "http + wav": "#3a4658",
   "used": "#2ef2ff", "spare to cap": "#f0c674", "cap to guard": "#3a4658"
 };
@@ -17353,9 +20571,15 @@ function meterSegs(line, view) {
             ["spare to cap", Math.max(0, cap - used)],
             ["cap to guard", Math.max(0, guard - cap)]].filter(s => s[1] > 0);
   }
+  // the bands come from the RECORD, not from a list written here: a step the
+  // panel had been measuring for six patches could not reach this bar because
+  // this line did not name it (patch24)
   const ms = line.ms || {};
-  return ["player tags", "mood", "token estimate", "panel",
-          "generate", "codec", "http + wav"]
+  const lead = ["player tags", "mood", "token estimate"];
+  const tail = ["panel", "generate", "codec", "http + wav"];
+  const mid = Object.keys(ms).filter(k => lead.indexOf(k) < 0 && tail.indexOf(k) < 0);
+  mid.sort((a, b) => (ms[b] || 0) - (ms[a] || 0));
+  return lead.concat(mid, tail)
     .map(k => [k, Math.max(0, ms[k] || 0)]).filter(s => s[1] > 0);
 }
 function meterFmt(v, view) {
@@ -17502,10 +20726,11 @@ function saveTts() {
   ttsFields().forEach(f => { const el = $("tts-" + f[0]); if (el) body[f[0]] = el.value; });
   const tg = $("tts-ttsTags"); if (tg) body.ttsTags = tg.value;   // not a path field
   // a <select> outside ttsFields, like the one above it: read where it is written
-  const sac = $("tts-ttsSampAutoCal"); if (sac) body.ttsSampAutoCal = sac.value;
   const g = $("tts-ttsGpuId");
   if (g) body.ttsGpuId = g.value;
-  ["ttsWrapMode", "ttsAnswerPing", "ttsAcppProfile", "ttsPlayerTags", "ttsGpuClockHold",
+  ["ttsWrapMode", "ttsAnswerPing", "ttsAcppProfile", "ttsPlayerTags", "ttsPlayerName",
+   "ttsAcppAsrModel", "ttsAsrMode", "ttsAsrLang",
+   "ttsAsrItn", "ttsGpuClockHold",
    "ttsMoodEval", "ttsMoodHistory", "ttsMoodCount",
    "ttsMoodPostpone", "ttsMoodEvery", "ttsPtiBudget", "ttsPmeBudget",
    "ttsAutoCal", "ttsAutoCalEvery", "ttsFixedTokPerChar",
@@ -18454,7 +21679,7 @@ async function detectIp(el) {
   el.disabled = false;
   const box = $("ip-sugg");
   box.innerHTML = (r.ips||[]).map(ip =>
-    '<span class="chip clickable" data-act="ipUse" data-ip="'+esc(ip)+'"><span class="hb">'+esc(ip)+'</span></span>').join(" ") || "none found";
+    '<span class="chip clickable" data-act="ipUse" data-ip="'+esc(ip)+'">'+esc(ip)+'</span>').join(" ") || "none found";
 }
 let slotMsg = {};
 let recoMsg = "";
@@ -18631,8 +21856,12 @@ function paramEditor(s) {
     if (window.__slotBusy && window.__slotBusy[s.id]) return " mload";
     return s.scriptExists === false ? " mfail" : " mok";
   };
+  const BI = "@builtin-mtp";       // the model's own MTP head, not a file
   const pick = function(key, cur2, label, guide, flag) {   // optional model pickers
     let o = '<option value="N/A"' + ((!cur2 || cur2 === "N/A") ? " selected" : "") + '>Disabled</option>';
+    if (key === "draft" && ((chosen && chosen.mtpHead) || cur2 === BI))
+      o += '<option value="' + BI + '" style="color:var(--ok)"' + (cur2 === BI ? " selected" : "")
+        + '>Built-in MTP head &#8212; the model drafts for itself</option>';
     mlist.forEach(function(m) { o += optFor(m, key, cur2); });
     return '<div class="pcell stack"><span class="plab hint">' + label
       + ' <span class="pref" data-act="paramGuide" data-t="' + pgSlug(guide) + '" title="open this setting in the Sampler Guide">[' + esc(flag) + ']</span></span>'
@@ -18648,6 +21877,10 @@ function paramEditor(s) {
   // and the same said plainly under the two optional pickers
   function wrongFor(key, cur2, label) {
     if (!cur2 || cur2 === "N/A") return "";
+    if (cur2 === BI)
+      return (key === "draft" && chosen && chosen.mtpHead) ? ""
+        : '<div class="hint chkmsg" style="color:var(--err)">the selected model carries no '
+          + 'MTP head &#8212; pick a drafter file or Disabled</div>';
     const m2 = mlist.filter(function(x) { return (x.path || x) === cur2; })[0];
     if (!m2) return "";
     const want = FITS[key];
@@ -18661,6 +21894,8 @@ function paramEditor(s) {
   const mArch = archOf(chosen);
   const STRENGTH_ARCH = ["muse-glimmer"];
   const wantsStrength = STRENGTH_ARCH.indexOf(mArch) >= 0;
+  const EFFORT_ARCH = ["qwen35", "qwen35moe"];
+  const wantsEffort = EFFORT_ARCH.indexOf(mArch) >= 0;
   const archLine = (function() {
     if (!p.model) return "";
     if (!chosen) return '<div class="hint chkmsg" style="color:var(--dim)">'
@@ -18675,10 +21910,19 @@ function paramEditor(s) {
       + esc(lbl) + raw + (bits.length ? ' <span style="color:var(--dim)">&middot; '
       + esc(bits.join(" \u00b7 ")) + '</span>' : "") + '</div>';
   })();
+  // a model that carries its own multi-token-prediction layers drafts for itself:
+  // llama.cpp runs them with --spec-type draft-mtp and no separate draft file
+  const mtpLine = (chosen && chosen.mtpHead)
+    ? '<div class="chkmsg"><span class="mandy" title="This model carries '
+      + 'multi-token-prediction layers of its own (blk.N.nextn.*). llama.cpp can '
+      + 'run speculative decoding from them with no separate draft file. Pick '
+      + 'Built-in MTP head under Speculative decoding to use it.">'
+      + 'Built-in MTP head</span></div>'
+    : "";
   let h = '<div class="pgrid">'
     + '<div class="pcell stack"><span class="plab hint">Model <span class="mand">Mandatory</span></span>'
     + '<span class="pctl"><select class="msel' + mstate(p.model) + '" data-act="slotParam" data-id="' + s.id + '" data-key="model">' + mopts + '</select></span>'
-    + wrongKind + archLine + '</div>'
+    + wrongKind + archLine + mtpLine + '</div>'
     + pick("vision", p.vision, "Vision (mmproj)", "Vision projector", "--mmproj")
     + pick("draft", p.draft, "Speculative decoding", "Draft model", "--model-draft");
   // a setting the rest of the configuration makes moot stays visible but is not
@@ -18691,7 +21935,10 @@ function paramEditor(s) {
   const OFF = {
     ngl:       pval("fit") === "on" ? "auto fit chooses the layer count, so this is ignored" : "",
     threads:   maxNgl ? "every layer is on the GPU, so CPU threads barely matter" : "",
-    nommap:    maxNgl ? "every layer is on the GPU, so nothing is memory-mapped into RAM" : "",
+    // NOT here any more. This map greys its control out, and the claim was false:
+    // memory-mapped weights stay host-resident and spread across devices even with
+    // every layer nominally on the GPU. The setting that fixes that must be
+    // reachable. Its guidance lives in the hint under the control instead. (p33)
     cacheK:    pval("flash") === "off" ? "KV cache quantization needs flash attention on" : "",
     cacheV:    pval("flash") === "off" ? "KV cache quantization needs flash attention on" : "",
     nocontbat: parseInt(pval("parallel"), 10) <= 1 ? "continuous batching only applies with more than one parallel slot" : "",
@@ -18712,10 +21959,16 @@ function paramEditor(s) {
       h += '<div class="pgrp">' + esc(lastGroup) + '</div>';
     }
     const v = (p[d.key] !== undefined && p[d.key] !== "") ? p[d.key] : d.def;
-    if (d.key === "nommap") seenMmap = true;
+    if (d.key === "loadmode") seenMmap = true;
     const tight = seenMmap;                       // the gap under Disable mmap and below
     const why = OFF[d.key] || "";
-    const dis = why ? " disabled" : "";
+    // NEVER disabled. This map's job is to EXPLAIN that another setting is
+    // overruling this one; it also used to LOCK the control, so a guess written
+    // into one of these strings took the setting away from the person who owns
+    // the machine - load mode was greyed out on exactly the cards that needed it
+    // changed, and the owner had to edit launchers by hand to get past it. Say
+    // why; let them decide. (patch35)
+    const dis = "";
     let ctl;
     const onoff = d.kind === "sel" && (d.opt.opts || []).length === 2
       && (d.opt.opts || []).every(function(o) { return o === "on" || o === "off"; });
@@ -18758,7 +22011,102 @@ function paramEditor(s) {
         + '<select data-act="slotParam" data-id="' + s.id + '" data-key="reasonStrength">'
         + opts + '</select></span></div>';
     }
+    if (d.key === "reasoning" && wantsEffort) {
+      // Qwen 3.8: the dial above still turns thinking off; this one sets how DEEP
+      // it goes when on. Off outranks effort, exactly as the launcher writes it.
+      const ce = String(p.reasonEffort || "");
+      const eopts = ["", "low", "medium", "xhigh"].map(function(o) {
+        return '<option value="' + esc(o) + '"' + (o === ce ? " selected" : "") + '>'
+             + (o === "" ? "model default (xhigh)" : esc(o)) + '</option>';
+      }).join("");
+      h += '<div class="pcell' + (tight ? " ptight" : "") + '" title="reasoning depth when'
+        + ' thinking is on - written as a chat template kwarg; the Reasoning dial set to'
+        + ' off outranks it">'
+        + '<span class="plab hint">Reasoning effort</span><span class="pctl">'
+        + '<select data-act="slotParam" data-id="' + s.id + '" data-key="reasonEffort">'
+        + eopts + '</select></span></div>';
+    }
   });
+  const dr9 = String(p.draft || "");
+  const drafting9 = dr9 && dr9 !== "N/A" && dr9 !== "Disabled";
+  if (drafting9) {
+    const drFile9 = dr9 !== "@builtin-mtp";
+    // the same anatomy as every cell above: label, blue flag reference, control.
+    // The reference used to be a dead span - styled like the others, opening
+    // nothing - on the grounds that these flags had no Sampler Guide page. Four of
+    // them had gained one since and three never had; the guide now covers all
+    // seven, so the blue text does what blue text does everywhere else. A flag with
+    // no page still renders, plainly, rather than lying about being a link.
+    const SPEC_GUIDE = {
+      "--spec-draft-n-max": "Draft n-max",
+      "--spec-draft-n-min": "Draft n-min",
+      "--spec-draft-p-min": "Acceptance",
+      "--spec-draft-p-split": "Draft split probability",
+      "--spec-draft-backend-sampling": "Draft backend sampling",
+      "--spec-draft-type-k": "Draft KV cache type",
+      "--spec-draft-type-v": "Draft KV cache type"
+    };
+    const ref9 = function(flag) {
+      const g = SPEC_GUIDE[flag];
+      if (!g) {
+        return ' <span class="pref" style="cursor:default" title="the llama.cpp flag '
+          + 'this control writes">[' + esc(flag) + ']</span>';
+      }
+      return ' <span class="pref" data-act="paramGuide" data-t="' + pgSlug(g)
+        + '" title="open this setting in the Sampler Guide">[' + esc(flag) + ']</span>';
+    };
+    const cell9 = function(key, label, flag, ctl, title) {
+      return '<div class="pcell ptight"'
+        + (title ? ' title="' + esc(title) + '"' : "")
+        + '><span class="plab hint">' + esc(label) + ref9(flag)
+        + '</span><span class="pctl">' + ctl + '</span></div>';
+    };
+    const num9 = function(key, mx, title, label, flag) {
+      return cell9(key, label, flag,
+        '<input class="edit pnum" type="number" min="0" max="' + mx + '" step="1" value="'
+        + esc(String(p[key] || "")) + '" placeholder="auto" data-act="slotParam" data-id="'
+        + s.id + '" data-key="' + key + '">', title);
+    };
+    const txt9 = function(key, title, label, flag) {
+      return cell9(key, label, flag,
+        '<input class="edit pnum" value="' + esc(String(p[key] || ""))
+        + '" placeholder="auto" data-act="slotParam" data-id="' + s.id
+        + '" data-key="' + key + '">', title);
+    };
+    const sel9 = function(key, opts, none, title, label, flag) {
+      const cur = String(p[key] || "");
+      const o9 = [""].concat(opts).map(function(o) {
+        return '<option value="' + esc(o) + '"' + (o === cur ? " selected" : "") + '>'
+             + (o === "" ? none : esc(o)) + '</option>';
+      }).join("");
+      return cell9(key, label, flag, '<select data-act="slotParam" data-id="' + s.id
+        + '" data-key="' + key + '">' + o9 + '</select>', title);
+    };
+    h += '<div class="pgrp">Speculative Decoding'
+      + (drFile9 ? "" : ' <span class="mandy" title="The draft model is the main '
+          + 'model itself: its multi-token-prediction head drafts, so there is no '
+          + 'separate file, no placement, and no draft cache to set.">'
+          + 'Built-in MTP head</span>')
+      + '</div>';
+    h += num9("specNMax", 64, "tokens drafted per step. DFlash and DSpark carry "
+      + "theirs in the header, which wins.", "Draft tokens (max)", "--spec-draft-n-max");
+    h += num9("specNMin", 16, "minimum draft tokens per step",
+      "Draft tokens (min)", "--spec-draft-n-min");
+    h += txt9("specPMin", "greedy acceptance threshold, 0..1",
+      "Accept p-min", "--spec-draft-p-min");
+    h += txt9("specPSplit", "split probability, 0..1", "Split p",
+      "--spec-draft-p-split");
+    h += sel9("specSample", ["on", "off"], "server default",
+      "offload draft sampling to the backend", "Backend sampling",
+      "--spec-draft-backend-sampling");
+    if (drFile9) {
+      const kv9 = ["f16", "bf16", "q8_0", "q5_1", "q5_0", "q4_1", "q4_0", "iq4_nl"];
+      h += sel9("specCtkD", kv9, "f16 (default)", "the drafter's own K cache type",
+        "Draft KV cache (K)", "--spec-draft-type-k");
+      h += sel9("specCtvD", kv9, "f16 (default)", "the drafter's own V cache type",
+        "Draft KV cache (V)", "--spec-draft-type-v");
+    }
+  }
   h += '</div>';
   return h;
 }
@@ -19697,13 +23045,6 @@ document.addEventListener("click", ev => {
     post("/api/settings", body).then(() => renderTts(true));
     return;
   }
-  if (d.act === "ttsRetrySafe") {
-    const on = !(state && state.settings
-                 && String(state.settings.ttsRetrySafe || "on").toLowerCase() === "on");
-    if (state && state.settings) state.settings.ttsRetrySafe = on ? "on" : "off";
-    post("/api/settings", { ttsRetrySafe: on ? "on" : "off" }).then(() => renderTts(true));
-    return;
-  }
   if (d.act === "srvEdLock") { srvEd.locked = !srvEd.locked; post("/api/settings", { srvEdOpen: !srvEd.locked }); renderSrvInspector(); return; }
   if (d.act === "srvEdUndo") { srvEdStep(-1); return; }
   if (d.act === "srvEdRedo") { srvEdStep(1); return; }
@@ -20007,6 +23348,11 @@ document.addEventListener("click", ev => {
   }
   if (d.act === "ttsImport") { _pickField = "__ttsimport"; _pickPrefix = "tts-"; _pickExts = [".bat", ".cmd", ".ps1"]; browseTo(""); return; }
   if (d.act === "ttsStart" || d.act === "ttsStop") { ttsServer(d.act === "ttsStart" ? "start" : "stop"); return; }
+  if (d.act === "ttsAudioCache") { audioCacheShow(); return; }
+  if (d.act === "ttsAudioCacheClear") { audioCacheClear(); return; }
+  if (d.act === "ttsAsrClear") { asrClear(); return; }
+  if (d.act === "ttsCalClear") { calClear(); return; }
+  if (d.act === "ttsDefaults") { ttsDefaults(); return; }
   if (d.act === "ttsOpenDir") { openFolder("launcherDir"); return; }
   if (d.act === "ttsGen") { ttsLauncher(false); return; }
   if (d.act === "ttsSave") { ttsLauncher(true); return; }
@@ -20473,6 +23819,14 @@ function respPretty(text) {
     if (Object.values(tailMaxState).some(x => x)) tmaxWake();
     return;
   }
+  if (d.act === "provAll") {                  // every provider at once
+    const on = d.on === "1" || d.on === 1;
+    const body = { termHideProv: on ? "" : allProvs().map(p => p.id).join(",") };
+    if (state && state.settings) state.settings.termHideProv = body.termHideProv;
+    paintProvFilter();
+    post("/api/settings", body).then(() => refreshTail("dashboard"));
+    return;
+  }
   if (d.act === "provPick") {                 // one provider, on or off
     const id = d.id || "";
     const off = hiddenProvs();
@@ -20908,6 +24262,22 @@ function renderParams() {
       what:"Only ever consider the k most likely words.",
       how:"A hard cap on how many candidates are on the table. At 40 only the 40 highest-probability words can be chosen; 0 disables it. Coarser than min-p or top-p.",
       sky:"A gentle guardrail - a value near <b>40</b> rarely hurts and quietly blocks the truly unlikely choices. Many setups leave it off and lean on min-p instead." },
+    { name:"Repeat penalty", flag:"--repeat-penalty N", def:"N = 1.0 - 1.3", lo:"1 = off", hi:"stronger",
+      what:"Divides down the odds of any token seen in the recent window.",
+      how:"The oldest and bluntest of the penalties: every token in the last <b>--repeat-last-n</b> is pushed down by the same factor, whatever it was. That includes 'the', 'a', commas and full stops - the words a sentence cannot be built without - so it suppresses grammar along with repetition. 1.0 is off. Above about 1.2 syntax starts to break.",
+      sky:"Prefer DRY, which looks at repeated <i>phrases</i> rather than repeated tokens. If you use this at all, <b>1.05 to 1.1</b> is enough; leave it at 1.0 and reach for DRY first." },
+    { name:"Repeat last-n", flag:"--repeat-last-n N", def:"N = 0 - ctx", lo:"0 = off", hi:"-1 = whole context",
+      what:"How far back the repeat, presence and frequency penalties look.",
+      how:"The window the three classic penalties share - it does nothing on its own, and setting it while all three are off changes nothing. The default is 64 tokens; -1 means the whole context, which on a long roleplay session means a character is penalised for words they used an hour ago.",
+      sky:"A dialogue turn is short, so a small window is the point: <b>64</b> covers the current exchange. Widening it to the whole context is what makes an NPC start avoiding ordinary words." },
+    { name:"Presence penalty", flag:"--presence-penalty N", def:"N = 0.0 - 1.0", lo:"0 = off", hi:"stronger",
+      what:"A flat penalty on any token that has appeared at all.",
+      how:"Once, or fifty times, costs the same - it penalises presence, not count. That pushes the model toward vocabulary it has not used yet, which reads as introducing new ideas rather than as avoiding loops. Additive, so unlike repeat penalty it does not scale a token's odds toward zero.",
+      sky:"A small amount keeps a character from circling one subject. <b>0.1 to 0.3</b> is plenty; higher and they change the topic mid-sentence." },
+    { name:"Frequency penalty", flag:"--frequency-penalty N", def:"N = 0.0 - 1.0", lo:"0 = off", hi:"stronger",
+      what:"A penalty that grows with how often a token has been used.",
+      how:"The counted twin of presence penalty: a word used ten times is pushed down far harder than one used twice, so common words are left alone until they are actually overused. That makes it the safer of the two to raise, and the better answer to a model that leans on one particular word.",
+      sky:"Good against a verbal tic - one NPC saying 'indeed' every other line. <b>0.1 to 0.4</b>; it pairs well with a little presence penalty rather than replacing it." },
     { name:"DRY penalty", flag:"--dry-multiplier N", def:"N = 0.0 - 2.0", lo:"0 = off", hi:"stronger",
       what:"Don't Repeat Yourself - discourages repeating phrases the model already said.",
       how:"Scales a penalty against sequences that echo earlier output. 0 is off; raise it to break loops and stock phrases. Three companions tune it: <b>--dry-base</b> (how sharply the penalty grows), <b>--dry-allowed-length</b> (repeats allowed before it bites) and <b>--dry-penalty-last-n</b> (how far back it looks). Too high makes speech stilted.",
@@ -20932,8 +24302,10 @@ function renderParams() {
       how:"<b>--parallel N</b> is how many requests the server works on at once, and it is biased to <b>1</b> on purpose: with one slot every request gets the whole GPU and the entire KV cache, so a single Skyrim conversation gets the lowest latency. With N slots the context window and KV cache are split N ways and compute is shared, which only pays off when several clients hit the server together. <b>--no-cont-batching</b> turns off continuous batching (the scheduler that interleaves several in-flight requests token by token) - pointless with one slot, and it keeps timing simple and predictable. For a single-player SkyrimNet setup one slot is almost always right; raise --parallel and drop --no-cont-batching only if you serve several players or tools from the same server. Correlates with Context size and the KV cache - the per-slot share of both shrinks as --parallel grows." },
     { name:"Prompt batching", flag:"--batch-size N  --ubatch-size N", range:"ubatch <= batch",
       how:"These size <b>prefill</b> only - how the prompt is chewed through before the first token appears; they do not change generation speed. <b>--batch-size</b> (logical batch) is how many prompt tokens are submitted together; <b>--ubatch-size</b> (physical micro-batch) is how many are actually computed on the GPU at once, and it must be no larger than the batch size. Bigger values prefill long scenes faster but use more compute-buffer VRAM. On a tight VRAM budget lower ubatch; if prefill of big scenes feels slow and you have headroom, raise both. Independent of the KV cache and the samplers." },
-    { name:"Threads / mmap / fit", flag:"--threads N  --no-mmap  --fit off", range:"N = 1 - CPU cores",
-      how:"threads sets the CPU threads for parts that touch the CPU; --no-mmap loads weights straight into memory instead of memory-mapping the file; --fit off skips llama.cpp auto layer-fitting when you set the layer count yourself." },
+    { name:"Threads / fit", flag:"--threads N  --fit off", range:"N = 1 - CPU cores",
+      how:"threads sets the CPU threads for parts that touch the CPU; --fit off skips llama.cpp auto layer-fitting when you set the layer count yourself." },
+    { name:"Load mode", flag:"--load-mode", range:"auto | none | mmap | mlock | mmap+mlock | dio  (default dio)",
+      how:"How the weights are read off disk - and, in practice, <b>where they end up</b>.  <b>dio</b> reads with DirectIO straight into the card, which is the default here: on a multi-GPU machine it is what keeps a model on its pinned card.  <b>auto</b> and <b>mmap</b> memory-map the file, so pages stay host-resident and llama.cpp may place them across several cards and into system RAM - measured on a three-card rig, one model landed on three GPUs plus RAM under auto and on one card under dio.  <b>none</b> reads it all into memory up front, needing the whole model in RAM at once; <b>mlock</b> pins it so the OS cannot swap or compress it; <b>mmap+mlock</b> does both.  This one flag replaces the old --no-mmap, --mlock and --direct-io, which current llama.cpp warns on - and warns again if you combine the old and new spellings, so set it here and nowhere else." },
     { name:"Generation cap", flag:"--n-predict N", range:"N = -1 (off) or 1 or more",
       how:"A server-side backstop so a runaway generation cannot hold the slot forever. A per-request max_tokens still overrides it." },
     { name:"Vision projector", flag:"--mmproj",
@@ -20954,10 +24326,18 @@ function renderParams() {
   const SP = [
     { name:"Draft model", flag:"--spec-draft-model",
       how:"A small, fast instruct model proposes several tokens that the big model verifies in one pass, speeding up generation. Most useful where a small matching model can draft ahead; skip it on already-tiny models." },
-    { name:"Spec type", flag:"--spec-type <type>", range:"draft-mtp | separate drafter",
-      how:"Uses the model Multi-Token-Prediction head as the drafter rather than a fully separate model." },
+    { name:"Spec type", flag:"--spec-type <type>", range:"draft-simple | draft-mtp | draft-eagle3 | draft-dflash | draft-dspark",
+      how:"Which speculative implementation runs - a drafter without one drafts nothing. The panel writes this beside the drafter you pick, read from the file the same way llama.cpp reads it: an MTP head by its blk.N.nextn tensors, DFlash by its architecture, DSpark by DFlash plus a Markov head, EAGLE-3 by its architecture, and a whole small model of the same family as draft-simple." },
     { name:"Draft n-max", flag:"--spec-draft-n-max N", range:"N = 1 - 16",
       how:"How many tokens the drafter proposes per step. More can speed things up if acceptance stays high." },
+    { name:"Draft n-min", flag:"--spec-draft-n-min N", range:"N = 0 - 16",
+      how:"The floor under Draft n-max: the drafter proposes at least this many tokens per step even when it is unsure. Raising it commits more work to each guess, which pays only while acceptance stays high; leaving it at the server default lets llama.cpp shorten a draft it doubts." },
+    { name:"Draft split probability", flag:"--spec-draft-p-split N", range:"N = 0.0 - 1.0",
+      how:"Where a draft branches rather than continuing in a straight line. When the drafter's confidence in its next token falls below this, it stops extending that line and starts another. Lower values branch sooner and explore more; higher values keep each draft long and narrow." },
+    { name:"Draft backend sampling", flag:"--spec-draft-backend-sampling", range:"on | off",
+      how:"Whether the drafter samples on the GPU backend instead of on the CPU. Keeping it on the backend avoids copying logits across the bus for every drafted token, which is most of the cost of a short draft; the server default is usually right, and this is here for the case where a backend does not implement it." },
+    { name:"Draft KV cache type", flag:"--spec-draft-type-k / --spec-draft-type-v", range:"f16 | bf16 | q8_0 | q5_1 | q5_0 | q4_1 | q4_0 | iq4_nl",
+      how:"The drafter's own K and V cache precision, set apart from the main model's. A draft model is small, so its cache is small, and quantizing it saves little while costing draft quality - and a worse draft is rejected more often, which is the one thing that makes speculative decoding lose. Leave both at f16 unless VRAM is genuinely the binding constraint. Only a separate draft FILE has these; a built-in MTP head shares the main model's cache." },
     { name:"Acceptance", flag:"draft acceptance %",
       how:"Whether spec-decode earns its place depends on how many drafted tokens the big model accepts; low acceptance wastes work. As a rule of thumb it is worth keeping above roughly <b>60 percent</b>, and usually costs more than it saves below about <b>35 percent</b> - the Statistics tab tracks this per server." }
   ];
@@ -21497,6 +24877,12 @@ function crValidateText(txt) {
     ["--top-k","--top-p","--typical"].forEach(f => { if (val(f) !== null) add("warn", "Mirostat is on and " + f.replace("--","") + " is also set - Mirostat replaces top-k / top-p / typical, so those are ignored while it runs."); });
   }
 
+  // an integer flag handed a fraction: llama.cpp reads --top-k as an int, so
+  // "0.95" reads as 0 and quietly turns the sampler off
+  const tk = val("--top-k");
+  if (tk !== null && tk.trim() !== "" && !/^-?[0-9]+$/.test(tk.trim()))
+    add("warn", "Top-k is a COUNT and llama.cpp reads it as an integer: " + tk.trim() + " reads as " + (parseInt(tk, 10) || 0) + " (off). A value like 0.95 usually belongs to --top-p.");
+
   // disabled-value info
   const OFF = [["--top-k","0","Top-k"],["--top-p","1.0","Top-p"],["--typical","1.0","Typical"],["--min-p","0","Min-p"],["--top-n-sigma","-1","N-sigma"],["--xtc-probability","0","XTC"],["--dry-multiplier","0","DRY"]];
   OFF.forEach(o => { const v = val(o[0]); if (v !== null && parseFloat(v) === parseFloat(o[1])) add("info", o[2] + " is present but set to its off value (" + v + ") - it currently has no effect (this may be intentional)."); });
@@ -21807,7 +25193,36 @@ async function removeSlot(sid) {
 // launches and stops mirror the TTS buttons: the button names the phase and stays
 // down, and the card's small terminal opens on the press and LIVES - polled from the
 // slot's own console log - until the server is serving (launch) or gone (stop).
-const slotBusy = {}, slotPoll = {}, slotLogText = {};
+const slotBusy = {}, slotPoll = {}, slotLogText = {}, slotVram = {};
+function vramGiB(mib) { return (mib / 1024).toFixed(mib >= 10240 ? 1 : 2); }
+function vramFmt(r) {
+  const seg = [];
+  if (r.weightsGpu) seg.push('weights ' + vramGiB(r.weightsGpu));
+  if (r.mmprojGpu) seg.push('mmproj ' + vramGiB(r.mmprojGpu));
+  if (r.draftGpu) seg.push('drafter ' + vramGiB(r.draftGpu));
+  if (r.kv) seg.push('KV ' + vramGiB(r.kv));
+  if (r.kvDraft) seg.push('KV draft ' + vramGiB(r.kvDraft));
+  if (r.rs) seg.push('RS ' + vramGiB(r.rs));
+  if (r.compGpu) seg.push('compute ' + vramGiB(r.compGpu));
+  if (r.mtpCtx) seg.push('MTP ctx ' + vramGiB(r.mtpCtx));
+  const sum = r.weightsGpu + r.mmprojGpu + r.draftGpu + r.kv + r.kvDraft + r.rs + r.compGpu + r.mtpCtx;
+  let line = 'VRAM  ' + seg.join(' &middot; ')
+    + (sum ? ' &middot; \u03a3 ' + vramGiB(sum) + ' GiB' : '')
+    + (r.freeAtLoad ? ' <span style="color:var(--dim)">(free at load ' + vramGiB(r.freeAtLoad) + ' GiB)</span>' : '');
+  if (r.weightsHost || r.compHost)
+    line += ' <span style="color:var(--dim)">&middot; host ' + vramGiB(r.weightsHost + r.compHost) + ' GiB</span>';
+  if (r.exited)
+    line = '<span style="color:var(--err)">&#10006; the server exited during load &#8212; the numbers below are how far it got</span><br>' + line;
+  return line;
+}
+function vramTick(sid) {
+  post("/api/slot-log", { slot: sid, report: 1 }).then(r => {
+    if (!r || !r.report) return;
+    slotVram[sid] = r.report;
+    const el = $("vram-" + sid);
+    if (el) { el.innerHTML = vramFmt(r.report); el.style.display = r.report.any || r.report.exited ? "block" : "none"; }
+  }).catch(() => {});
+}
 function slotTermTick(sid) {
   post("/api/slot-log", { slot: sid }).then(r => {
     if (!slotBusy[sid]) return;
@@ -21815,6 +25230,7 @@ function slotTermTick(sid) {
     const lg = $("log-" + sid);
     if (lg) { lg.textContent = slotLogText[sid]; lg.style.display = "block";
               lg.scrollTop = lg.scrollHeight; }
+    vramTick(sid);
   }).catch(() => {});
 }
 function slotBusyClear(sid) {
@@ -22001,6 +25417,32 @@ function liveRefresh(src) {
 // it. The Higgs installer saved the folder paths and notified, but the page only
 // refreshed terminals and queues - the TTS pane sat on its old inputs until a
 // hand reload. Editing is respected: a pane holding the keyboard is not stomped.
+async function ttsInstalled() {
+  // An install or adoption just wrote settings and put models on disk. Both stale
+  // copies are exactly what the page would otherwise keep showing, and the button
+  // that started it still holds focus - so this repaint is NOT deferred. Focus
+  // protection exists to stop clobbering someone mid-type, and nobody is typing
+  // into a field while an install finishes. (patch33)
+  ttsModels = null;
+  clearTimeout(window.__ttsOwe);
+  try { state = await (await fetch("/api/state")).json(); } catch (e) { return; }
+  ttsPaneDrawn = "";
+  if (curTab === "tts") renderTts(true);
+  // and then say it outright. The reload patch35 used worked and was wrong: it
+  // threw away the terminal, the scroll position and any half-typed field to
+  // deliver four strings. These are the fields an install fills, so after the
+  // repaint they are written from the state we just fetched - if the repaint
+  // already did it this changes nothing, and if it did not, the page is right
+  // anyway. (patch36)
+  const st = (state && state.settings) || {};
+  ["ttsAcppDir", "ttsAcppModelsDir", "ttsAcppModel", "ttsSampleDir",
+   "ttsOutDir", "ttsEngine"].forEach(k => {
+    const el = $("tts-" + k);
+    if (el && st[k] !== undefined && el.value !== String(st[k])) {
+      el.value = String(st[k]);
+    }
+  });
+}
 async function stateRepull() {
   try { state = await (await fetch("/api/state")).json(); } catch (e) { return; }
   appTagCheck();
@@ -22009,7 +25451,24 @@ async function stateRepull() {
   const pane = $("dpane-tts");
   const busy = document.activeElement && pane && pane.contains
             && pane.contains(document.activeElement);
-  if (curTab === "tts" && !busy) renderTts();
+  if (curTab === "tts") {
+    // focus inside the pane defers the repaint - it must not CANCEL it. Clearing
+    // the drawn signature makes the very next render redraw (patch28). But a
+    // BUTTON holds focus forever - nothing blurs it, so "the very next render"
+    // never came and the page sat stale until F5. A deferred repaint now has a
+    // due date, honoured unless the person is actually typing. (patch32)
+    if (busy) {
+      ttsPaneDrawn = "";
+      clearTimeout(window.__ttsOwe);
+      window.__ttsOwe = setTimeout(() => {
+        const a = document.activeElement;
+        const typing = a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName || "");
+        if (curTab === "tts" && !typing) renderTts(true);
+        else ttsPaneDrawn = "";              // still owed, next event re-arms
+      }, 900);
+    }
+    else renderTts();
+  }
 }
 function connectES() {
   if (window.__es) { try { window.__es.close(); } catch (e) {} }
@@ -22018,6 +25477,7 @@ function connectES() {
     let ev = {}; try { ev = JSON.parse(e.data); } catch (x) { return; }
     if (ev.seq) window.__sseSeq = ev.seq;
     if (ev.t === "state") stateRepull();
+    if (ev.t === "tts-installed") ttsInstalled();
     if (ev.t === "tail") liveRefresh("tail");
     if (ev.t === "replay" && ev.id) spkPlay(String(ev.id));
   };
@@ -22039,6 +25499,151 @@ function showModal(html, resizable) {
   ov.innerHTML = '<div style="' + box + '">' + html + '</div>';
   ov.style.display = "flex";
 }
+
+// ---- Audio Cache: who the panel has met, and what they sound like (patch8) ----
+function audioCacheShow() {
+  post("/api/tts-audio-cache", {}).then(r => {
+    if (!r || !r.rows) { showModal('<h2 style="margin:2px 0 10px;font-size:17px">Audio Cache</h2><div class="hint">nothing answered</div><div class="row" style="justify-content:flex-end;margin-top:14px"><button onclick="closeModal()">Close</button></div>'); return; }
+    let h = '<h2 style="margin:2px 0 4px;font-size:17px">Audio Cache</h2>'
+      + '<div class="hint" style="margin-bottom:10px">' + r.rows.length
+      + ' character' + (r.rows.length === 1 ? '' : 's') + ' met this run &middot; takes counted in '
+      + (r.outDir ? esc(r.outDir) : 'no output folder set') + '</div>'
+      + '<div id="ac-list" style="overflow:auto;max-height:60vh;min-height:120px;border-radius:10px">';
+    if (!r.rows.length)
+      h += '<div class="hint" style="padding:14px">nobody has spoken yet - the list fills as lines are voiced</div>';
+    r.rows.forEach(row => {
+      h += '<div class="acrow" data-acn="' + esc(row.name) + '" style="display:flex;gap:10px;align-items:baseline;'
+        + 'padding:7px 10px;border-radius:8px;cursor:pointer">'
+        + '<b style="min-width:160px">' + esc(row.name) + '</b>'
+        + '<span class="hint" style="min-width:180px">' + esc(row.voicetype) + '</span>'
+        + '<span style="flex:1">' + esc(row.sample)
+        + (row.present ? '' : ' <span style="color:var(--err)">(missing)</span>') + '</span>'
+        + '<span class="hint">' + row.takes + ' take' + (row.takes === 1 ? '' : 's') + '</span>'
+        + '</div>';
+    });
+    h += '</div><div class="row" style="justify-content:flex-end;margin-top:14px">'
+      + '<button onclick="closeModal()">Close</button></div>';
+    showModal(h, true);
+    const list = document.getElementById("ac-list");
+    if (list) {
+      list.addEventListener("click", ev => {
+        const row = ev.target.closest("[data-acn]");
+        if (row) audioCacheTakes(row.getAttribute("data-acn"));
+      });
+      list.addEventListener("mouseover", ev => {
+        const row = ev.target.closest("[data-acn]");
+        list.querySelectorAll("[data-acn]").forEach(x => x.style.background = "");
+        if (row) row.style.background = "rgba(255,255,255,.06)";
+      });
+    }
+  }).catch(() => {});
+}
+// Deliberately a two-step: the record behind it can be thousands of lines and
+// months of play, and nothing else in the panel rebuilds it. (patch20)
+function ttsDefaults() {
+  const NL = String.fromCharCode(10) + String.fromCharCode(10);
+  uiDialog({ title: "Revert every TTS setting?",
+             body: "Every setting and path on this page returns to its shipped "
+               + "default - engine choice, folders, samplers, chunking, the lot. "
+               + "Settings that no longer exist in this build are removed." + NL
+               + "What is NOT touched: installed engines and models on disk, "
+               + "voice samples, the sample vault, learned transcripts, saved "
+               + "audio, and the calibration record (that has its own button "
+               + "below)." + NL
+               + "Revert the settings?",
+             buttons: [{ label: "Yes, revert them", value: true },
+                       { label: "No, keep mine", value: false }] })
+    .then(yes => {
+      if (!yes) return;
+      post("/api/tts-defaults", {}).then(async () => {
+        ttsModels = null;
+        await load();
+        ttsPaneDrawn = "";
+        renderTts(true);
+      });
+    });
+}
+function calClear() {
+  // the blank line is COMPOSED, never spelled: this JS lives inside a Python
+  // string, so a backslash-n here is eaten one layer down and breaks the
+  // literal. Same law as the heredoc and the chr() rules. (patch20)
+  const NL = String.fromCharCode(10) + String.fromCharCode(10);
+  uiDialog({ title: "Clear calibration data?",
+             body: "Every measured line and every recorded cap-hit is forgotten, "
+               + "including the files on disk. This cannot be undone." + NL
+               + "What happens next: the estimator falls back to its seed margin "
+               + "and relearns from the lines you speak after this. For the first "
+               + "few lines the token cap is a guess rather than a measurement, so "
+               + "expect a little more variation until the record fills again." + NL
+               + "What is NOT touched: voice samples, the sample vault, learned "
+               + "transcripts, saved audio, and every setting on this page." + NL
+               + "Clear the calibration record?",
+             buttons: [{ label: "Yes, clear it", value: true },
+                       { label: "No", value: false }]
+  }).then(r => {
+    if (!r || r.value !== true) return;
+    post("/api/tts-cal-clear", {})
+      .then(r => uiAlert(((r && r.rows) || 0) + " measured line(s) and "
+                         + ((r && r.eoc) || 0) + " cap-hit(s) forgotten. The "
+                         + "estimator relearns as lines are spoken.",
+                         "Calibration data cleared"))
+      .catch(() => {});
+  });
+}
+
+function asrClear() {
+  uiDialog({ title: "Clear learned transcripts?",
+             body: "Every stored voice-sample transcript is forgotten, including the "
+               + "file on disk. Voice samples and audio takes are not touched, and "
+               + "transcripts are learned again as characters speak.",
+             buttons: [{ label: "Clear", value: true }, { label: "Cancel", value: false }]
+  }).then(r => {
+    if (!r || r.value !== true) return;
+    post("/api/tts-ref-text-clear", {})
+      .then(r => uiAlert(((r && r.cleared) || 0) + " transcript(s) forgotten.",
+                         "Transcripts cleared"))
+      .catch(() => {});
+  });
+}
+function audioCacheClear() {
+  uiDialog({ title: "Clear the Audio Cache?",
+             body: "Every learned character-sample pairing is forgotten, including "
+               + "the saved list on disk. Kept audio files are not touched, and the "
+               + "list refills as characters speak.",
+             buttons: [{ label: "Clear", value: true }, { label: "Cancel", value: false }]
+  }).then(r => {
+    if (!r || r.value !== true) return;
+    post("/api/tts-audio-cache-clear", {}).then(() => audioCacheShow()).catch(() => {});
+  });
+}
+
+function audioCacheTakes(name) {
+  post("/api/tts-audio-takes", { name: name }).then(r => {
+    let h = '<h2 style="margin:2px 0 4px;font-size:17px">' + esc(name) + '</h2>'
+      + '<div class="hint" style="margin-bottom:10px">every kept line, newest first</div>'
+      + '<div style="overflow:auto;max-height:60vh;min-height:100px">';
+    const rows = (r && r.rows) || [];
+    if (!rows.length)
+      h += '<div class="hint" style="padding:14px">no takes on disk for this character - '
+        + 'set an output folder on the TTS page to keep them</div>';
+    else {
+      h += '<table style="width:100%;border-collapse:collapse;font-size:13px">'
+        + '<tr class="hint" style="text-align:left"><th style="padding:4px 8px">created</th>'
+        + '<th style="padding:4px 8px">file</th><th style="padding:4px 8px;text-align:right">size</th></tr>';
+      rows.forEach(t => {
+        h += '<tr><td style="padding:4px 8px;white-space:nowrap">' + esc(t.when) + '</td>'
+          + '<td style="padding:4px 8px">' + esc(t.file) + '</td>'
+          + '<td style="padding:4px 8px;text-align:right;white-space:nowrap">' + t.kb + ' KB</td></tr>';
+      });
+      h += '</table>';
+    }
+    h += '</div><div class="row" style="justify-content:flex-end;gap:8px;margin-top:14px">'
+      + '<button onclick="audioCacheShow()">&#8592; Back</button>'
+      + '<button onclick="closeModal()">Close</button></div>';
+    showModal(h, true);
+  }).catch(() => {});
+}
+
 function closeModal() { const ov = document.getElementById("pl-modal"); if (ov) { ov.style.display = "none"; ov.innerHTML = ""; } }
 function uiDialog(opts) {
   return new Promise(resolve => {
@@ -22447,10 +26052,15 @@ def main():
                 log_error("panel", "background init failed: %s" % traceback.format_exc(limit=3))
 
         _th.Thread(target=_background_init, daemon=True).start()
-        # the panel page binds the LAN only when the owner has switched LAN mode on;
-        # client_scope() still refuses out-of-scope callers, but in local mode the
-        # socket is simply not there to knock on. Changing the mode takes a restart.
-        _bind = "0.0.0.0" if net_mode() == "lan" else "127.0.0.1"
+        # The panel page listens on the LAN interface always, and client_scope()
+        # decides who may speak: it already denies every external address outright
+        # and every LAN address while Remote Access is off. Binding was a second
+        # lock on the same door, and it made the switch a lie - turning Remote
+        # Access on did nothing until the panel was restarted, with the page
+        # cheerfully printing the address to visit. The authoritative check is the
+        # scope test, which is consulted per request, so the switch now takes
+        # effect the moment it is thrown. (patch36)
+        _bind = "0.0.0.0"
         srv = ThreadingHTTPServer((_bind, PORT), Handler)
         print("%s %s   : http://localhost:%d/" % (APP_NAME, APP_VER_UI, PORT))
         print("file         : %s" % BUILD_ID.get("path", "?"))

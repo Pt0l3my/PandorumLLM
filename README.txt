@@ -1,4 +1,4 @@
-PandorumLLM v3.75 Beta - local LLM stack for SkyrimNet, all in one folder
+PandorumLLM v3.76 Beta - local LLM stack for SkyrimNet, all in one folder
 ============================================================
 
 
@@ -5138,6 +5138,352 @@ a reasoning strength instead.
 v3.74 patch189: the shipped default configuration now lists the same
 providers the panel seeds, including the NarrativeEngine and
 AgencyEngine pairs.
+
+v3.76 Beta: every speculative decoding setting on a server card now opens
+its own page in the Sampler Guide - those seven flags were drawn as links and
+did nothing. Four new pages cover the drafter's minimum tokens, split
+probability, backend sampling and its separate KV cache precision. The guide
+also gains every repetition penalty llama.cpp offers - repeat penalty, its
+look-back window, presence penalty and frequency penalty - alongside the DRY and
+XTC pages it already had.
+
+v3.75 patch44: the repository states its own line endings. The exact bytes
+of every file are part of what the project checks, but nothing told git that, so
+a copy taken with git clone was formatted by whatever setting the copying machine
+happened to use - which on a common Windows setup gives the wrong endings for the
+documentation and one launcher script. Only affects working from a clone; an
+installation unpacked from the release zip was never involved.
+
+v3.75 patch43: the six emotion tags that ship switched off now reach an
+existing installation as well as a fresh one. A tag board that had ever been
+adjusted kept its old contents on upgrade, so the six stayed on for exactly the
+people using tags most. They are added to what is already there, once, and
+anything switched back on afterwards stays that way.
+
+v3.75 patch42: six emotion tags - disgust, elation, longing, sadness, shame
+and determination - ship switched OFF rather than removed. They stay on the
+Allowed Tags board and one click brings any of them back. They are not offered to
+the tag injector or the mood reader, and switching an emotion off now stops NPC
+lines as well as the player's, which it never did before.
+
+v3.75 patch41: five emotion tags - disgust, longing, sadness, shame and
+elation - are no longer used. Measured one line at a time, the first four make
+Higgs speak as a different person and the fifth loses the speaker entirely. They
+are refused on the wire and removed from the tag injector and mood reader
+prompts. A character speaking through another character's unique voice sample is
+now called by their own name when the words of the line say so.
+
+v3.75 patch40: a character's line is never announced under the player's name -
+the guard that refuses a name belonging to another voice sample could not see
+the player's own, which is the name SkyrimNet queues most often. A queued line
+that could not have been this character's no longer leaves the true speaker
+unnamed. Any take that runs longer than the sample it was cloned from is now
+recorded, in the terminal and the log.
+
+v3.75 patch39: an NPC's thought now waits for the last chunk of the line it
+belongs to, even when that chunk is slow to synthesize - a chunk that has been
+asked for and not yet answered counts as the reply still arriving. A thought is
+synthesized once rather than twice, and the next character's line waits for a
+thought that is still being spoken. A character whose name runs past 29
+characters - "Ertzebet the Librarian's Assistant" - is read correctly; their
+lines had been filed with no speaker at all, which silently cost them their
+emotion tags, their thought audio and their name in the identity ledger. The
+Providers and Options panels take the Adjust panel's glow and geometry, and
+All on/off is centred.
+
+v3.75 patch38: when an NPC's thought lands earlier than it should, the TTS
+calibration log now says why - whether the reply it compares against was
+missing, stale, or did not match. Actions are shown by default, and action
+parameters are no longer cut short.
+
+v3.75 patch37: SkyrimNet's startup ping is Banned by default, NPC thoughts
+are shown by default, terminals start without the time column, and a
+terminal's Providers panel gains a button that turns them all on or off -
+with the providers wrapped into an even grid.
+
+v3.75 patch36: player lines are tagged again - PTI and PME have no port of
+their own, and the readiness check was asking about it instead of about their
+server. Remote Access now takes effect the moment you switch it rather than
+at the next restart, and installing Higgs fills the folder and model fields
+without reloading the page.
+
+v3.75 patch35: every server card setting is editable - the card still says
+when one setting overrules another, but no longer takes the control away.
+Installing or adopting Higgs reloads the page, so the folder paths and the
+model selection appear without pressing CTRL+F5.
+
+v3.75 patch34: context checkpoints now default to 0. They are rollback copies
+of a slot's context kept in system memory - llama.cpp keeps eight per slot -
+and they were the last reason a model borrowed RAM after the GPU pin and
+load mode were fixed. A default server launcher now keeps everything on its
+own card and fails at launch if it does not fit.
+
+v3.75 patch33: Model load mode now defaults to dio, which is what keeps each
+model on its own pinned card - memory-mapped weights stay host-resident and
+llama.cpp spreads them across every card it can reach. The setting is always
+editable again, and installing or adopting Higgs repaints the TTS page at
+once instead of waiting for a restart.
+
+v3.75 patch32: a server with no GPU chosen is assigned one when its launcher
+is written - least-loaded card first, logged, and shown on the card - so a
+fresh install pins correctly without any setup. The installed Higgs model is
+selected in its dropdown again, clicking a detected IP fills the field, and
+the TTS page repaints after an install even while a button holds focus.
+
+v3.75 patch31: the GPU pin is now written into the launcher file itself
+rather than left to a template, so a server runs on the card its own card
+names and no other. Installing or adopting Higgs also fills every folder
+path it found - engine, models and Sample Vault - and the setup-page
+addresses respond to a click.
+
+v3.75 patch30: a server set to "Auto fit to VRAM: off" now tells llama.cpp
+so - it used to write nothing, and llama.cpp fits by default, which is why
+models spread across every card and into system RAM. The fleet also has its
+own launcher templates in server-templates\, all of which pin one card and
+keep the model on it; the Launcher Creator's templates stay in templates\
+and are no longer offered to server cards.
+
+v3.75 patch29: the voice warm-up is gone - it cost about three quarters of a
+second on every speaker change and the carryover it fought went away with the
+reference samplers. Proxy Setup addresses are readable, Saved Audio Folder
+shows a full path, reverting TTS settings no longer forgets where the engine
+is installed, recognition defaults to Auto, and server-card launchers report
+how they ended.
+
+v3.75 patch28: the TTS page updates itself after an install, Dismiss works,
+and a Revert to default TTS settings button sits beside the TTS selector.
+Saved audio defaults to a TTSaudio folder beside the panel, the 10-second
+sample window survives installs, long lines split at 140 characters, the
+setup-page addresses are shown plainly, and the Permission Tree matches this
+build.
+
+v3.75 patch27: server cards now carry Model load mode instead of Disable
+mmap. Current llama.cpp folded --no-mmap, --mlock and --direct-io into one
+--load-mode flag and warns on the old spellings; the setting offers exactly
+the values it accepts and defaults to auto. The Sampler Guide has a page for
+it, and every card cross-reference was repointed.
+
+v3.75 patch26: the default launcher stops relaunching itself when a server
+fails, keeps its window open so the error stays readable, carries the exit
+code, and prints the line the panel needs to tell a dead server from a
+loading one. llama.cpp's own output still reaches the log unchanged, which
+is what the VRAM report is read from.
+
+v3.75 patch25: a server that fails to start now explains itself - the card
+reads the slot's own log and shows what the server last wrote before it went
+away, instead of sitting silently on "down". DFlash drafters are also asked
+for the draft depth they can actually produce, read from the drafter's own
+header and tensors, so the engine no longer reduces it on every launch.
+
+v3.75 patch24: SenseVoice transcription is timed and shown by name on the
+timing line, the graphic bar and the calibration terminal. The bar itself now
+draws whatever was spent rather than a fixed set of bands, so thought
+synthesis, the sample gate and the rest finally appear on it.
+
+v3.75 patch23: TTS Samplers is temperature and top-k, set by hand - Boson's
+reference pair for this model, with top-p, min-p and repetition penalty
+removed because Higgs either ignores them or is harmed by them. Sampler
+Calibration and Steady Retry are gone: both moved these values, and moving
+them is what produced the endless repeated-token takes. The proxy still sets
+the per-line token limit, and a retry still raises it.
+
+v3.75 patch22: the player tagger is told that most lines need no tags and
+answers with silence unless the words clearly call for one - a flat sentence
+no longer comes back marked as singing. It also skips instantly when its
+server is not running instead of stalling every player line on a timeout,
+and says once which server it is waiting for.
+
+v3.75 patch21: the speech samplers now default to Boson's own reference
+values for Higgs - temperature 0.8, top-k 50, nothing else sent - and Top-K
+is a setting of its own. The retry no longer steps the samplers colder each
+attempt: that walked them toward greedy decoding, which is what produces the
+endless repeated-token takes in the first place. Installing Higgs restores
+these values over whatever the fields held.
+
+v3.75 patch20: the token-cap margin can finally move. It was measuring
+that it needed about 2.65 and being clamped to 1.60 every time, which is
+why the retry ladder kept rescuing lines that never got a bigger cap next
+time. There is also a Clear calibration data button on the TTS Calibration
+section, with a confirmation explaining what it forgets and what it leaves
+alone.
+
+v3.75 patch19: only one line reaches the speech engine at a time. Its
+reference state lives in the model session, so a dialogue line and a thought
+arriving together could cross - one voicetype speaking in another's voice.
+Waiting for the engine is now shown on its own line instead of counting as
+synthesis. An allocation refusal also stops raising the token cap, which was
+asking the card for a bigger buffer than the one it had just refused.
+
+v3.75 patch18: the timing report now measures the synthesis that actually
+played instead of the whole retry ladder, so a line that failed once and
+succeeded once no longer reads as one slow take - discarded attempts get
+their own line. Every line also writes a row to tts-timing.csv with tokens,
+timings, attempts and the reference sample's length, so the per-request and
+per-token costs can be told apart from real play.
+
+v3.75 patch17: diagnostics. audio.cpp is started with --log and the panel
+writes its own launch banner - every model, family, size, the pinned card,
+what is resident on it, and the argv - so a failed session can be read
+afterwards. Failures carry stable codes (TTS-E01..E06), an allocation
+failure is retried instead of silently losing the line, every audio-path
+step reports its own milliseconds by name, and the SenseVoice picker no
+longer offers speech models.
+
+v3.75 patch16: a take suspected of dropping its words is transcribed and
+judged on them - convicted takes retry once, acquitted ones are kept.
+Vocal performances ("Ahh...", sighs, murmurs) pass unjudged in both
+directions and no longer teach the pricing model. Sound-effect and
+ellipsis costs are learned from real lines, the runaway verdict runs on
+the same per-voice model as the token cap, and the Meta tags setting -
+which changed nothing visible - is removed.
+
+v3.75 patch15: the per-line token cap is now fitted per voicetype instead
+of guessed from one constant. Each voice learns its own overhead from the
+takes it has produced, sharing a per-character rate with every other voice.
+Short lines get more room - they were the ones being turned into failures -
+and long lines get less, so a runaway is cut off sooner. Nothing to set up:
+a new voice uses the shipped fit and adapts as it speaks.
+
+v3.75 patch14: reference transcripts are on by default and the Higgs
+installer downloads SenseVoice for you (about 254 MB) and points the field
+at it. Every control in the section now has a ? explanation, picking the
+wrong gguf as the recogniser is flagged in red, and the TTS page refreshes
+itself the moment an install completes.
+
+v3.75 patch13: Runaway Handling is a dropdown in TTS Backend Settings and
+detection is the default - every take's audio is measured against what its
+text should run; a runaway is retried once and the better take speaks, a
+suspiciously short take is logged. Line Time Limit remains as the alternate
+mode. The Sample Vault is now the default voice home: the installer creates
+it and sets the path, Local Voice Clips act as an alternate source that is
+repaired into the vault and re-adopted whenever you edit a clip, and Cached
+Voices defaults to 1024.
+
+v3.75 patch12: the server cards are visually consistent - equal spacing at
+every group boundary with the divider centred in it, and the Speculative
+Decoding section styled exactly like the groups above it, blue flag
+references included. A model with its own MTP head shows a yellow
+"Built-in MTP head" chip under the model picker and beside the Speculative
+Decoding heading when that head is the drafter.
+
+v3.75 patch11: the panel now keeps its own repaired copy of every voice it
+meets. The first time a character speaks, their clip is read - even if its
+header declares an impossible length, which is what made a lot of voice
+files unplayable - rewritten correctly, trimmed to a short example, and
+saved under the voicetype's name in a vault folder. Every later line speaks
+from that copy. Your original files are never modified. Two rows in Audio
+Files choose where the vault lives and how long a kept sample may run.
+Hovering a provider title in the proxy terminal also glows properly now
+instead of blurring.
+
+v3.75 patch10: Reference Transcripts is now its own settings field on the
+TTS page, above Audio Tags - Off, Stored only (use what is known, load no
+model), or On (co-host SenseVoice and learn the rest), with language, meta
+tag and number-format controls and a Clear transcripts button. Nothing ever
+waits on it: the speak path reads what is known and unknown samples are
+transcribed in the background, so the first line for a new voice goes out
+at once and the next one carries its transcript. The store keeps the
+voicetype beside each line so you can correct it by hand, which beats any
+recogniser on Skyrim names.
+
+v3.75 patch9: server cards grow a Speculative Decoding segment whenever a
+drafter is selected - draft tokens per step, acceptance thresholds, backend
+draft sampling, and (for file drafters) the drafter's own KV cache types,
+all reading back from hand-edited launchers. Qwen 3.8 is fully supported:
+its multi-step MTP head is auto-detected for the built-in drafter, and the
+card shows both the Reasoning on/off dial and a Reasoning effort select
+(low / medium / xhigh) - Off outranks effort.
+
+v3.75 patch8: ready for audio.cpp 0.6 - the start retries once without
+session options when the server refuses them, so upgrading the engine costs
+seconds, not a working Start button. An optional SenseVoice model
+(TTS page, "ASR model for reference transcripts") is co-hosted beside the
+TTS engine and transcribes each voice sample once; every cloning request
+then carries the transcript, which locks voice identity harder. And the
+Audio Files settings grew two buttons: Audio Cache lists every character
+the panel has ever met with the sample that speaks them - the pairings
+persist across restarts - with click-through to every kept take, dated,
+newest first; Clear Audio Cache forgets the learned list, disk copy
+included, behind a confirm.
+
+v3.75 patch7: the panel now mirrors what the TTS engine's single session
+was last conditioned on, across every synthesis path - voiced thoughts
+included - and each block in tts-identity.log says "engine was: <voice>"
+whenever the previous take was somebody else's. One read of that line tells
+a wrong-voice case apart: nothing there means a cold start (the engine's own
+misrender), another voicetype there means carryover from the previous
+speaker. The voice warm-up switch reads the same record, so a thought voiced
+between two of your lines counts as the speaker change it is.
+
+v3.75 patch6: every voice sample is verified before the TTS engine sees
+it. A reference missing from disk is recovered from the panel's own copy of
+that voicetype or the line is refused loudly, and a path carrying another
+voicetype's bytes - proven by hash - is treated the same way; a re-recorded
+sample is accepted with one alarm. The gate's verdict lands in
+tts-identity.log beside the fingerprint. There is also a voice warm-up
+switch on the TTS page, off by default: a short discarded take on each NEW
+speaker's voice before their real line, absorbing the engine's carryover
+from the previous one - turn it on and, if first chunks in the wrong voice
+stop, the carryover theory is proven on your own hardware.
+
+v3.75 patch5: a spoken line is named by its own words first - every reply
+the proxy serves is remembered, four deep per character, and a TTS chunk is
+matched into exactly one of them, however late the TTS queue delivers it.
+Chunks of one utterance travel together, so a short "Not an inch." inherits
+the name its longer sibling proved. Only Dialogue requests feed the pairing
+queue now; GM, Combat and Meta traffic no longer lend their names to passing
+lines. A unique voicetype binds its character permanently from its own
+filename, the Meta selector's speaker>listener pick breaks ties among
+waiting requests, and a generic voicetype with nothing live behind it prints
+as itself instead of wearing the previous speaker's name. The player can
+also be recognised automatically as the one name everyone addresses and
+nobody ever is. Every distinct TTS request shape SkyrimNet sends is recorded
+in tts-identity.log - keys and header names only - so what crosses the wire
+is a matter of record.
+
+v3.75 patch4: your character's name is a setting - a field under the Player
+Tag Injector labels your own spoken lines and tells the tagger who "I" is,
+and typed there it outranks anything read from a prompt. The rule that could
+learn the player's name from a think request is gone; the party heading is
+the only prompt that names them, the source is recorded, and a name that
+already belongs to a character is refused. A spoken line under 24 characters
+names nobody, and a name bound to one voice sample can never be moved onto a
+second. Every spoken line now writes a block to tts-identity.log naming the
+speaker, the rule that decided it, the sample sent with its size and hash,
+and the line itself; a reference missing from disk is called missing, and
+one character arriving on a second sample is alarmed in the TTS terminal as
+it happens.
+
+v3.75 patch3: a model that carries its own MTP head can now be its own
+drafter. The Speculative decoding picker offers "Built-in MTP head", and the
+launcher gets "--spec-type draft-mtp" with no draft file at all; a launcher
+already written that way shows up on the card as that choice. A dialogue
+reply that opens with its internal thought is served dialogue-first, the
+thought placed right behind the first spoken segment, so the words reach TTS;
+thought-only replies keep their shape, and thoughts are shown and voiced in
+full. Every server card now carries a per-launch VRAM report above its
+terminal - weights, drafter, projector, KV, RS, compute and MTP context, plus
+GPU free at load - read from llama.cpp's own log lines, and a launch that
+died before serving says so in red instead of reporting itself loaded. The
+port warning tells a stuck or dying load apart from a foreign process
+holding the port.
+
+v3.75 patch2: a speculative drafter is typed by what its tensors prove
+rather than by the architecture it declares, matching how llama.cpp
+itself identifies one - so qwen35-generation MTP heads launch as
+draft-mtp and Markov-headed DFlash files as draft-dspark. A model that
+carries its own MTP head is labelled on its card: it can draft for
+itself with no separate file. The launcher check also flags an integer
+flag handed a fraction, such as a top-k of 0.95.
+
+v3.75 patch1: releases are now ordered by kind as well as number - a
+release, then its hotfixes, then its patches - so the update check can
+tell a hotfix and a patch of the same number apart.
+
+v3.75 hotfix1: a selected speculative drafter is now launched with
+its decoding type, without which recent llama.cpp builds load the drafter
+and draft nothing. Gemma 4, DFlash and EAGLE-3 heads and plain small
+drafters each get the type they need.
 
 v3.75 Beta: a release of everything the v3.74 patch line brought - Muse
 Glimmer support, model architecture detection on every server card,

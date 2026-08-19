@@ -266,8 +266,16 @@ check(rc.count('"FileVersion", "%s"' % dotted) == 1, "app.rc FileVersion string"
 check(rc.count('"ProductVersion", "%s"' % dotted) == 1, "app.rc ProductVersion string")
 check(('version="%s"' % dotted) in mf, "app.manifest assemblyIdentity")
 check(tag.startswith("v" + ver), "APP_RELEASE_TAG matches version", tag)
-check((patch > 0) == ("patch" in tag), "APP_PATCH agrees with tag",
-      "patch=%d tag=%s" % (patch, tag))
+# a build numbered above the release calls that number something - "patch" or
+# "hotfix" - and the tag, the header and the docs must all use the SAME word
+word = re.search(r'APP_PATCH_WORD\s*=\s*"([a-z]+)"', py)
+word = word.group(1) if word else "patch"
+check((patch > 0) == (("%s%d" % (word, patch)) in tag.lower()),
+      "APP_PATCH agrees with the tag, under the word this build uses",
+      "patch=%d word=%s tag=%s" % (patch, word, tag))
+check('VER_TIER = {"": 0, "hotfix": 1, "patch": 2}' in py
+      and word in ("hotfix", "patch"),
+      "and that word is one the version order knows", word)
 check(("v%s Beta" % ver) in rd("README.txt").decode("utf-8", "replace")[:200],
       "README.txt title version")
 
@@ -275,14 +283,14 @@ check(("v%s Beta" % ver) in rd("README.txt").decode("utf-8", "replace")[:200],
 # said v3.69 Beta patch5 for 185 patches: its principles were updated every time
 # and its own header never was, and it shipped that way. A file that names the
 # version it belongs to is a claim, and a claim is checkable.
-_vsay = "v%s Beta%s" % (ver, (" patch%d" % patch) if patch else "")
+_vsay = "v%s Beta%s" % (ver, (" %s%d" % (word, patch)) if patch else "")
 for _dn in ("DEVELOPMENT.md", "CHANGELOG.md", "README.md", "BUILD.md", "README.txt"):
     if not os.path.isfile(os.path.join(ROOT, _dn)):
         continue
     _dt = rd(_dn).decode("utf-8", "replace")
     for _ln in _dt.split("\n"):
         if re.search(r"[Cc]urrent version", _ln):
-            _said = re.findall(r"v3\.\d+ Beta(?: patch\d+)?", _ln)
+            _said = re.findall(r"v3\.\d+ Beta(?: (?:patch|hotfix)\d+)?", _ln)
             check(bool(_said) and all(s == _vsay for s in _said),
                   "%s states the current version, and it is this one" % _dn,
                   _ln.strip()[:90])
@@ -530,6 +538,30 @@ sys.dont_write_bytecode = True
 spec = importlib.util.spec_from_file_location("fp", os.path.join(ROOT, "fleet-panel.py"))
 fp = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(fp)
+
+_vt = None
+try:
+    _T = fp._ver_tuple
+    _rel, _h1, _h2 = _T("v3.75-beta"), _T("v3.75-beta-hotfix1"), _T("v3.75-beta-hotfix2")
+    _p1, _p2 = _T("v3.75-beta-patch1"), _T("v3.75-beta-patch2")
+    _next = _T("v3.76-beta")
+    _prev = _T("v3.74-beta-patch190")
+    _vt = [_rel < _h1 < _h2 < _p1 < _p2 < _next,
+           _prev < _rel,
+           _h1 != _p1,                                   # same number, not the same build
+           _T("v3.75-h1 Beta") == _h1 and _T("v3.75-p1 Beta") == _p1,
+           _T("v3.75-beta") == (3, 75, 0, 0),
+           _T(fp.APP_RELEASE_TAG) is not None]
+except Exception:
+    _vt = None
+if _vt is not None:
+    check(_vt == [True] * 6,
+          "run: within one release the order is the order the builds are made - the "
+          "release, then its hotfixes, then its patches - a hotfix and a patch of the "
+          "same number are told apart, the header's short forms read the same as the "
+          "tags, and the next release still outranks them all", str(_vt))
+else:
+    check(False, "the version-order run did not RUN")
 
 # Fixtures are documentation-reserved values ONLY - RFC 5737 TEST-NET-1 for addresses,
 # an all-zero UUID, a drive letter and folders that exist on no real machine. A fixture
@@ -1627,9 +1659,9 @@ check('"tts-ttsAutoCalEvery"'.strip('"') in _acb9
       "so the slider id exists once in the source, whatever mode renders")
 check('ttsCalRow(main, rate, "")' in _px9 and "everyBlock(" in _px9,
       "Proxy: the setting, then the speech rate menu with its button in the same cell")
-_sbrow = seg(_sb9, "return ttsCalRow(main,", "ttsTitle(\"Samplers\"")
-check('ttsCalRow(main, "", "")' in _sbrow,
-      "Sampler Calibration is the setting alone - the model cell left with the mode")
+# retold patch23: the sampler block has no calRow at all now - no setting, no
+# menu, no model cell. It is a title and its chips.
+nin(_sb9, "ttsCalRow(", "the sampler block is a title and its chips, nothing else")
 check('ttsCalRow(main, "", "")' in _row9,
       "Fixed gets none of it - the row is the setting alone")
 _crq = seg(JS, "function ttsCalRow(main, mid, side)", "function hbox(")
@@ -1643,8 +1675,8 @@ check('class="calcell"' in _crq
       "the shrinkable cells may shrink instead of pushing")
 check("min-width:0" in seg(_crcss, ".calrow .calsel {", ".calrow .setsel"),
       "including the server picker, which is what refused to shrink before")
-check(JS.count("function ttsCalRow(") == 1 and _sb9.count("ttsCalRow(main,") == 1,
-      "one row shape, used by both settings")
+check(JS.count("function ttsCalRow(") == 1,   # retold p23: one user now
+      "one row shape, defined once")
 check("ttsJobCell" not in JS,
       "the job picker itself is gone - the one remaining job needs no cell")
 # the reading, above the bars, on a rule of its own
@@ -1663,7 +1695,7 @@ nin(_row9, "tts-head-now",
 for _blk9, _nm9 in ((_acb9, "calibration"), (_sb9, "sampler")):
     check(_blk9.count('class="hint" style="line-height:1.7') == 0,
           "no grey explanation paragraph left in the %s block" % _nm9)
-check(_acb9.count("ttsTitle(") >= 4 and _sb9.count("ttsTitle(") >= 3,
+check(_acb9.count("ttsTitle(") >= 4 and _sb9.count("ttsTitle(") >= 1,  # p23
       "every setting in both blocks carries a title with its own tooltip",
       "%d and %d" % (_acb9.count("ttsTitle("), _sb9.count("ttsTitle(")))
 check('<div class="tsplit"></div>' in _acb9,
@@ -1750,9 +1782,7 @@ check("min-width:0" in seg(_crcss, ".calrow .calsel {", ".calrow .setsel"),
       "and neither carries the page-wide 260px floor into the stand-in")
 # (the job cell and its server menu left with LLM Controlled in patch153)
 _ac13 = seg(JS, "function ttsAutoCalBlock(st)", "function ttsDiagBlock()")
-_sb13 = seg(JS, "function ttsSampBlock(st)", "// A job the panel gives to a model")
-for _blk13, _id13, _cls13 in ((_ac13, "tts-ttsAutoCal", "setsel"),
-                              (_sb13, "tts-ttsSampAutoCal", "setsel")):
+for _blk13, _id13, _cls13 in ((_ac13, "tts-ttsAutoCal", "setsel"),):  # p23
     _s13 = seg_len(_blk13, 'class="txt calsel ' + _cls13 + '" id="' + _id13 + '"', 90)
     check("style=" not in _s13, "%s is sized by its class, not inline" % _id13)
 check('<span class="calgap"></span>' in _crq,
@@ -1833,7 +1863,7 @@ nin(py, "ttsPassThrough", "and from the settings, the rule and the facts answer"
 nin(_sb15, "SkyrimNet's Own Settings", "with its title")
 check(fp.tts_samp_now({"ttsCalTemp": "0.7"}).get("temp") == "0.7",
       "what is in force answers in the CHIPS' key names - temp, not temperature")
-check(set(fp.TTS_SAMP_FIELD) == {"temp", "top_p", "min_p", "rep"}
+check(set(fp.TTS_SAMP_FIELD) == {"temp", "top_k"}   # retold p23
       and "TTS_SAMP_FIELD.items()" in seg(py, "def tts_samp_now", "def cal_overrides"),
       "through the one map the line under the bars already went through")
 check('"sampSent": tts_samp_now(st)' in py and py.count("def tts_samp_now") == 1,
@@ -1848,12 +1878,11 @@ check('setChanged($("tts-samp-chips"), ttsSampChips(r))'
 # 7. Steady Retry is on the Samplers line
 # patch116: beside the SAMPLERS, not beside their title - it is the other thing that
 # decides what a request carries, and a title row put it a line away from them
-_sr16 = seg(_sb15, 'id="tts-samp-chips"', "}")
-check('ttsTitle("Steady Retry"' in _sr16,
-      "Steady Retry sits in the chips' own row, beside the samplers themselves")
-check(_sb15.index('ttsTitle("Samplers"') < _sb15.index('id="tts-samp-chips"')
-      < _sb15.index('ttsTitle("Steady Retry"'),
-      "with the title above them both, on a line of its own")
+# retold patch23: Steady Retry is gone, so there is nothing to sit beside the
+# chips. The title leads and the chips follow - that is the whole block.
+nin(_sb15, "Steady Retry", "no retry switch rides with the samplers any more")
+check(_sb15.index('ttsTitle("TTS Samplers"') < _sb15.index('id="tts-samp-chips"'),
+      "the title leads and the chips follow")
 
 # 12, 13, 14. one button row, on the terminal it acts on
 check('ttsTitle("TTS Calibration Terminal"' in _dx15,
@@ -2018,13 +2047,11 @@ check("time.time() - last > 1.0" in _dlq,
       "and the one caller that repeats still rate-limits itself, so the notify does too")
 check('"higgsInstall": dict(HIGGS_INSTALL)' in py,
       "the state the bar is drawn from is the state that event carries")
-# the retry switch had no name - only a sentence beside it that reads as prose
+# retold patch23: Steady Retry is gone - it moved the samplers, and moving them
+# is what produced the degenerate repeat
 _sampq = seg(JS, "function ttsSampBlock", "// A job the panel gives to a model")
-check('ttsTitle("Steady Retry"' in _sampq,
-      "the retry sampler switch says what it is, in a title that carries its own"
-      " explanation like every other setting here")
-check('data-act="ttsRetrySafe"' in _sampq, "and still carries its own action")
-
+nin(_sampq, "Steady Retry", "the retry switch is gone from the sampler block")
+nin(_sampq, "ttsRetrySafe", "action and all")
 
 # patch100: a dial value that does something its label does not say. The captured
 # config that spoke "<|channel>thought" at the head of every line had slot 1 on
@@ -2119,10 +2146,11 @@ finally:
 # folded the button into the automatic run behind ONE switch: on shows the sampler
 # settings AND lets the every-N run calibrate them; off hides them and stops the
 # automation - and the user's stored values keep applying either way.
-check("def autocal_sampler_arith" in py
-      and "cal_overrides(" in seg(py, "def autocal_sampler_arith", "AUTOCAL_GEN")
-      and "save_config(" in seg(py, "def autocal_sampler_arith", "AUTOCAL_GEN"),
-      "the arith sampler step remains: it reads the bounded overrides and saves")
+# retold patch23: the automatic sampler step is GONE. Moving these values is what
+# produced the degenerate repeat, so nothing moves them now - they are set by hand.
+nin(py, "def autocal_sampler_arith",
+    "the automatic sampler step is gone, function and all")
+nin(py, "ttsSampAutoCal", "and the switch that ran it with it")
 for _phrase in ("does NOT change how often", "top_p 1.0 truncates nothing",
                 "repetition_penalty pushes probability away"):
     check(_phrase in fp.DIAG_SYSTEM,
@@ -2131,14 +2159,11 @@ check("overrunBySampler" in fp.cal_facts({"settings": {}}),
       "and is given the failure rate per configuration to read it from")
 nin(JS, "ttsAutoCalRun", "the button it replaced is gone, handler and all")
 nin(py, "api_tts_autocal_run", "and so is the endpoint - the run is in-process now")
-check("ttsSampAutoCal" in fp.DEF_SETTINGS
-      and fp.DEF_SETTINGS["ttsSampAutoCal"] == "on",
-      "the switch is a known setting and ships ON - Automatic is the shipped standard")
+nin(py, "ttsRetrySafe",
+    "and so is Steady Retry - a retry carries the SAME samplers now")
 _tk8 = seg(py, "def autocal_tick", "def api_tts_diag")
-check('"ttsSampAutoCal", "on")).lower()' in seg(py, "def autocal_sampler_arith", "AUTOCAL_GEN"),
-      "the arith sampler step runs only when the switch says so")
-check("autocal_sampler_arith(_cfgp)" in _tk8,
-      "and the tick takes it with the refit, in process, no server to pick")
+nin(_tk8, "autocal_sampler_arith",
+    "and the tick no longer calls it - the refit alone remains")
 check("autocal_wait_idle" not in _tk8 and "tts_job_port" not in _tk8,
       "the tick asks nothing of any server - no port, no idle window")
 # ONE switch: content behind it, values not gated by it
@@ -2146,19 +2171,13 @@ _sb8 = seg(JS, "function ttsSampBlock(st)", "// A job the panel gives to a model
 # patch109: a two-option menu like the one above it, not a switch. Manual leaves the
 # samplers themselves in the user's hands: Manual means YOU move them, not that they
 # stop being sent.
-check('id="tts-ttsSampAutoCal"' in _sb8 and ">Manual</option>" in _sb8
-      and ">Automatic</option>" in _sb8,
-      "sampler calibration is a Manual / Automatic menu, whichever method runs it")
-check('ttsCalRow(main, "", "")' in _sb8,
-      "no model cell remains in the row - the arith step reads the record itself")
+# retold patch23: no menu - the samplers are manual, always, and that is not a mode
+nin(_sb8, "tts-ttsSampAutoCal", "there is no calibration menu on the sampler block")
+check('ttsTitle("TTS Samplers"' in _sb8,
+      "the block is titled TTS Samplers - calibration was never what it did")
 check('id="tts-samp-chips"' in _sb8 and "if (!on) return" not in _sb8,
-      "the samplers show under it either way - Manual is a hand on them, not a hide")
-check("ttsSampAutoCal = sac.value" in JS,
-      "and it saves like the field it now is")
-nin(JS, 'd.act === "ttsSampAutoCal"',
-    "the click handler it replaced is gone")
-nin(seg(py, "def cal_overrides", "def "), "ttsSampAutoCal",
-    "the values really do keep applying - the switch never gates cal_overrides")
+      "the samplers show unconditionally - there is no switch to hide them")
+nin(JS, "ttsSampAutoCal = sac.value", "and nothing saves the setting it replaced")
 for _gone in ("tts-diag-srv", "tts-autocal-srv", "tts-llm-srv"):
     nin(JS, _gone, "and the pickers of old are still gone: %s" % _gone)
 
@@ -2174,18 +2193,17 @@ try:
     fp._SN_TTS_SEEN.update({"temperature": 0.6, "top_p": 1.0, "min_p": 0.05,
                             "repetition_penalty": 1.2})
     _a1 = fp.tts_samplers(_ss, 1)
-    check(_a1 == {"temperature": 0.6, "top_p": 1.0, "min_p": 0.05, "repetition_penalty": 1.2},
-          "a first attempt carries SkyrimNet's own values untouched", str(_a1))
-    _a2 = fp.tts_samplers(_ss, 2)
-    check(_a2["repetition_penalty"] == 1.0 and _a2["top_p"] <= 0.9
-          and _a2["temperature"] < _a1["temperature"],
-          "a retry drops to a profile that aims to FINISH, not to perform", str(_a2))
-    check(fp.tts_samplers({**_ss, "ttsRetrySafe": "off"}, 2) == _a1,
-          "and the user can turn that off - it is their setting")
-    check(fp.tts_samplers({**_ss, "ttsCalRepPen": "1.0"}, 1)["repetition_penalty"] == 1.0,
+    # retold patch23: only what Higgs takes is forwarded, so SkyrimNet's top_p and
+    # min_p are DROPPED rather than passed on
+    check(_a1 == {"temperature": 0.6},
+          "a first attempt carries SkyrimNet's own values, minus what this engine "
+          "cannot use", str(_a1))
+    check(fp.tts_samplers(_ss, 2) == _a1 and fp.tts_samplers(_ss, 3) == _a1,
+          "and every retry carries exactly the same ones - nothing narrows")
+    check(fp.tts_samplers({**_ss, "ttsCalTemp": "0.9"}, 1)["temperature"] == 0.9,
           "a value set on the page wins over SkyrimNet's")
-    check(set(fp.tts_samplers({}, 1)) >= {"temperature", "top_p"},
-          "and what arrived is forwarded with no setting able to drop it",
+    check(set(fp.tts_samplers({}, 1)) == {"temperature"},   # retold p23
+          "and what arrived is forwarded where this engine can use it",
           str(sorted(fp.tts_samplers({}, 1))))
 finally:
     fp._SN_TTS_SEEN.clear()
@@ -2333,20 +2351,19 @@ try:
     fp.calterm_log = lambda lines, blank=True: _said.append(
         lines if isinstance(lines, str) else "\n".join(str(x) for x in lines))
     fp.AUTOCAL_GEN[0] = 0
-    _realda, _realsa = fp.autocal_derive_arith, fp.autocal_sampler_arith
+    _realda = fp.autocal_derive_arith
     _realcfg = fp.CONFIG
     # the proxy tick loads the config, and load_config CREATES the file when it is
     # absent - pointed at the tree, the gate would write into what it judges
     fp.CONFIG = os.path.join(tempfile.mkdtemp(), "fleet-config.json")
     _arith = []
     fp.autocal_derive_arith = lambda cfg=None, why="": _arith.append(why) or {"ok": True}
-    fp.autocal_sampler_arith = lambda cfg=None: None
     try:
         for _i in range(30):
             fp.autocal_tick({"ttsAutoCal": "proxy", "ttsAutoCalEvery": "5",
                              "ttsAutoCalPort": "1"})
     finally:
-        fp.autocal_derive_arith, fp.autocal_sampler_arith = _realda, _realsa
+        fp.autocal_derive_arith = _realda
         fp.CONFIG = _realcfg
     check(len(_arith) == 6 and all("every 5 lines" in w for w in _arith),
           "Proxy counts, and refits by arithmetic every N lines, inline",
@@ -2358,12 +2375,11 @@ try:
     fp.CONFIG = os.path.join(tempfile.mkdtemp(), "fleet-config.json")
     _arith2 = []
     fp.autocal_derive_arith = lambda cfg=None, why="": _arith2.append(why) or {"ok": True}
-    fp.autocal_sampler_arith = lambda cfg=None: None
     try:
         for _i in range(7):
             fp.autocal_tick({"ttsAutoCal": "llm", "ttsAutoCalEvery": "5"})
     finally:
-        fp.autocal_derive_arith, fp.autocal_sampler_arith = _realda, _realsa
+        fp.autocal_derive_arith = _realda
         fp.CONFIG = _realcfg2
     check(len(_arith2) == 1 and "every 5 lines" in _arith2[0],
           "a saved llm config counts and refits by arithmetic - the migration is "
@@ -2396,12 +2412,11 @@ try:
     fp.autocal_lines_since = lambda st: 8
     fp.autocal_note = lambda outcome: _lines.append(str(outcome))
     fp.calterm_log = lambda lines, blank=True: None
-    _realda3, _realsa3 = fp.autocal_derive_arith, fp.autocal_sampler_arith
+    _realda3 = fp.autocal_derive_arith
     _realcfg3 = fp.CONFIG
     fp.CONFIG = os.path.join(tempfile.mkdtemp(), "fleet-config.json")
     _ar3 = []
     fp.autocal_derive_arith = lambda cfg=None, why="": _ar3.append(why) or {"ok": True}
-    fp.autocal_sampler_arith = lambda cfg=None: None
     try:
         fp.AUTOCAL_GEN[0] = -1
         fp.autocal_tick({"ttsAutoCal": "llm", "ttsAutoCalEvery": "10"})
@@ -2413,7 +2428,7 @@ try:
               "and the tenth is the one that refits - by arithmetic, saved mode llm or not",
               "gen=%d arith=%d" % (fp.AUTOCAL_GEN[0], len(_ar3)))
     finally:
-        fp.autocal_derive_arith, fp.autocal_sampler_arith = _realda3, _realsa3
+        fp.autocal_derive_arith = _realda3
         fp.CONFIG = _realcfg3
 finally:
     fp.autocal_lines_since, fp.autocal_note = _realsince2, _realnote2
@@ -2444,7 +2459,7 @@ nin(JS, "no LLM fit derived yet",
 # Every path out of the fit writes exactly one record, including the two guards
 # that used to return in silence - the automatic caller has no page to show an
 # error on, so an unlogged return is an invisible one.
-_dvq = seg(py, "def autocal_derive_arith", "def autocal_sampler_arith")
+_dvq = seg(py, "def autocal_derive_arith", "def autocal_lines_since")
 check(_dvq.count("return {") == _dvq.count('calterm_log(["TTS calibration') > 0,
       "every way out of the fit writes one record - none returns quietly",
       "%d returns, %d records" % (_dvq.count("return {"),
@@ -2692,20 +2707,27 @@ check("SPEAKER_SCAN" in _ns and "[:SPEAKER_SCAN]" in _ns,
 check("json" not in _ns, "and it is not JSON-parsed on every request")
 check("_spk_recent.append((time.time(), name))" in _ns,
       "only the NAME is kept - never the prompt")
-_sv = seg(py, "def speaker_for_voice", "def tts_voice_name")
+# retold patch4: the decision moved into speaker_for_voice_ex, which reports WHICH
+# rule answered; the slice bounds that function alone.
+_sv = seg(py, "def speaker_for_voice_ex", "_PLAYER_SAID = [False]")
 check("del _spk_recent[idx]" in _sv,
       "a paired request is CONSUMED, so a second voice cannot inherit the same name")
-# A generic voicetype - femalecommoner, maleguard - is shared by dozens of characters.
-# Caching for good meant the first commoner to speak owned that voice for the session
-# and every commoner after wore their name. Fresh evidence wins; the cache is the
-# fallback for a line with no dialogue request behind it.
-check("return known or \"\"" in _sv, "an unpaired line falls back to the last name learned")
+# retold patch5: the cache STOPPED answering. femaledarkelf handing Nelysa's name to
+# the next dark elf who spoke five seconds later is what the fallback bought; the
+# last-known name stays visible to the ledger and the one-voice guards, but a line
+# with no live evidence prints as its voicetype.
+check('return "", "no live evidence - the voicetype stands", cand' in _sv,
+      "an unpaired line answers as its voicetype, never from the cache")
 fp.panel_log = (lambda *_a, **_k: None) if not hasattr(fp, "_gate_quiet") else fp.panel_log
 _realpl = fp.panel_log
+_realtw = fp.TTSW.log        # retold patch4: a rebind raises the identity alarm, which
 fp.panel_log = lambda *_a, **_k: None
+fp.TTSW.log = lambda *_a, **_k: None   # reaches TTSW.log - and that loads a config
 try:
     fp._spk_recent[:] = []
     fp._spk_voices.clear()
+    fp._spk_run.clear()
+    fp._spk_pin.clear()
     fp.note_speaker(b"You are Brelyna Maryon, a mage of the College")
     _first = fp.speaker_for_voice("femalecommoner")
     _again = fp.speaker_for_voice("femalecommoner")
@@ -2713,14 +2735,17 @@ try:
     _second = fp.speaker_for_voice("femalecommoner")
 finally:
     fp.panel_log = _realpl
+    fp.TTSW.log = _realtw
     fp._spk_recent[:] = []
     fp._spk_voices.clear()
+    fp._spk_run.clear()
+    fp._spk_pin.clear()
 check(_first == "Brelyna Maryon", "the name behind a voicetype is learned", _first)
 check(_again == "Brelyna Maryon", "and held when nothing newer has arrived", _again)
 check(_second == "Ysolda",
       "but a shared voicetype takes the character who just spoke, not the first ever",
       _second)
-check("note_speaker(body)" in seg_len(py, "def _mk_handler", 4000),
+check("note_speaker(body, enqueue=" in seg_len(py, "def _mk_handler", 4000),  # retold patch5
       "read from the request the proxy is already carrying, with no extra model call")
 check("def tts_speaker_label" in py and "or tts_voice_name(path)" in py,
       "the terminal shows the character where known and the voicetype otherwise")
@@ -2763,7 +2788,7 @@ for _gl in _gsrc.splitlines():
         check(False, "a check on a regex match is coerced to a bool, or it SKIPs",
               _gs[:80])
 check(True, "every check written on a regex match says bool() and cannot skip itself")
-_sv2 = seg(py, "def speaker_for_voice", "def acpp_local_version")
+_sv2 = seg(py, "def speaker_for_voice_ex", "def acpp_local_version")  # retold patch4
 check("if key in PLAYER_VOICES" in _sv2 and "return _spk_player[0]" in _sv2,
       "so it never enters the learned map and cannot take an NPC's name")
 # and when it cannot be read, it says so ONCE, with what the prompt did head its
@@ -3260,14 +3285,16 @@ check("The bridge is just past the mill." in _ex,
 _tp = seg(py, "def tts_tag_prompt", "PTI_LAST = [0.0]")
 check("fewer is better" not in _tp, "the prompt no longer talks the model down to one tag")
 # patch26 wording: the closing instruction reads for both kinds
-check("either optional" in _tp, "and says plainly that neither is required")
+check("When in doubt, no tag." in _tp,   # retold p22: stronger than "optional"
+      "and says plainly that neither is required - silence is the default")
 check("At most one EMOTION and one AUDIO tag" in _tp,
       "explaining that the two kinds combine")
 for _lbl in ("EMOTION (felt)", "AUDIO (heard)"):
     check(_lbl in _tp, "each kind says what it is for: %s" % _lbl)
 # the whole point of cutting it: the prefill is the same prompt every time
 _p_new = fp.tts_tag_prompt()
-check(len(_p_new) < 1450, "and the whole thing stays well under three quarters of what it was",
+check(len(_p_new) < 1800,   # retold p22: two neutral examples joined the prompt
+      "and the whole thing stays well under three quarters of what it was",
       "%d chars" % len(_p_new))
 _words = len(", ".join(dict(fp.TAG_OFFER)["Emotion"])) + len(", ".join(dict(fp.TAG_OFFER)["Audio"]))
 check(_words > len(_p_new) * 0.3,
@@ -3297,20 +3324,27 @@ check("for gi, (_label, words) in enumerate(TAG_OFFER)" in _grp,
 check("gi in seen" in _grp, "so a second emotion is dropped rather than sent")
 
 
-section("elation never reaches the engine")
-# MEASURED: 8 of 8 takes carrying <|emotion:elation|> came back in a different voice,
-# across two references at 83 Hz and 200 Hz - and all landed at 265-381 Hz REGARDLESS
-# of the reference, which is the speaker being dropped, not shifted
-check("TTS_EMOTION_BLOCK" in py, "a blocked-emotion list exists")
+section("elation does not reach the engine unasked")
+# MEASURED twice, years apart. First: 8 of 8 takes carrying <|emotion:elation|> came
+# back in a different voice across two references at 83 Hz and 200 Hz, all landing at
+# 265-381 Hz REGARDLESS of the reference - the speaker being dropped, not shifted.
+# Then unblocked in patch24, when the Pitch Guard was thought to cover it; the Pitch
+# Guard went in patch33 because pitch moves with feeling and not identity, leaving the
+# fault untreated either way. patch41 blocked it outright and lost the switch with it.
+# patch42 ships it OFF instead - the reason it stays reachable is that this entry has
+# been wrong before, and the next sweep needs somewhere to disagree.
+check("TTS_EMOTION_OFF" in py, "an emotions-off list exists")
 # from the COMMENT, not the assignment - the reasoning is what matters here
-_blk = seg(py, "# Emotions this build refuses", "def tts_apply_tags")
-# emptied in patch24: the Pitch Guard catches a wrong voice whatever caused it, which
-# is the same fault treated at its source rather than by naming one word
-check("frozenset()" in _blk, "empty - the Pitch Guard treats this at its source")
-check("this is where it goes" in _blk, "the mechanism stays, for a tag that earns it")
-_rn = seg(py, "def _tts_render", "def tts_is_player")
-check("TTS_EMOTION_BLOCK" in _rn,
-      "blocked where the token is WRITTEN, so every spelling is covered")
+_blk = seg(py, "# Emotions this build ships with turned OFF", "DEF_SETTINGS = {")
+check("disgust" in _blk and "shame" in _blk,
+      "populated by measurement, not by the mechanism being available")
+check("ELATION HAS BEEN HERE BEFORE" in _blk,
+      "and the one entry that has been added and removed before says so")
+check("elation" in fp.TTS_EMOTION_OFF
+      and "EMOTION-ELATION" in fp.DEF_SETTINGS["ttsTagsFinalOff"],
+      "elation ships off, on the gate that stops it whoever wrote it")
+check("EMOTION-ELATION" in " ".join(dict(fp.TAG_OFFER)["Emotion"]),
+      "and stays on the board, because this entry has been wrong before")
 _off2 = seg(py, "def _build_offer", "TAG_OFFER = _build_offer()")
 check("TTS_TAGS.get(kind" in _off2,
       "the offer is BUILT from the tables - a hand-written list drifted at once")
@@ -3709,10 +3743,14 @@ check("cache_note" in _pl3 or "cache %d" in _pl3, "and so does the PTI/PME recor
 # one character has one voice: `femalecommoner is Serana` happened because a spoken line
 # with no dialogue request behind it took whatever name was pending
 _realpl2 = fp.panel_log
+_realtw2 = fp.TTSW.log       # retold patch4, as above
 fp.panel_log = lambda *_a, **_k: None
+fp.TTSW.log = lambda *_a, **_k: None
 try:
     fp._spk_recent[:] = []
     fp._spk_voices.clear()
+    fp._spk_run.clear()
+    fp._spk_pin.clear()
     fp.note_speaker(b"You are Serana, a vampire of Volkihar")
     _own = fp.speaker_for_voice("serana")
     fp.note_speaker(b"You are Serana, a vampire of Volkihar")
@@ -3722,8 +3760,11 @@ try:
     _still = fp.speaker_for_voice("serana")
 finally:
     fp.panel_log = _realpl2
+    fp.TTSW.log = _realtw2
     fp._spk_recent[:] = []
     fp._spk_voices.clear()
+    fp._spk_run.clear()
+    fp._spk_pin.clear()
 check(_own == "Serana", "a voicetype learns the character behind it", _own)
 check(_steal == "",
       "a name already bound to another voicetype cannot be taken by a second one", _steal)
@@ -3742,7 +3783,10 @@ nin(_lp, "if not isinstance(regen_slot_script", "and isinstance is not the test"
 _cc = [r for r in fp.SERVER_PARAMS if r[0] == "ctxcheck"]
 check(bool(_cc), "context checkpoints is a server parameter")
 check(bool(_cc) and _cc[0][5] == "--ctx-checkpoints", "written as --ctx-checkpoints")
-check(bool(_cc) and _cc[0][3] == "8", "defaulting to llama.cpp's own 8", str(_cc and _cc[0][3]))
+# retold patch34: 0, not llama.cpp's 8 - checkpoints live in HOST memory and a
+# fleet server must not borrow system RAM to make a model appear to fit
+check(bool(_cc) and _cc[0][3] == "0", "defaulting to 0, not llama.cpp's own 8",
+      str(_cc and _cc[0][3]))
 check(bool(_cc) and _cc[0][4]["min"] == 0, "reaching 0, which disables checkpointing")
 _l3 = fp.build_param_launcher({"settings": {}},
         {"id": "s1", "port": 1237, "params": {"model": os.path.join(tempfile.mkdtemp(), "m.gguf"),
@@ -3755,7 +3799,7 @@ check(_l3.count("--ctx-checkpoints") == 1,
 
 # a refused pairing was silent, so "the names are wrong" and "the names are missing"
 # read identically from a log
-_sv2 = seg(py, "def speaker_for_voice", "def tts_voice_name")
+_sv2 = seg(py, "def speaker_for_voice_ex", "def tts_voice_name")  # retold patch4
 check("already belongs " in _sv2, "a name refused because it is taken says so")
 check("no dialogue request " in _sv2, "and a line nobody named says that instead")
 
@@ -3889,7 +3933,9 @@ check('color:var(--ok)' in _dash and 'color:#e8ecf2' in _dash,
 # belongs to the first request that came in. Taking the newest handed two NPCs speaking
 # in quick succession each other's names.
 _realpl3 = fp.panel_log
+_realtw3 = fp.TTSW.log       # retold patch4, as above
 fp.panel_log = lambda *_a, **_k: None
+fp.TTSW.log = lambda *_a, **_k: None
 try:
     fp._spk_recent[:] = []
     fp._spk_voices.clear()
@@ -3898,11 +3944,12 @@ try:
     _one, _two = fp.speaker_for_voice("femalecommoner"), fp.speaker_for_voice("serana")
 finally:
     fp.panel_log = _realpl3
+    fp.TTSW.log = _realtw3
     fp._spk_recent[:] = []
     fp._spk_voices.clear()
 check(_one == "Azeeda" and _two == "Serana",
       "two NPCs speaking in succession keep their own names", "%s / %s" % (_one, _two))
-check("for idx in range(len(_spk_recent)):" in seg(py, "def speaker_for_voice", "def tts_voice_name"),
+check("for idx in range(len(_spk_recent)):" in seg(py, "def speaker_for_voice_ex", "def tts_voice_name"),
       "the pending names are a queue, not a stack")
 
 section("the server card reads in groups")
@@ -3924,7 +3971,9 @@ check('"group": PARAM_GROUP.get(k' in _pdefs, "and every parameter is sent with 
 _pe = seg(JS, "function paramEditor", "// ITEM 8:")
 check("state.paramGroups" in _pe, "and lays the parameters out by it")
 check('class="pgrp"' in _pe, "with a heading before each group")
-check(".pgrp" in _css and "border-top" in seg(_css, ".pgrp {", ".pgrp:first-child"),
+# retold patch12: a slotgrid-scoped .pgrp override exists now, so the anchor
+# pins the line-start original rule alone
+check(".pgrp" in _css and "border-top" in seg(_css, "\n.pgrp {", ".pgrp:first-child"),
       "drawn as a rule, so the card reads as blocks")
 # every parameter has to land somewhere, or a control disappears from the card
 _ungrouped = [r[0] for r in fp.SERVER_PARAMS if r[0] not in fp.PARAM_GROUP]
@@ -3933,7 +3982,7 @@ check(not _ungrouped, "and no parameter is left without a group",
 
 
 # white, and the same rule the TTS page draws between its blocks
-_pg = seg(_css, ".pgrp {", ".pgrp:first-child")
+_pg = seg(_css, "\n.pgrp {", ".pgrp:first-child")   # retold patch12: see above
 check("color: #fff" in _pg, "a group heading is white")
 nin(_pg, "border-top: 1px", "and separated by a rule, not a flat border")
 check("linear-gradient" in seg(_css, ".pgrp::before", ".pgrp:first-child"),
@@ -3974,10 +4023,15 @@ section("the panel asks for the emotions SkyrimNet teaches")
 # fourteen. Those fourteen are what its dialogue models are taught to write, so they are
 # what PTI and PME are offered and what their answers are held to.
 _em = dict(fp.TAG_OFFER)["Emotion"]
-# SkyrimNet's template lists every emotion Higgs has, so the panel offers every one -
-# including anger, fear and disgust, without which an aggressive line cannot be labelled
+# SkyrimNet's template lists every emotion Higgs has and the panel offers every one -
+# anger and fear included, without which an aggressive line could not be labelled.
+# Six ship TURNED OFF rather than missing (patch42): the board is the whole vocabulary,
+# the default decides what is used, and the user keeps the switch.
 check(len(_em) == len(fp.TTS_TAGS["emotion"]),
-      "every emotion the engine has is offered", "%d of %d" % (len(_em), len(fp.TTS_TAGS["emotion"])))
+      "every emotion the engine has is offered",
+      "%d of %d" % (len(_em), len(fp.TTS_TAGS["emotion"])))
+check(all(("EMOTION-%s" % e.upper()) in _em for e in fp.TTS_EMOTION_OFF),
+      "the six that ship off among them - a default keeps its switch")
 check(all(w.startswith("EMOTION-") and w.split("-", 1)[1].lower() in fp.TTS_TAGS["emotion"]
           for w in _em),
       "and every one of them is a tag the engine really has")
@@ -3990,11 +4044,17 @@ for _p in ("pause", "long_pause", "speed_slow", "pitch_high", "expressive_low"):
     check(_p in _au2, "prosody is offered bare: [%s]" % _p)
     check(fp.tts_apply_tags("Wait [%s] for it." % _p, True, "audiocpp").count("<|") == 1,
           "and translates: [%s]" % _p)
-for _w in ("ANGER", "FEAR", "DISGUST", "AMUSEMENT", "DETERMINATION", "BITTERNESS",
-           "ELATION", "AFFECTION", "AROUSAL", "AWE", "CONTEMPLATION", "CONTENTMENT",
-           "ENTHUSIASM", "HELPLESSNESS", "LONGING", "PRIDE", "RELIEF", "SADNESS",
-           "SHAME", "SURPRISE", "CONFUSION"):
+for _w in ("ANGER", "FEAR", "AMUSEMENT", "DETERMINATION", "BITTERNESS",
+           "AFFECTION", "AROUSAL", "AWE", "CONTEMPLATION", "CONTENTMENT",
+           "ENTHUSIASM", "HELPLESSNESS", "PRIDE", "RELIEF", "SURPRISE", "CONFUSION"):
     check(("EMOTION-%s" % _w) in _em, "asked for: %s" % _w)
+# and the six that ship off are not in the PROMPT - the model must not spend its one
+# tag on a word the wire will drop - while staying on the board. (patch42)
+_pOff = fp.tts_tag_prompt(off=frozenset(
+    w.upper() for w in fp.tags_off(fp.DEF_SETTINGS, "ttsTagsOff")))
+for _w in ("DISGUST", "ELATION", "LONGING", "SADNESS", "SHAME", "DETERMINATION"):
+    check(("EMOTION-%s" % _w) not in _pOff, "not asked of the tagger: %s" % _w)
+    check(("EMOTION-%s" % _w) in _em, "but still on the board: %s" % _w)
 # the notation is SkyrimNet's, so a tagged player line is indistinguishable from an NPC one
 check(all(w.startswith("EMOTION-") for w in _em), "emotions are written EMOTION-NAME")
 check(all(w.startswith(("SFX-", "STYLE-")) or "-" not in w.replace("_", "")
@@ -4033,8 +4093,10 @@ section("an NPC's internal thought")
 # SkyrimNet asks its characters to end a reply with private reasoning wrapped in
 # <internal_thought>. It is never spoken, so it never reaches the TTS record - the reply
 # on its way past the proxy is the only place to catch it.
-check("ttsThoughtOut" in fp.DEF_SETTINGS, "it has a switch, off by default")
-check(fp.DEF_SETTINGS["ttsThoughtOut"] == "off", "off by default")
+# retold p37: shown by default - a thought is why the line after it makes sense,
+# and the shipped "off" cost a session's diagnosis
+check("ttsThoughtOut" in fp.DEF_SETTINGS, "it has a switch")
+check(fp.DEF_SETTINGS["ttsThoughtOut"] == "on", "on by default")
 check(bool(fp.THOUGHT_RX.search("a <internal_thought>x</internal_thought>")),
       "the tag is matched as SkyrimNet writes it")
 check(not fp.THOUGHT_RX.search("<internal thought>x</internal thought>"),
@@ -4090,7 +4152,8 @@ check(_off == "", "and nothing at all with the switch off")
 check(_none == "", "a reply carrying no thought writes nothing")
 # the spoken line still needs that name: peeking must not consume it
 check(_after == _before, "the shared name queue is not touched at all", str(_after))
-check("speaker = note_speaker(body)" in seg(py, "def _proxy(self)", "def _background_init"),
+check('speaker = note_speaker(body, enqueue=(rt["title"] == "Dialogue"))'
+      in seg(py, "def _proxy(self)", "def _background_init"),  # retold patch5
       "the name comes from the request that produced the reply, not from the queue")
 check(PAGE.count('data-act="termThoughts"') == 3,
       "the switch is in all three Options panels - the dashboard and both split panes",
@@ -4258,9 +4321,14 @@ for _bx20, _frag20 in (("headroom", "estimate x this"),
 _pt21 = seg(JS, "const pidRx = new RegExp", "function paintTok(tk)")
 _css21 = seg(PAGE, ".plpay { cursor:pointer", ".plpay:hover")
 nin(_css21, "dotted", "no underline at rest - the text is the text it always was")
-nin(_css21, "text-shadow", "and at rest no glow restyles the glyphs - the hover may")
+# retold patch23: the at-rest rule is unchanged; the hover is now one 6px glow, so
+# the seg that used to end at ":hover" now contains it - pin the rest rule itself
+check(".plpay { cursor:pointer; }" in PAGE,
+      "and at rest no glow restyles the glyphs - the hover may")
 _ph45 = seg(PAGE, ".plpay:hover {", ".moodic[title]")
-check("text-shadow:0 0 7px var(--acc)" in _ph45 and "drop-shadow" in _ph45,
+# retold patch23: ONE tight glow. The drop-shadow filter over two text-shadows
+# re-blurred already-blurred pixels and the provider name read as out of focus.
+check("text-shadow:0 0 6px var(--acc)" in _ph45 and "drop-shadow" not in _ph45,
       "the button shows itself under the hand as a glow on the glyphs")
 check("background" not in _ph45 and "box-shadow:0 0 0 1px" not in _ph45,
       "and no painted rectangle - the highlight is light, not a box")
@@ -4388,14 +4456,21 @@ for _sc23 in ('setChanged($("tts-head-now")', 'setChanged($("tts-samp-chips")',
 _sd23 = JS.find("if (window.__ttsDiag)")
 check(_sd23 >= 0 and "window.__ttsMeter" in JS and _sd23 < JS.find("loadTtsDiag();"),
       "a rebuilt pane is seeded from what was last known BEFORE the fetches repaint it")
-check(b"Think internally as " == fp.PLAYER_THINK,
-      "the player is also named by their own standalone thought prompt")
+# patch123 named the player from a standalone "Think internally as <n>" prompt. patch4
+# removed it: SkyrimNet sends NPC think tasks in the same shape and the agreement test
+# passes for those too, so the rule named an NPC as the player and every spoken line of
+# the player's wore her name from then on. The pins are retold as its ABSENCE.
 _ns23 = seg(py, "def note_speaker", "def speaker_for_voice")
-check("PLAYER_THINK + name.encode" in _ns23,
-      "and only when that prompt thinks AS its own speaker - the two names must agree")
-check('sys_p += "\\n\\nThe line is spoken by the player, %s." % _spk_player[0]' in py,
-      "PTI is told who the player is, from the name the proxy learned")
-check('_sys += "\\nThe player is %s." % _spk_player[0]' in py,
+nin(_ns23, "Think internally as",
+    "note_speaker no longer reads a think prompt as the player's")
+check("_player_name_learn(pm.group(1)" in _ns23,
+      "the party heading is the only prompt that names them, through the one gate "
+      "that can refuse a name")
+check('sys_p += "\\n\\nThe line is spoken by the player, %s." % _pn' in py
+      and "_pn = player_name_setting() or _spk_player[0]" in py,
+      "PTI is told who the player is - the typed name first, then the read one")
+check('_sys += "\\nThe player is %s." % _pn2' in py
+      and "_pn2 = player_name_setting() or _spk_player[0]" in py,
       "and PME the same, under its own prompt")
 check(fp.acpp_token_cap("x" * 400) < fp.TTS_CAP_CEILING,
       "even a long line stays under the ceiling the retry escalation stops at",
@@ -4409,7 +4484,8 @@ _ao = seg(py, "def _tts_acpp_once", "def tts_server_port")
 # is why busy_timeout_ms is the bound that has to work
 for _k in ("max_new_tokens", "max_tokens", "higgs_audio_tts.max_new_tokens"):
     check(_k in _ao, "the token cap is sent as %s" % _k)
-check("_cap, _capnote, _est = tts_auto_cap(text, _st0)" in _ao,
+# retold patch15: the cap now asks which VOICE is speaking
+check("_cap, _capnote, _est = tts_auto_cap(text, _st0, vt=tts_voice_key(ref_path))" in _ao,
       "all from the one figure - the auto cap, which IS the guard when off")
 _as = seg(py, "def tts_acpp_speak", "def _tts_acpp_once")
 check('"EOC" in _msg' in _as, "a differently worded overrun is still recognised as one")
@@ -4419,7 +4495,9 @@ check("_try >= 2" in _as, "and it is tried three times, not for ever")
 # Audio Tags defaults to stripping, and PTI forces it ON for the line it tagged itself -
 # so the player was heard with feeling while every NPC line arrived flat, and nothing
 # anywhere said why. The strip is a setting; being silent about it was the fault.
-_L = "[EMOTION-SADNESS] It has been a long day. [SFX-SIGH] The longest of my life."
+# CONTEMPLATION, not SADNESS: this block is about the translator, and patch41
+# refuses sadness - the check would have been measuring the block instead.
+_L = "[EMOTION-CONTEMPLATION] It has been a long day. [SFX-SIGH] The longest of my life."
 check(fp.tts_tag_count(_L) == 2, "a line's performance tags are counted",
       str(fp.tts_tag_count(_L)))
 check(fp.tts_tag_count("It has been a long day.") == 0, "a plain line carries none")
@@ -4479,11 +4557,15 @@ for _w in ("angry", "fear", "surprised", "whispering", "dramatic", "narration", 
 check(fp.DEF_SETTINGS.get("ttsAcppBusyMs") == "9000",
       "the line time limit is a setting, defaulting to 9s",
       str(fp.DEF_SETTINGS.get("ttsAcppBusyMs")))
-_c0 = json.loads(fp.tts_acpp_config({"settings": {}}))["models"][0]
+# retold patch13: detect mode (the default) floors this clock at 30s so the token
+# cap is the bound; the USER'S clock semantics are pinned under limit mode, where
+# it is the bound.
+_c0 = json.loads(fp.tts_acpp_config({"settings": {"ttsRunawayMode": "limit"}}))["models"][0]
 check(_c0["busy_timeout_ms"] == 9000, "defaulting to 9s, not the old hardcoded 20",
       str(_c0["busy_timeout_ms"]))
 for _v, _want in (("10", 2000), ("999999", 60000), ("abc", 9000), ("", 9000)):
-    _g = json.loads(fp.tts_acpp_config({"settings": {"ttsAcppBusyMs": _v}}))["models"][0]
+    _g = json.loads(fp.tts_acpp_config({"settings": {"ttsAcppBusyMs": _v,
+                                                    "ttsRunawayMode": "limit"}}))["models"][0]
     check(_g["busy_timeout_ms"] == _want,
           "clamped to something a server can honour: %r" % _v, str(_g["busy_timeout_ms"]))
 check("ttsAcppBusyMs" in PAGE, "with a row on the TTS page")
@@ -4494,13 +4576,22 @@ check("server limit" in _as2, "beside the limit that was meant to stop it")
 
 section("the backend takes no settings, and the panel stops pretending otherwise")
 
-# audio.cpp validates its session option list and exits on anything not on it. Only
-# reference_cache_slots is accepted for this family, so temperature, top_k, top_p,
-# repetition_penalty, sample_rate and max_new_tokens are gone rather than left as
-# controls that cannot reach the engine.
+# audio.cpp validates its session option list and exits on anything not on it. On the
+# builds this panel grew up with, reference_cache_slots is the one option the Higgs
+# family accepts - so temperature, top_k, top_p, repetition_penalty, sample_rate and
+# max_new_tokens are gone rather than left as controls that cannot reach the engine.
+# retold patch8: 0.6 dropped even that one, so the option is now CONDITIONAL - written
+# by default, omitted after a refusal (_ACPP_NO_OPTS) or on request (no_opts).
+_keep8o = fp._ACPP_NO_OPTS[0]
+fp._ACPP_NO_OPTS[0] = False
 _so = json.loads(fp.tts_acpp_config({"settings": {}}))["models"][0]["session_options"]
 check(list(_so) == ["higgs_audio_tts.reference_cache_slots"],
-      "one session option is written, the only one this family takes", str(list(_so)))
+      "one session option is written by default, the one older builds accept",
+      str(list(_so)))
+check("session_options" not in
+      json.loads(fp.tts_acpp_config({"settings": {}}, no_opts=True))["models"][0],
+      "and it can be left at home for the builds that refuse it")
+fp._ACPP_NO_OPTS[0] = _keep8o
 for _dead in ("acpp_sampling", "ACPP_SAMPLING", "acpp_session_options", "acpp_proxy_side",
               "acpp_learn_bad_opt", "ttsBackendSide", "ttsAcppTemp", "ttsAcppRate"):
     nin(py, _dead, "and the control that could not reach it is gone: %s" % _dead)
@@ -4605,7 +4696,8 @@ check("Serana > bathe" in _txt, "and written as <who> > <what>", _txt.strip()[:6
 check(fp.ACTION_MARK in _txt, "under a mark of its own, not a spoken one")
 check(_none == "", "None is not an action - it is the commonest answer and would bury the rest")
 check(_off == "", "and nothing at all with the switch off")
-check(fp.DEF_SETTINGS.get("ttsActionOut") == "off", "off by default")
+check(fp.DEF_SETTINGS.get("ttsActionOut") == "on",   # retold p38
+      "on by default - like Thoughts, an off switch reads as a broken feature")
 check('data-act="termActions"' in PAGE, "with a switch in the Options panel")
 
 
@@ -4695,7 +4787,8 @@ check(fp.note_actor(b"## Serana's Character Profile") == "Serana",
       "and a plain name still reads as it always did")
 
 # the Audio Tags buttons, end to end
-check('"ttsTagsOff": ""' in py, "the clicked-off tags are one setting")
+check('"ttsTagsOff": TTS_EMOTION_OFF_WORDS,' in py,
+      "the clicked-off tags are one setting, seeded from the measured six")
 _to25 = fp.tags_off({"ttsTagsOff": "sfx-laughter, EMOTION-ANGER NOT-REAL"})
 check(_to25 == frozenset(("SFX-LAUGHTER", "EMOTION-ANGER")),
       "read case-blind, comma- or space-cut, and only words actually offered",
@@ -4783,7 +4876,8 @@ check("height:" not in _pc39 and "vertical-align" not in _pc39,
 # the Audio Tags field. A blocked tag never reaches the engine whoever wrote it -
 # and a blocked sound effect takes its onomatopoeia with it, which a door on tokens
 # alone did not do: the "Ahem," was written beside the token, not inside it.
-check('"ttsTagsFinalOff": ""' in py, "the gate is one setting")
+check('"ttsTagsFinalOff": TTS_EMOTION_OFF_WORDS,' in py,
+      "the gate is one setting, seeded from the same six")
 check('def tags_off(st, key="ttsTagsOff"):' in py,
       "read by the same parser the prompt board uses, keyed to its own setting")
 _fo32 = fp.tags_off({"ttsTagsFinalOff": "sfx-cough, EMOTION-ANGER pause NOT-REAL"},
@@ -4986,13 +5080,14 @@ check('ev.t === "replay" && ev.id) spkPlay(String(ev.id))' in JS,
 # The requested out-of-the-box defaults, and a page that follows an install: a
 # state event now re-pulls /api/state and repaints the TTS pane, so the Higgs
 # installer's saved folder paths appear without a hand reload.
+# retold patch23: sampler calibration is gone; the reference pair replaces it
 check(fp.DEF_SETTINGS["ttsTags"] == "on"
       and fp.DEF_SETTINGS["ttsMoodEvery"] == "5"
-      and fp.DEF_SETTINGS["ttsSampAutoCal"] == "on"
-      and fp.DEF_SETTINGS["ttsAnswerPing"] == "off"
+      and fp.DEF_SETTINGS["ttsCalTemp"] == "0.8"
+      and fp.DEF_SETTINGS["ttsAnswerPing"] == "banned"   # retold p37
       and fp.DEF_SETTINGS["ttsWrapMode"] == "on",
       "the five requested defaults ship as asked: tags pass, PME every 5, "
-      "calibration Automatic, ping No, the Proxy translates")
+      "Boson's temperature, ping Banned, the Proxy translates")
 check(">The Proxy (no separate wrapper process)</option>" in JS
       and "The panel (no separate" not in JS,
       "the option reads The Proxy now, nowhere still The panel")
@@ -5057,8 +5152,8 @@ check("AUTOCAL_QUIET_GAP_S" not in py and "TTS_LAST_END" not in py,
       "the quiet-gap wait and its clock left with the model fit - nothing to be "
       "quiet for")
 check('"wall": round(float(wall or 0), 2),' in py
-      and "tts_measure_row(text, secs, est, wall)" in py
-      and "wall=synth)" in py,
+      and "tts_measure_row(text, secs, est, wall, vt)" in py   # retold patch15
+      and "wall=(float(TTS_TAKE.get(\"final_s\") or 0.0)" in py,   # retold p18
       "the seconds a line took to MAKE are in its measure row, end to end")
 _pf28 = fp.tts_perf_summary()
 check(isinstance(_pf28, dict) and set(("x", "n", "retries")) <= set(_pf28),
@@ -5120,24 +5215,15 @@ _d30 = fp.tts_headroom_facts(_r30, [])
 check(_d30["h"] < 1.5 and _d30["worst"] == 2.4,
       "run: one freak line no longer sets every cap, and is still reported",
       "h=%.2f worst=%.2f" % (_d30["h"], _d30["worst"]))
-check(fp.AUTOCAL_HEAD_MAX == 1.60 and fp.AUTOCAL_HEAD_MIN == 1.08,
-      "the clamp is a margin, not the pinned-bug era's 2.5")
-_da30 = seg(py, "def autocal_derive_arith", "def autocal_sampler_arith")
+# retold patch20: 1.60 never stopped binding - the fit asked 2.65 for weeks and
+# was clamped every time. The guard bounds the cap; this is a sanity stop.
+check(fp.AUTOCAL_HEAD_MAX == 4.00 and fp.AUTOCAL_HEAD_MIN == 1.08,
+      "the clamp is a sanity stop, and the guard is the working bound")
+_da30 = seg(py, "def autocal_derive_arith", "def autocal_lines_since")
 check("tts_measure_ols(rows)" in _da30 and '"ttsAutoCalMedian"' in _da30,
       "the proxy refit is least squares, written to the same stored fit")
 nin(_da30, "panel_chat", "and it asks no model")
 nin(_da30, "autocal_wait_idle", "and waits for nothing - arithmetic cannot contend")
-_sa30 = seg(py, "def autocal_sampler_arith", "def autocal_lines_since")
-check('"ttsSampAutoCal", "on")).lower() != "on"' in _sa30,
-      "the sampler step runs only under the switch left on")
-check("rate >= 0.08" in _sa30 and "max(0.5," in _sa30 and "max(0.85," in _sa30,
-      "steadier by one bounded notch when the window failed")
-check('rate == 0.0 and len(rows) >= 40 and cur' in _sa30,
-      "and one notch back towards SkyrimNet after a clean full window")
-check('if mark and since <= mark:' in _sa30,
-      "never twice on the same window - the lines must postdate the last change")
-check("calterm_log" in _sa30,
-      "every change carries the numbers that drove it into the feed")
 check('">Player Audio Tags<span class="qm">?</span>' in JS,
       "the tag board is titled Player Audio Tags")
 check(".tail .tl { display:block; min-height:1.5em; line-height:1.5em;" in PAGE
@@ -5188,7 +5274,7 @@ check('def api_slot_log(body):' in py and '"/api/slot-log": api_slot_log,' in py
       "the slot's console log is servable, ANSI-stripped, for the card's terminal")
 check('"srv_%s_*.log" % glob.escape(sid)' in py,
       "and it reads the slot's OWN newest log, the same file the speed reader trusts")
-_ab46 = seg(JS, "const slotBusy = {}, slotPoll = {}, slotLogText = {};",
+_ab46 = seg(JS, "const slotBusy = {}, slotPoll = {}, slotLogText = {}, slotVram = {};",  # retold patch3
             "let exitArmed = false;")
 check('btn.textContent = kind === "launch" ? "Launching Server..." : "Shutting Down..."' in _ab46,
       "the button names the phase the moment it is pressed")
@@ -5209,7 +5295,10 @@ check('Object.keys(slotBusy).forEach(sid => {' in JS,
 # character's own remembered reference, bakes in an inner-monologue echo, and
 # broadcasts it over the same replay stream a spoken line uses. The echo runs
 # LIVE here on a synthetic wav to prove the taps exist and nothing clips.
-check("TTS_REF_BY_NAME[tts_speaker_label(ref_path)] = ref_path" in py,
+# retold patch8: the write goes through the persistence gate now - loaded once,
+# saved when the pairing is new - so the pin follows it there.
+check("TTS_REF_BY_NAME[_lbl8] = ref_path" in py
+      and "_lbl8 = tts_speaker_label(ref_path)" in py,
       "the panel remembers each speaker's last WORKING reference as they speak")
 check('def api_tts_thought(body):' in py
       and '"/api/tts-thought": api_tts_thought,' in py,
@@ -5298,9 +5387,9 @@ check("THOUGHT_FRESH[who] = (rows[-1], time.time())" in py
 _ta48 = seg(py, "_thWho = tts_speaker_label(ref_path)", 'if tts_engine(cfg) == "audiocpp":')
 check("THOUGHT_FRESH.pop(_thWho, None)" in _ta48 and "180.0" in _ta48,
       "a thought is voiced once, for its own line, and staleness is refused")
-check("_thw = _thEnd - time.time() + 0.5" in py
+check("(_thEnd - time.time() + 0.5) if _thEnd else 0.0" in py
       and "_thEnd = time.time() + min(float(_tsec or 0.0), 12.0)" in py
-      and "_hold_s = min(_thw, 12.0)" in py and "time.sleep(_hold_s)" in py
+      and "_hold_s = min(_thw, TTS_FLOOR_CAP_S)" in py and "time.sleep(_hold_s)" in py
       and "t0 += _hold_s" in py,
       "BEFORE holds for the thought's length plus half a second - and the hold "
       "leaves the measured wall by shifting its origin, with its own row")
@@ -5393,31 +5482,33 @@ check('"AE-Impulse": "\\U0001F4A5"' in py and '"AE-Impulse":"\\U0001F4A5"' in py
 # grows half again per attempt, the sampler ladder cools FURTHER per attempt,
 # and the picker plus the seeds know the new marks - an emoji-less factory
 # provider heals to its shipped mark on load.
+# retold patch23: the CAP still escalates; the samplers never do
 check('_cap = int(min(TTS_CAP_CEILING, _cap * (1.5 ** (attempt - 1))))' in py
-      and '(0.8 ** _k)' in py and '- 0.05 * (_k - 1)' in py,
-      "the retry escalates: cap half again per attempt, samplers deeper per step")
+      and "(0.8 ** _k)" not in py and "- 0.05 * (_k - 1)" not in py,
+      "the retry escalates the cap half again per attempt, and nothing else")
 check("\U0001F4A5" in JS and "\u2696\uFE0F" in JS
       and '"emoji": DEFAULT_PROVIDER_EMOJI.get(nm, "")' in py,
       "the picker offers the new marks, and a seeded default CARRIES its mark")
+# retold patch23: the ladder's sampler stepping is REMOVED. Attempts two and three
+# must now be identical - stepping toward greedy decoding is what produced the
+# degenerate repeat this project spent days chasing.
 _rl81 = None
 try:
     _obs81, _cal81 = fp.sn_tts_observed, fp.cal_overrides
     fp.sn_tts_observed = lambda: {"temperature": 0.6, "top_p": 1.0,
                                   "min_p": 0.05, "repetition_penalty": 1.2}
     fp.cal_overrides = lambda st: {}
-    _s81 = {"ttsRetrySafe": "on"}
+    _s81 = {}
+    _a1 = fp.tts_samplers(_s81, 1)
     _a2 = fp.tts_samplers(_s81, 2); _a3 = fp.tts_samplers(_s81, 3)
     fp.sn_tts_observed, fp.cal_overrides = _obs81, _cal81
-    _rl81 = [_a2 != _a3,
-             _a3["temperature"] < _a2["temperature"],
-             _a3["top_p"] < _a2["top_p"],
-             _a3["min_p"] > _a2["min_p"]]
+    _rl81 = [_a1 == _a2, _a2 == _a3, _a1 == {"temperature": 0.6}]
 except Exception:
     _rl81 = None
 if _rl81 is not None:
-    check(_rl81 == [True] * 4,
-          "run: attempts two and three carry DIFFERENT samplers, each cooler and "
-          "tighter than the last - the 12:12 identical-repeat, gone", str(_rl81))
+    check(_rl81 == [True] * 3,
+          "run: every attempt carries the SAME samplers, and only what this engine "
+          "uses reaches it - the narrowing that fed the fault is gone", str(_rl81))
 else:
     check(False, "the ladder run did not RUN")
 _eh81 = None
@@ -5464,10 +5555,13 @@ if _fw82 is not None:
           "with 800, on the SkyrimNet sampler source no less", str(_fw82))
 else:
     check(False, "the final-word run did not RUN")
-check('_arriving = (time.time() - _last_rx) <= 3.5' in py
-      and 'p.get("defer", 0) < 3' in py
+check('(time.time() - _last_rx) <= 3.5' in py
+      and '_cap = 3 if not _held else' in py
+      and 'p.get("defer", 0) < _cap' in py
       and '_unfinished = bool(_nf) and _arriving and not any(' in py,
-      "an unfinished reply earns a defer only while chunks actually arrive")
+      "an unfinished reply earns a defer only while chunks actually arrive - and "
+      "the three-step bound still holds when that is a guess rather than an open "
+      "request")
 _gh82 = None
 try:
     _f82 = []; _d82b = []
@@ -5873,9 +5967,11 @@ check("def listen_host(st=None):" in py,
 check(fp.listen_host({"remoteIp": ""}) == "127.0.0.1"
       and fp.listen_host({"remoteIp": "192.0.2.9"}) == "0.0.0.0",
       "run: no second PC configured means loopback; a remote IP opens the LAN")
-check('_bind = "0.0.0.0" if net_mode() == "lan" else "127.0.0.1"' in py
+# retold p36: the socket is always offered; client_scope is the boundary and is
+# consulted per request, so Remote Access takes effect when it is switched
+check('_bind = "0.0.0.0"' in py
       and "ThreadingHTTPServer((_bind, PORT), Handler)" in py,
-      "the panel page itself binds the LAN only in LAN mode")
+      "the panel page binds the LAN interface, and scope decides who may speak")
 check("_QuietServer((_lh, lp), _mk_handler(self, lp))" in py
       and "_QuietServer((listen_host(st), port), _mk_tts_handler(self))" in py,
       "the proxy and the TTS wrapper both bind by that one rule")
@@ -5941,8 +6037,11 @@ check('data-act="logSrvSlot"' in JS and 'd.act === "logSrvSlot"' in JS
 # character's own cooldown limits. The runs below walk the whole circle.
 check('def tts_npc_mood_arm(who, text, cool=frozenset()):' in py
       and "raw = tts_npc_mood_arm(tts_speaker_label(ref_path), raw," in py
-      and "cool=_cool)" in seg_len(py, "raw = tts_npc_mood_arm", 300),
-      "every NPC chunk is offered its queued completion mood at the one gate")
+      and 'cool=tags_off(st, "ttsTagsFinalOff") | _cool)' in seg_len(
+          py, "raw = tts_npc_mood_arm", 300),
+      "every NPC chunk is offered its queued completion mood at the one gate - and "
+      "the arm is handed the final-off board too, because it forms its own token and "
+      "the wire gate downstream leaves a formed one alone (patch42)")
 _tl70 = seg(py, "def thought_lines(said", "\ndef ", 1)
 check(_tl70.index("MOOD_QUEUE[who] = (_mq, time.time())") < _tl70.index("if not rows:"),
       "the mood capture sits ABOVE the thought guard - a tag-only reply with no "
@@ -6024,8 +6123,10 @@ else:
 # ends, whatever was injected in front - and only a FRESH reply may claim
 # anything; stale or unknown stands the defer down and the chain fires as
 # patch170 did.
-check("if not full or time.time() - full[1] > 25.0:" in py
-      and "return _n >= min(12, len(nf), len(nc))" in py
+# retold p38: the two guards are split so each can say WHY, and the result is
+# held in _ok so a failure can be explained before it is returned
+check("if time.time() - full[1] > 25.0:" in py
+      and "_ok = _n >= min(12, len(nf), len(nc))" in py
       and "_cs172(_nf, r[2]) >= min(12, len(_nf), len(r[2]))" in py,
       "final by common suffix, judged only against a fresh reply - both sides")
 _fs72 = None
@@ -6203,7 +6304,7 @@ check('self.log("   Banned Tags: %s" % ", ".join(' in py
       "the two rows print, and only when they have something to say")
 check("def tag_cooldown_report(key, limits, exclude=frozenset()):" in py
       and "return frozenset(hits)" in py
-      and 'or ("%s:%s" % pick) in cool' in py,
+      and 'if ("%s:%s" % pick) in cool:' in py,
       "note returns what it recorded, report counts down, the armer refuses "
       "a cooling pair outright")
 _tc77 = None
@@ -6387,8 +6488,8 @@ check("sn_tts_observed()" in _sr and "SN_TTS_FORWARD" in _sr,
       "the request carries the ones the engine has a name for")
 check("tts_samplers(_st0, attempt)" in seg(py, "def _tts_acpp_once", "def tts_server_port"),
       "and gets them from that one rule")
-check(set(fp.SN_TTS_FORWARD) == {"temperature", "top_p", "min_p", "repetition_penalty"},
-      "which is four of them; pace and expressiveness have no counterpart and are only "
+check(set(fp.SN_TTS_FORWARD) == {"temperature", "top_k"},   # retold p23
+      "which is two of them; the rest have no counterpart this engine uses have no counterpart and are only "
       "observed", str(sorted(fp.SN_TTS_FORWARD)))
 
 section("TTS Calibration is one section, one terminal, in order")
@@ -6449,7 +6550,7 @@ nin(_ls, '!= "serving"', "but a card that is merely stopped still is - it is a s
 check('"state": state' in _ls, "with that state shown")
 
 # what a calibration may change, and how far
-check(len(fp.CAL_KNOBS) >= 5, "there are bounded knobs to set", str(len(fp.CAL_KNOBS)))
+check(len(fp.CAL_KNOBS) >= 4, "there are bounded knobs to set", str(len(fp.CAL_KNOBS)))
 # (cal_apply left in the patch155 sweep with the model calibration that called it)
 check(fp.cal_overrides({"ttsCalTemp": "0.7"}) == {"temperature": 0.7},
       "a calibrated value becomes a request override")
@@ -7198,7 +7299,7 @@ section("names when nothing has passed through the proxy")
 _sl2 = seg(py, "def tts_speaker_label", "def tts_parse_multipart")
 check("or tts_voice_name(path)" in _sl2,
       "an unlearned voice falls back to its voicetype rather than failing")
-_sfv = seg(py, "def speaker_for_voice", "def player_name_unread")
+_sfv = seg(py, "def speaker_for_voice_ex", "def player_name_unread")  # retold patch4
 check("return _spk_player[0]" in _sfv and 'return "Player"' in _sfv,
       "and the player is Player until named")
 
@@ -7672,15 +7773,15 @@ check("PROXY.busy(s.get(\"port\") or 0)" in py and "requests open now" in py,
 # a drafter that loads through the speculative path needs the speculative flags,
 # not --model-draft.
 check("DRAFT_ARCHS = frozenset((" in py and '"dflash"' in py
-      and "if arch in DRAFT_ARCHS" in py,
+      and "if is_draft_arch(arch) or any(" in py,
       "a drafter that names its own architecture is taken at its word")
-check('if hint == "vision" and meta.get(arch + ".block_count")' in py,
+check('if sc.get("vision") and not meta.get(arch + ".block_count")' in py,
       "and a model that CARRIES a vision tower is still the model that runs - "
       "Muse Glimmer is image-text-to-text in one file")
-check("def draft_launch_args(draft_path" in py
-      and '("--spec-type", "draft-dflash")' in py
-      and 'meta.get("dflash.block_size")' in py,
-      "the drafter's own block size is the draft depth, read from its header")
+check("def draft_launch_args(draft_path" in py and "def draft_spec_type(path):" in py
+      and 'out = [("--spec-draft-model", p), ("--spec-type", kind)]' in py
+      and "draft_n_max_ceiling(meta, kind)" in py,   # retold p25
+      "EVERY drafter leaves with its type, and a DFlash one with its block size too")
 
 
 def _mkgguf85(path, kvs, tensors):
@@ -7739,16 +7840,18 @@ try:
     _cv85 = fp.draft_launch_args(_pl85, "99")
     _no85 = [f for f, _v in fp.draft_launch_args(_dr85, "")]
     _a85 = [_sp85 == [("--spec-draft-model", _dr85), ("--spec-type", "draft-dflash"),
-                      ("--spec-draft-n-max", "16"), ("--spec-draft-ngl", "99")],
-            _cv85 == [("--model-draft", _pl85)],
+                      ("--spec-draft-n-max", "15"), ("--spec-draft-ngl", "99")],
+            _cv85 == [("--spec-draft-model", _pl85), ("--spec-type", "draft-simple"),
+                      ("--spec-draft-ngl", "99")],
             "--spec-draft-ngl" not in _no85]
 except Exception:
     _a85 = None
 if _a85 is not None:
     check(_a85 == [True, True, True],
-          "run: a DFlash drafter is launched through the speculative flags with its "
-          "own block size, a conventional drafter keeps --model-draft, and the "
-          "drafter is never placed on a card the user did not name", str(_a85))
+          "run: a DFlash drafter is launched with its own block size as the depth, a "
+          "plain small drafter with draft-simple - both TYPED, since an untyped "
+          "drafter drafts nothing - and neither is placed on a card the user did "
+          "not name", str(_a85))
 else:
     check(False, "the draft-flags run did not RUN")
 
@@ -7775,7 +7878,7 @@ try:
     _mix85 = fp.render_launcher_lines(_t85c, "x.ps1", "llama-server.exe")
     _g85 = ['"--spec-draft-model", "%s"' % _dr85 in _txt85,
             '"--spec-type", "draft-dflash"' in _txt85,
-            '"--spec-draft-n-max", "16"' in _txt85,
+            '"--spec-draft-n-max", "15"' in _txt85,   # retold p25
             "--model-draft" not in _txt85,
             not any("--model-draft" in ln for ln in _on85),
             not any(any(f in ln for f in fp.DRAFT_SPEC_FLAGS) for ln in _off85),
@@ -7791,9 +7894,10 @@ if _g85 is not None:
 else:
     check(False, "the launcher-flags run did not RUN")
 
-check('_KIND_RULES = "188"' in py and '_m.get("_rules") == _KIND_RULES' in py,
+check('_KIND_RULES = "375p2"' in py and '_m.get("_rules") == _KIND_RULES' in py,
       "and a cache of verdicts reached under the OLD rule is dropped, not trusted - "
-      "the drafter was already remembered as a plain model")
+      "the drafter was already remembered as a plain model, and the qwen35 heads "
+      "were remembered before the tensor rule existed")
 
 # ---------------------------------------------------------------- patch186
 # A hand-edited launcher is edited in place, flag by flag - but the two optional
@@ -7860,16 +7964,17 @@ try:
              "--model-draft" not in _offtxt86,
              "DFlash, verified on this build" in _offtxt86,
              '"--temp", "1.0"' in _offtxt86,
-             '"--model-draft", "%s"' % _pl86 in _conv86,
-             not any(_f in _conv86 for _f in fp.DRAFT_SPEC_FLAGS)]
+            '"--spec-draft-model", "%s"' % _pl86 in _conv86,
+            '"--spec-type", "draft-simple"' in _conv86,
+            "--model-draft" not in _conv86]
 except Exception:
     _rt86 = None
 if _rt86 is not None:
-    check(_rt86 == [True] * 9,
+    check(_rt86 == [True] * 10,
           "run: every card setting survives card -> hand-edited launcher -> card, "
           "Disabled removes the whole speculative block while the comment and the "
           "sampler line around it stay, and swapping a DFlash assistant for a plain "
-          "drafter takes the speculative flags out with it", str(_rt86))
+          "drafter re-types it rather than dropping to an untyped flag", str(_rt86))
 else:
     check(False, "the card round-trip run did not RUN")
 
@@ -8078,6 +8183,308 @@ if _fa90 is not None:
           "cannot be armed", str(_fa90))
 else:
     check(False, "the free-allocation run did not RUN")
+
+# ------------------------------------------------------- v3.75 patch1 (hotfix)
+# llama.cpp runs NO speculation unless it is told which kind: --spec-type
+# defaults to none, and only a HuggingFace sidecar download fills it in by
+# itself. A local drafter named with --model-draft alone therefore loads, holds
+# its VRAM and drafts not one token - silently. The owner's Gemma 4 assistants
+# did exactly that ("no implementations specified for speculative decoding"),
+# and only the decode speed showed it. Every drafter now leaves with its type,
+# derived from the architecture it declares.
+check("def draft_spec_type(path):" in py and "def _spec_kind(arch, scan):" in py
+      and '"draft-mtp"' in py and '"draft-eagle3"' in py and '"draft-simple"' in py
+      and "def is_draft_arch(arch):" in py and 'a.endswith("-assistant")' in py,
+      "a head shipped beside a family is a drafter, and each kind has its type")
+_sp1 = None
+try:
+    _d1 = tempfile.mkdtemp()
+    _mk1 = {}
+    for _nm, _ar, _extra in (
+            ("gemma4-31B-it-assistant-Q8_0.gguf", "gemma4-assistant",
+             {"gemma4-assistant.block_count": (4, 4)}),
+            ("Muse-Glimmer-30B-assistant-Q8_0.gguf", "dflash",
+             {"dflash.block_size": (4, 16)}),
+            ("eagle3-head.gguf", "eagle3", {}),
+            ("Qwen3-0.6B-Q8_0.gguf", "qwen3", {"qwen3.block_count": (4, 28)}),
+            ("gemma4-31B-it-Q6_K.gguf", "gemma4", {"gemma4.block_count": (4, 62)})):
+        _p1 = os.path.join(_d1, _nm)
+        _kv1 = {"general.architecture": (8, _ar)}
+        _kv1.update(_extra)
+        _mkgguf85(_p1, _kv1,
+                  ["token_embd.weight"] + ["blk.%d.attn_q.weight" % i for i in range(4)])
+        _mk1[_ar] = _p1
+    _t1 = lambda a: dict(fp.draft_launch_args(_mk1[a], "99")).get("--spec-type")
+    _sp1 = [fp._model_kind_read(_mk1["gemma4-assistant"]) == "draft",
+            fp._model_kind_read(_mk1["gemma4"]) == "main",
+            _t1("gemma4-assistant") == "draft-mtp",
+            _t1("dflash") == "draft-dflash",
+            _t1("eagle3") == "draft-eagle3",
+            _t1("qwen3") == "draft-simple",
+            dict(fp.draft_launch_args(_mk1["dflash"], "99")).get("--spec-draft-n-max") == "15",
+            "--spec-draft-n-max" not in dict(fp.draft_launch_args(_mk1["gemma4-assistant"], "99")),
+            all("--model-draft" not in dict(fp.draft_launch_args(_p, "99"))
+                for _p in _mk1.values())]
+except Exception:
+    _sp1 = None
+if _sp1 is not None:
+    check(_sp1 == [True] * 9,
+          "run: an assistant head reads as a DRAFTER while the model it drafts for "
+          "stays a model; MTP, DFlash, EAGLE-3 and a plain small model each leave "
+          "with their own --spec-type; only DFlash carries a block depth; and no "
+          "drafter leaves with a bare --model-draft that would draft nothing",
+          str(_sp1))
+else:
+    check(False, "the spec-type run did not RUN")
+_lp1 = None
+try:
+    _cfg1 = {"settings": {}, "gpus": []}
+    _gm1 = _mk1["gemma4-assistant"]
+    _own1 = "\n".join(['$llamaArgs = @(', '    "-m", "main.gguf",',
+                       '    "--n-gpu-layers", "99",', '',
+                       '    # --- speculative decoding: MTP ---',
+                       '    "--model-draft", "%s",' % _gm1, '',
+                       '    "--temp", "1.0",', ')'])
+    _s1 = {"id": "s1", "port": 1236,
+           "params": {"model": "main.gguf", "draft": _gm1, "vision": "N/A", "ngl": "99"}}
+    _o1 = _own1
+    for _f, _v in sorted(fp.slot_flag_values(_cfg1, _s1, _own1, ["draft"]).items()):
+        _o1 = fp.ps1_set_flag(_o1, _f, _v,
+                              after=fp.CTK_AFTER if _f == fp.CTK_FLAG else None)
+    _gen1 = fp.build_param_launcher(_cfg1, {"id": "s2", "port": 1237, "label": "G",
+                                            "gpuId": "", "params": {"model": "main.gguf",
+                                            "draft": _gm1, "ngl": "99"}},
+                                    os.path.join(_d1, "gen.ps1"))
+    _lp1 = ['"--spec-type", "draft-mtp"' in _o1,
+            "--model-draft" not in _o1,
+            "speculative decoding: MTP" in _o1 and '"--temp", "1.0"' in _o1,
+            '"--spec-type", "draft-mtp"' in _gen1,
+            "--model-draft" not in _gen1]
+except Exception:
+    _lp1 = None
+if _lp1 is not None:
+    check(_lp1 == [True] * 5,
+          "run: a launcher that named a drafter the OLD way is corrected in place - "
+          "the type arrives, the dead flag goes, and everything a person wrote "
+          "around it stays; the generated launcher agrees", str(_lp1))
+else:
+    check(False, "the launcher-upgrade run did not RUN")
+
+# ------------------------------------------------------------------ v3.75 patch2
+# llama.cpp types a drafter by its TENSORS, not its architecture
+# (common_speculative_types_from_gguf): a non-DFlash file is an MTP drafter iff
+# it carries blk.{block_count-1}.nextn.eh_proj.weight, and a DFlash-arch file
+# with a Markov head is DSpark. The qwen35-generation heads declare the FAMILY
+# architecture, so the architecture-only rule sent them out as draft-simple and
+# llama-server tried to load a one-layer head file as a 65-layer model. The same
+# tensor, inside a full model, means the model drafts for ITSELF - the card says
+# so. And the tensor that proves all of this sits at the END of the list, so a
+# scan capped at the first few hundred names could never have seen it.
+check("def gguf_tensor_scan(path, block_count=0):" in py
+      and '"blk.%d.nextn.eh_proj.weight" % (int(block_count or 0) - 1)' in py
+      and "for _ in range(ntensor):" in py and "range(min(ntensor" not in py,
+      "every tensor name is read, and the MTP tensor llama.cpp looks for is "
+      "looked for by its exact name at the last block")
+check('return "draft-dspark" if sc.get("markov") else "draft-dflash"' in py
+      and 'or sc.get("nextn_last") or sc.get("mtp_names"):' in py,
+      "the Markov head tells DSpark from DFlash, and the nextn/mtp tensors make "
+      "an MTP drafter of a file whatever architecture it declares")
+check('"mtpHead": bool(kind == "main" and (scan or {}).get("nextn_last"))' in py
+      and '"spec": _spec_kind(arch, scan)' in py,
+      "a file's facts carry the speculation kind it would perform and whether, "
+      "as a model, it drafts for itself")
+check('return "main" if sc.get("blk0") else "draft"' in py,
+      "the SAME tensor reads two ways: with the blocks before it, a model that "
+      "drafts for itself; alone, that head extracted into a drafter file")
+# retold patch12: the note is the yellow chip now, worded as the picker option
+check("'Built-in MTP head</span></div>'" in py and "chosen.mtpHead" in py
+      and py.count("mtpHead") >= 4,
+      "and the card says so, under the model it belongs to")
+check('"qwen35": "Qwen 3.5/3.8 family"' in py
+      and '"qwen35moe": "Qwen 3.5/3.8 family (MoE)"' in py,
+      "the qwen35 generation is named, not guessed from a prefix")
+check('range:"draft-simple | draft-mtp | draft-eagle3 | draft-dflash | draft-dspark"' in py,
+      "the guide states the real types, DSpark included")
+check('!/^-?[0-9]+$/.test(tk.trim())' in py and "usually belongs to --top-p" in py,
+      "the launcher check flags an integer flag handed a fraction - a top-k of "
+      "0.95 reads as 0 and turns the sampler off in silence")
+
+_p2 = None
+try:
+    _d2 = tempfile.mkdtemp()
+    _nm2 = ["token_embd.weight"]
+    for _i2 in range(64):
+        _nm2 += ["blk.%d.attn_q.weight" % _i2, "blk.%d.ffn_up.weight" % _i2,
+                 "blk.%d.ffn_down.weight" % _i2, "blk.%d.attn_norm.weight" % _i2,
+                 "blk.%d.ffn_gate.weight" % _i2, "blk.%d.attn_output.weight" % _i2,
+                 "blk.%d.attn_v.weight" % _i2]
+    _nm2 += ["blk.64.attn_q.weight", "blk.64.nextn.eh_proj.weight",
+             "blk.64.nextn.enorm.weight", "output.weight"]
+    _mn2 = os.path.join(_d2, "Omega-Convergence-27B-v1.0-q8_0.gguf")
+    _mkgguf85(_mn2, {"general.architecture": (8, "qwen35"),
+                     "qwen35.block_count": (4, 65),
+                     "qwen35.context_length": (4, 262144)}, _nm2)
+    _hd2 = os.path.join(_d2, "mtp-Omega-Convergence-27B-v1.0-q8_0.gguf")
+    _mkgguf85(_hd2, {"general.architecture": (8, "qwen35"),
+                     "qwen35.block_count": (4, 65)},
+              ["blk.64.attn_q.weight", "blk.64.nextn.eh_proj.weight",
+               "blk.64.nextn.enorm.weight"])
+    _ds2 = os.path.join(_d2, "dspark-drafter.gguf")
+    _mkgguf85(_ds2, {"general.architecture": (8, "dflash"),
+                     "dflash.block_size": (4, 16), "dflash.block_count": (4, 5)},
+              ["markov_w1.weight", "token_embd.weight", "blk.0.attn_q.weight"])
+    _fm2 = fp._model_facts_read(_mn2)
+    _fh2 = fp._model_facts_read(_hd2)
+    _fd2 = fp._model_facts_read(_ds2)
+    _lah2 = fp.draft_launch_args(_hd2, "99")
+    _lad2 = fp.draft_launch_args(_ds2, "99")
+    _p2 = [len(_nm2) > 400 and _fm2["kind"] == "main" and _fm2["mtpHead"] is True
+           and _fm2["spec"] == "draft-mtp" and _fm2["label"] == "Qwen 3.5/3.8 family",
+           _fh2["kind"] == "draft" and _fh2["mtpHead"] is False
+           and _fh2["spec"] == "draft-mtp",
+           _fd2["kind"] == "draft" and _fd2["spec"] == "draft-dspark",
+           _lah2 == [("--spec-draft-model", _hd2), ("--spec-type", "draft-mtp"),
+                     ("--spec-draft-ngl", "99")],
+           _lad2 == [("--spec-draft-model", _ds2), ("--spec-type", "draft-dspark"),
+                     ("--spec-draft-n-max", "16"), ("--spec-draft-ngl", "99")]]
+except Exception:
+    _p2 = None
+if _p2 is not None:
+    check(_p2 == [True] * 5,
+          "run: a qwen35 model whose MTP head sits past the 400th tensor name is a "
+          "MODEL that drafts for itself and the card knows it; the head extracted "
+          "into its own file is a DRAFTER that leaves as draft-mtp, not "
+          "draft-simple; a Markov-headed DFlash file leaves as draft-dspark with "
+          "its block depth", str(_p2))
+else:
+    check(False, "the tensor-rule run did not RUN")
+
+
+# The same hotfix, second half. llama.cpp's memory fitting builds a throwaway
+# probe context for the drafter before the target model exists, so a head that
+# must attach to the target - Gemma 4 assistant, DFlash, EAGLE-3 - always throws
+# there. llama.cpp catches it, says so in the message, and loads the drafter
+# properly a moment later. Raised as an ERROR it sent the owner hunting a
+# parameter that does not exist; it is noted now, not raised. Nothing else
+# softens: a real load failure is still a failure.
+check("BENIGN_RX = re.compile(" in py and "requires ctx_other to be set" in py
+      and "if BENIGN_RX.search(line):" in py
+      and "ERR_RX.search(ln) and not BENIGN_RX.search(ln)" in py
+      and 'if "fit" not in BENIGN_SEEN:' in py,
+      "the fitting probe's self-declared warning is kept out of the error log AND "
+      "out of the issue list, explained once instead")
+_bn1 = None
+try:
+    _real1 = [
+        "llama_init_from_model: failed to initialize the context: Gemma4Assistant "
+        "requires ctx_other to be set (this warning is normal during memory fitting)",
+        "srv    load_model: [spec] failed to measure draft model memory: failed to "
+        "create llama_context from model",
+        "srv    load_model: [spec] failed to measure MTP context memory: failed to "
+        "create llama_context from model"]
+    _still1 = [
+        "ggml_cuda_host_malloc: failed to allocate pinned memory: out of memory",
+        "srv    load_model: failed to load model 'x.gguf'",
+        "common_speculative_init_result: failed to create MTP context",
+        "srv    load_model: [spec] failed to measure draft model memory: CUDA out of "
+        "memory".replace("failed to measure draft model memory", "loaded nothing")]
+    # and the WATCHER itself, over a log holding both kinds twice over: keeping
+    # them out of the error file was not enough, because the issue list decides a
+    # line's severity from its own words and "failed" is in this one
+    _d1b = tempfile.mkdtemp()
+    _notes1 = []
+    _pl1 = fp.panel_log
+    fp.panel_log = lambda m: _notes1.append(m)
+    open(os.path.join(_d1b, "srv_gate1_9.log"), "w", encoding="utf-8").write(
+        "=== hdr ===\n" + "\n".join(_real1 * 2 + _still1) + "\n")
+    _keepLog, _keepTot = list(fp.ERR_LOG), fp.ERR_TOTAL[0]
+    _keepLvl, _keepTyp = dict(fp.ERR_BY_LEVEL), dict(fp.ERR_BY_TYPE)
+    _keepFile = fp.ERR_FILE[0]
+    del fp.ERR_LOG[:]
+    fp.ERR_TOTAL[0] = 0
+    fp.ERR_BY_LEVEL.clear(); fp.ERR_BY_TYPE.clear()
+    fp.ERR_FILE[0] = os.path.join(_d1b, "error_1.log")
+    open(fp.ERR_FILE[0], "w", encoding="utf-8").write("=== hdr ===\n")
+    fp.scan_slot_errors("gate1", "Gate Server", _d1b)
+    _rows1 = [_e["title"] for _e in fp.ERR_LOG]
+    _filelines = len(open(fp.ERR_FILE[0], encoding="utf-8").read().strip().split("\n")) - 1
+    fp.panel_log = _pl1
+    del fp.ERR_LOG[:]
+    fp.ERR_LOG.extend(_keepLog)
+    fp.ERR_TOTAL[0] = _keepTot
+    fp.ERR_BY_LEVEL.clear(); fp.ERR_BY_LEVEL.update(_keepLvl)
+    fp.ERR_BY_TYPE.clear(); fp.ERR_BY_TYPE.update(_keepTyp)
+    fp.ERR_FILE[0] = _keepFile
+    _bn1 = [all(fp.BENIGN_RX.search(_l) for _l in _real1),
+            all(fp.ERR_RX.search(_l) for _l in _real1),
+            not any(fp.BENIGN_RX.search(_l) for _l in _still1),
+            all(fp.ERR_RX.search(_l) for _l in _still1),
+            len(_rows1) == len(_still1),
+            not any("ctx_other" in _r or "measure draft model" in _r for _r in _rows1),
+            _filelines == len(_still1),
+            len(_notes1) == 1]
+except Exception:
+    _bn1 = None
+if _bn1 is not None:
+    check(_bn1 == [True] * 8,
+          "run: the fitting lines read as failures and are recognised as benign, and "
+          "the WATCHER puts neither in the error file nor in the issue list, saying "
+          "once why - while a real out-of-memory, a real load failure and a real MTP "
+          "context failure all still land in both", str(_bn1))
+else:
+    check(False, "the benign-line run did not RUN")
+
+# ------------------------------------------------- v3.75 hotfix1, third part
+# A voice read a tag aloud. Three things had to line up: SkyrimNet's prompt asks
+# the model for LOWERCASE tags while the panel only ever recognised the mod's own
+# ALL-CAPS ones; the model put one before a full stop, so the sentence split fell
+# through it; and what arrived - "[prosody-expressive_low." - had lost its closing
+# bracket upstream. The panel is the last thing between the text and a voice, so
+# it now reads a tag in any case, survives a damaged one, deletes anything merely
+# tag-SHAPED, and holds a tag whose chunk carried no words for the words that
+# follow instead of speaking it.
+check("re.I)" in seg_len(py, "TTS_CAPS_RX = re.compile(", 400)
+      and "TTS_TAGSHAPE_RX = re.compile(" in py and "TAG_CARRY = {}" in py
+      and "def tts_wordless(text):" in py
+      and "if tts_wordless(processed):" in py
+      and "tag with no words - held for the next line" in py,
+      "tags are read in any case, damaged or not, and a chunk with no words for a "
+      "voice to say holds its tags for the next one instead of being spoken")
+_tg1 = None
+try:
+    _ap = lambda s: fp.tts_apply_tags(s, True, "audiocpp")
+    _field = _ap("[prosody-expressive_low.")           # exactly what arrived
+    _low = _ap("[emotion-bitterness]Sigh, yes.")       # the prompt's own casing
+    _caps = _ap("[EMOTION-ANGER]Get out.")             # the mod's casing
+    _unknown = _ap("[emotion-nosuchfeeling]Hello there.")
+    _bare = _ap("prosody-speed_fast Quickly now.")     # brackets lost entirely
+    _dialogue = _ap("Meet me at the [Bannered Mare] tonight.")
+    _notes = _ap("I keep my notes in [brackets] sometimes.")
+    _words = lambda s: fp.TTS_TAG_ANY_RX.sub("", s).strip(" .,!?;:\"'")
+    _tg1 = [_field == "<|prosody:expressive_low|>.",
+            _words(_field) == "",
+            "<|emotion:bitterness|>" in _low and _words(_low) == "Sigh, yes",
+            "<|emotion:anger|>" in _caps,
+            _unknown == "Hello there.",
+            "<|prosody:speed_fast|>" in _bare,
+            _dialogue == "Meet me at the [Bannered Mare] tonight.",
+            _notes == "I keep my notes in [brackets] sometimes.",
+            not any(_w in _words(_x).lower() for _w in
+                    ("emotion", "prosody", "style", "sfx")
+                    for _x in (_field, _low, _caps, _unknown, _bare)),
+            fp.tts_wordless(_field) and not fp.tts_wordless(_low),
+            fp.tts_wordless("<|emotion:anger|> . ") and not fp.tts_wordless("Oh.")]
+except Exception:
+    _tg1 = None
+if _tg1 is not None:
+    check(_tg1 == [True] * 11,
+          "run: the field's damaged tag becomes a token and leaves NO words, a "
+          "lowercase tag and an ALL-CAPS one both convert, an unknown value and a "
+          "bracketless one are removed rather than spoken, real dialogue brackets "
+          "are untouched, no family word survives into speech, and a chunk left "
+          "with only a token counts as wordless", str(_tg1))
+else:
+    check(False, "the tag-recognition run did not RUN")
 
 for name in ("ProxyManager", "api_settings", "_mk_handler", "api_provider_add",
              "load_config", "save_config", "redact_state", "api_tail"):
@@ -8590,7 +8997,7 @@ _rc = seg(JS, "function renderCurrent", "function renderRouting")
 check("renderTts" in _rc,
       "the TTS pane redraws from renderCurrent, which runs AFTER state is fetched")
 check("dpane-tts" in _rc, "TTS redraw stands aside for a focused field")
-_lr = seg(JS, "function liveRefresh", "async function stateRepull")
+_lr = seg(JS, "function liveRefresh", "async function ttsInstalled")
 check("renderTts" not in _lr,
       "not redrawn from liveRefresh, which runs BEFORE the state fetch and would use stale data")
 check("stop_tts_server" in py and 'sse_notify("state")' in _ss,
@@ -8830,6 +9237,3801 @@ process.exit(0);          // the page's interval loop never lets node exit (sect
               "and neither press touches the other feature's setting", _to)
     except Exception as e:
         check(False, "jsdom harness ran", (r.stderr or r.stdout)[:300] or str(e))
+
+
+# ------------------------------------------------------------------ v3.75 patch3
+# A model with its own MTP head is its own drafter; a dialogue reply that OPENS
+# with the thought is served dialogue-first; thoughts leave whole; the card
+# reads its VRAM report from llama.cpp's lines and does not trust the
+# launcher's STATUS; a held-but-silent port names both of its causes.
+section("v3.75 patch3: builtin MTP, leading-thought reorder, VRAM report")
+
+check('DRAFT_BUILTIN = "@builtin-mtp"' in py,
+      "the builtin drafter sentinel exists, path-unlike by design")
+check('if p == DRAFT_BUILTIN:' in py and '[("--spec-type", "draft-mtp")]' in py,
+      "draft_launch_args answers the sentinel with the type and nothing else")
+check('"draft-mtp" in (grab("--spec-type") or "")' in py,
+      "a launcher naming the type with no draft file reads back as the builtin")
+check('drf_builtin = str(t.get("draft") or "") == DRAFT_BUILTIN' in py,
+      "the launcher renderer knows builtin is not off")
+check('def reorder_leading_thought(' in py and 'class ThoughtReorderStream' in py
+      and '_LEAD_THOUGHT_RX' in py,
+      "the leading-thought rule exists in pure and streamed form")
+check('rw = ThoughtReorderStream() if rt["title"] == "Dialogue" else None' in py
+      and 'reorder_leading_thought(_m0.get("content")' in py,
+      "the relay reorders Dialogue replies only, on both paths")
+check('" ".join(m.split())[:400]' not in py
+      and 'never capped: this list feeds the thought-audio pass' in py,
+      "thought rows are uncapped, and the reason is written where the cap was")
+check('def slot_vram_report(' in py and '"STATUS: loaded"' in py
+      and 'over a launch that died' in py,
+      "the VRAM report parser exists and distrusts the launcher's STATUS line")
+check('Server process exited before it became ready' in py
+      and 'port held but nothing answers on it' in py,
+      "a dead launch is detected, and the wedged verdict names both causes")
+check('id="vram-' in py and 'function vramTick' in py and '.vramline {' in py,
+      "the report strip sits above the card terminal and is polled")
+check('Built-in MTP head &#8212; the model drafts for itself' in py
+      and 'carries no ' in py,
+      "the picker offers the builtin head and calls out a headless model in red")
+
+import tempfile as _tf3
+_NL3 = chr(10)
+try:
+    _bi3 = fp.DRAFT_BUILTIN
+    _a3 = fp.draft_launch_args(_bi3, "99") == [("--spec-type", "draft-mtp")]
+    _s3 = {"id": "s1", "port": 1236,
+           "params": {"model": "m.gguf", "draft": _bi3, "vision": "N/A", "ngl": "99"}}
+    _fv3 = fp.slot_flag_values({"settings": {}, "gpus": []}, _s3, "", ["draft"])
+    _b3 = (_fv3.get("--spec-type") == "draft-mtp"
+           and _fv3.get("--spec-draft-model") is None
+           and _fv3.get("--spec-draft-ngl") is None
+           and _fv3.get("--model-draft") is None
+           and _fv3.get("--spec-draft-n-max") is None)
+    _own3 = _NL3.join(['$llamaArgs = @(', '    "-m", "main.gguf",',
+                       '    "--spec-draft-model", "OLD.gguf",',
+                       '    "--spec-draft-ngl", "99",',
+                       '    "--spec-type", "draft-simple",',
+                       '    "--temp", "1.0",', ')'])
+    _o3 = _own3
+    for _f3, _v3 in sorted(_fv3.items(), key=lambda x: (x[1] is None, x[0])):
+        _o3 = fp.ps1_set_flag(_o3, _f3, _v3,
+                              after=fp.CTK_AFTER if _f3 == fp.CTK_FLAG else None)
+    _c3 = ('"--spec-type", "draft-mtp"' in _o3 and "OLD.gguf" not in _o3
+           and "--spec-draft-ngl" not in _o3 and '"--temp", "1.0"' in _o3)
+    _tpl3 = _NL3.join(['$llamaArgs = @(', '    "-m", "<MODEL_PATH>",',
+                       '    "--spec-draft-model", "<DRAFT_PATH>",',
+                       '    "--spec-draft-ngl", "99",', ')'])
+    _rl3 = _NL3.join(fp.render_launcher_lines(
+        {"content": _tpl3, "model": "m.gguf", "draft": _bi3, "vision": "N/A",
+         "gpu": "", "port": 1236, "title": "T"}, "x.ps1", "llama-server.exe"))
+    _d3ok = ('"--spec-type", "draft-mtp"' in _rl3 and "<DRAFT_PATH>" not in _rl3
+             and "--spec-draft-model" not in _rl3 and "--spec-draft-ngl" not in _rl3)
+    _pb3 = fp.parse_launcher_params('$llamaArgs = @(' + _NL3
+                                    + '    "--spec-type", "draft-mtp",' + _NL3 + ')')
+    _pc3 = fp.parse_launcher_params('$llamaArgs = @(' + _NL3
+                                    + '    "--spec-draft-model", "D:' + chr(92) + 'h.gguf",'
+                                    + _NL3 + '    "--spec-type", "draft-mtp",' + _NL3 + ')')
+    _e3 = (_pb3.get("draft") == _bi3
+           and _pc3.get("draft") == "D:" + chr(92) + "h.gguf")
+    _run3 = [_a3, _b3, _c3, _d3ok, _e3]
+except Exception:
+    _run3 = None
+if _run3 is not None:
+    check(_run3 == [True] * 5,
+          "run: the builtin head travels the whole pipeline - launch args, the "
+          "surgical map, an in-place rewrite that keeps a person's tuning, a "
+          "generated launcher, and both read-back directions", str(_run3))
+else:
+    check(False, "the builtin-head pipeline run did not RUN")
+
+try:
+    _T3 = "<internal_thought>the plan</internal_thought>"
+    _cases3 = [
+        ("hello there", "hello there"),
+        (_T3, _T3),
+        (_T3 + " Speak now.", " Speak now." + _NL3 + _T3),
+        ("[tag1][tag2]" + _T3 + "Words.", "[tag1][tag2]Words." + _NL3 + _T3),
+        ("Words first. " + _T3 + " More words.", "Words first. " + _T3 + " More words."),
+        (_T3 + "d1 words<internal_thought>t2</internal_thought>d2",
+         "d1 words" + _NL3 + _T3 + "<internal_thought>t2</internal_thought>d2"),
+        (_T3 + "   ", _T3 + "   "),
+    ]
+    _pure3 = all(fp.reorder_leading_thought(a) == b for a, b in _cases3)
+    import json as _js3
+    def _sse3(txt):
+        return (b"data: " + _js3.dumps(
+            {"choices": [{"index": 0, "delta": {"content": txt}}]}).encode()
+            + chr(10).encode() * 2)
+    _stream3 = True
+    for _a, _want in _cases3:
+        for _sz in (1, 3, 7, 50, 4096):
+            _rw = fp.ThoughtReorderStream()
+            _outs = []
+            for _i in range(0, len(_a), _sz):
+                _ck = _a[_i:_i + _sz]
+                _outs.extend(_rw.feed(_sse3(_ck),
+                                      {"choices": [{"delta": {"content": _ck}}]}))
+            _outs.extend(_rw.feed(b"data: [DONE]" + chr(10).encode() * 2, None))
+            _got = []
+            for _ln in _outs:
+                _st = _ln.strip()
+                if not _st.startswith(b"data: ") or _st == b"data: [DONE]":
+                    continue
+                _dl = _js3.loads(_st[6:]).get("choices", [{}])[0].get("delta", {})
+                if _dl.get("content"):
+                    _got.append(_dl["content"])
+            if "".join(_got) != _want or "".join(_rw.said) != _want:
+                _stream3 = False
+    check(_pure3, "run: the pure reorder rule answers all seven shapes as written")
+    check(_stream3, "run: the streamed rewrite is byte-identical to the pure rule "
+                    "at chunk sizes 1, 3, 7, 50 and 4096, in output and in the report")
+except Exception as _e:
+    check(False, "the reorder runs did not RUN", str(_e)[:120])
+
+try:
+    _lc3 = fp.load_config
+    fp.load_config = lambda *a, **k: {"settings": {}}
+    fp.THOUGHT_FRESH.clear()
+    fp.thought_lines("<internal_thought>" + ("word " * 200) + "</internal_thought>",
+                     who="GateWho", cfg={"settings": {}})
+    _row3 = fp.THOUGHT_FRESH.get("GateWho", ("",))[0]
+    fp.load_config = _lc3
+    check(len(_row3) > 900 and _row3.endswith("word"),
+          "run: a long thought reaches the audio pass whole, not cut at 400")
+except Exception as _e:
+    try:
+        fp.load_config = _lc3
+    except Exception:
+        pass
+    check(False, "the uncapped-thought run did not RUN", str(_e)[:120])
+
+try:
+    _dv3 = _tf3.mkdtemp()
+    _p3 = os.path.join(_dv3, "srv_slot1_1.log")
+    _log3 = _NL3.join([
+        "=== 2026-08-15T13:27:47 | Server 1 | slot1 ===",
+        "  GPU free VRAM: 30,991 MiB (30.26 GiB)",
+        "load_tensors:        CUDA0 model buffer size = 20054.43 MiB",
+        "load_tensors:    CUDA_Host model buffer size =   994.63 MiB",
+        "srv    load_model: [spec] estimated memory usage of MTP context is 188.19 MiB",
+        "llama_kv_cache:      CUDA0 KV buffer size =   960.00 MiB",
+        "llama_memory_recurrent:      CUDA0 RS buffer size =   149.62 MiB",
+        "sched_reserve:      CUDA0 compute buffer size =   137.02 MiB",
+        "sched_reserve:  CUDA_Host compute buffer size =    35.02 MiB",
+        "Server ready - 5090 CUDA",
+    ])
+    with open(_p3, "w") as _fh3:
+        _fh3.write(_log3)
+    _r3 = fp.slot_vram_report(_p3)
+    _v1 = (_r3["any"] and _r3["weightsGpu"] == 20054.43 and _r3["weightsHost"] == 994.63
+           and _r3["mtpCtx"] == 188.19 and _r3["kv"] == 960.0 and _r3["rs"] == 149.62
+           and _r3["compGpu"] == 137.02 and _r3["compHost"] == 35.02
+           and _r3["freeAtLoad"] == 30991.0 and _r3["ready"] and not _r3["exited"])
+    with open(_p3, "w") as _fh3:
+        _fh3.write("old" + _NL3 + "=== earlier ===" + _NL3
+                   + "load_tensors:        CUDA0 model buffer size = 1.00 MiB" + _NL3
+                   + _log3.replace("Server ready - 5090 CUDA",
+                                   "Server process exited before it became ready."))
+    _r3b = fp.slot_vram_report(_p3)
+    _v2 = _r3b["exited"] and not _r3b["ready"] and _r3b["weightsGpu"] == 20054.43
+    with open(_p3, "w") as _fh3:
+        _fh3.write(_NL3.join([
+            "=== s ===",
+            "load_tensors:        CUDA0 model buffer size = 20000.00 MiB",
+            "srv    load_model: loading draft model x.gguf",
+            "load_tensors:        CUDA0 model buffer size = 450.00 MiB",
+            "llama_kv_cache:      CUDA0 KV buffer size =    64.00 MiB",
+        ]))
+    _r3c = fp.slot_vram_report(_p3)
+    _v3 = (_r3c["weightsGpu"] == 20000.0 and _r3c["draftGpu"] == 450.0
+           and _r3c["kvDraft"] == 64.0)
+    check(_v1 and _v2 and _v3,
+          "run: the VRAM parser buckets every component, reads only the LAST "
+          "session, calls a dead launch dead, and keeps the drafter's buffers "
+          "out of the model's", str([_v1, _v2, _v3]))
+except Exception as _e:
+    check(False, "the VRAM parser run did not RUN", str(_e)[:120])
+
+
+# ------------------------------------------------------------------ v3.75 patch4
+# Two bad identity transitions, both taken from one session's TTS log: an NPC think
+# task named the PLAYER (patch123's rule stopped discriminating when SkyrimNet began
+# sending them), and a one-word greeting moved a character's name onto a passing
+# stranger's voicetype. Plus the ledger that makes either answerable from a log.
+section("v3.75 patch4: player naming, one character one voice, the identity ledger")
+
+nin(py, "PLAYER_THINK", "the think-task rule is REMOVED, not left disabled")
+check("def _player_name_learn(" in py and "as the player from %s - that name already" in py
+      and '"speaks through %s" % (nm, source, bound)' in py,
+      "one place takes the player's name, and refuses one that already has a voice")
+check("_spk_player_src" in py, "and records where it came from")
+check("def player_name_setting(" in py and '"ttsPlayerName"' in py
+      and "_spk_typed = [\"\"]" in py,
+      "a typed name exists, is a real setting, and is read from a slot rather "
+      "than a config parse on every spoken line")
+check("SPEAKER_TEXT_MIN = 24" in py,
+      "the words rule has a length floor - a greeting names nobody")
+check("def speaker_for_voice_ex(" in py
+      and 'return speaker_for_voice_ex(voicetype)[0]' in py,
+      "every naming rule reports WHICH rule answered, through one dispatcher")
+check("def tts_ref_fingerprint(" in py and "def tts_identity_note(" in py
+      and "def tts_identity_alarm(" in py,
+      "the ledger, the fingerprint and the alarm exist")
+check("tts-identity.log" in py, "the ledger has a file of its own")
+check("MISSING - nothing to clone from" in py
+      and "the sample for %s is missing" in py,
+      "a reference that is not on disk is called missing rather than printed as a name")
+_pti4 = seg(JS, "function ttsPlayerTagRow(st)", "function ttsThoughtAudioRow(st)")
+check('id="tts-ttsPlayerName"' in _pti4, "the field sits under the Player Tag Injector")
+check('"ttsPlayerName"' in JS.split('function saveTtsMode')[1][:1200]
+      or '"ttsPlayerName",' in JS, "and it is saved with the rest of the page")
+
+import tempfile as _tf4
+try:
+    _D4 = _tf4.mkdtemp()
+    _lc4, _lcc4, _ld4 = fp.load_config, fp.load_config_cached, fp.log_dir
+    _pl4 = fp.panel_log
+    fp.panel_log = lambda *_a, **_k: None      # or the run writes a config and a log
+    _tl4 = fp.TTSW.log                         # TTSW.log calls log_dir() with NO cfg,
+    fp.TTSW.log = lambda *_a, **_k: None       # which loads - and WRITES - a real config
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _D4}}
+    fp.load_config_cached = lambda *a, **k: {"settings": {"logDir": _D4}}
+    fp.log_dir = lambda cfg=None: _D4
+    def _reset4(player="", src=""):
+        fp._spk_voices.clear(); fp._spk_pin.clear(); fp._spk_recent[:] = []
+        fp.REPLY_FULL.clear(); fp._ID_SEEN.clear()
+        fp._spk_player[0] = player; fp._spk_player_src[0] = src
+        fp._PLAYER_SAID[0] = True
+    # the 13:10 field case: an NPC think task must not name the player
+    _reset4()
+    _w4 = fp.note_speaker(b"You are Mirabelle Ervine [master wizard], a Female Breton "
+                          b"in Skyrim.\nThink internally as Mirabelle Ervine about it.")
+    _a4 = (_w4 == "Mirabelle Ervine" and fp._spk_player[0] == "")
+    # the party heading still names, and records its source
+    _reset4()
+    fp.note_speaker(b"You are Onmund, a Male Nord in Skyrim.\n"
+                    b"## Maxxor's Party's Active Quests\n- x")
+    _b4 = (fp._spk_player[0] == "Maxxor"
+           and fp._spk_player_src[0] == "the party heading")
+    # a name that already speaks somewhere cannot become the player
+    _reset4()
+    fp._spk_voices["femaleuniquemirabelleervine"] = "Mirabelle Ervine"
+    fp.note_speaker(b"You are Mirabelle Ervine, a Female Breton in Skyrim.\n"
+                    b"## Mirabelle Ervine's Party's Active Quests\n- x")
+    _c4 = fp._spk_player[0] == ""
+    # the typed name outranks a read one, and Player is the floor
+    _reset4(player="WrongName", src="the party heading")
+    fp.player_name_setting({"settings": {"logDir": _D4, "ttsPlayerName": "Maxxor"}})
+    _nm4, _rl4, _ = fp.speaker_for_voice_ex("player")
+    _d4 = (_nm4 == "Maxxor" and "typed" in _rl4)
+    # and naming a voice reads NO config: it cost a parse per spoken line and wrote a
+    # default config into a tree that had none
+    def _boom4(*_a, **_k):
+        raise AssertionError("the naming path must not read the config")
+    _keepcc4 = fp.load_config_cached
+    fp.load_config_cached = _boom4
+    try:
+        _d4 = _d4 and fp.speaker_for_voice("player") == "Maxxor"
+    finally:
+        fp.load_config_cached = _keepcc4
+    fp.player_name_setting({"settings": {"logDir": _D4}})
+    _reset4()
+    _e4 = fp.speaker_for_voice("player") == "Player"
+    check(_a4 and _b4 and _c4 and _d4 and _e4,
+          "run: the player is named by the setting, then the party heading, then not "
+          "at all - and an NPC think task, or an NPC's own name, never names them",
+          str([_a4, _b4, _c4, _d4, _e4]))
+
+    # the 13:32 field case: "Morning." must not move Nelysa onto a male voicetype
+    _reset4()
+    fp._spk_voices["femaledarkelf"] = "Nelysa"
+    fp.REPLY_FULL["Nelysa"] = (fp._th_norm("Morning."), time.time())
+    _f4 = (fp.tts_pin_speaker("C:" + chr(92) + "v" + chr(92) + "maleeventonedaccented.wav",
+                              "Morning.") == ""
+           and fp._spk_voices.get("maleeventonedaccented") is None
+           and fp.speaker_for_voice("maleeventonedaccented") == "")
+    # and a discriminating line still names its own voice, but only ONE
+    _reset4()
+    _ln4 = "I want you to sit there and feel exactly what you've done to me."
+    fp.REPLY_FULL["Mirabelle Ervine"] = (fp._th_norm(_ln4), time.time())
+    _g4 = (fp.tts_pin_speaker("C:" + chr(92) + "v" + chr(92)
+                              + "femaleuniquemirabelleervine.wav", _ln4)
+           == "Mirabelle Ervine")
+    _h4 = fp.tts_pin_speaker("C:" + chr(92) + "v" + chr(92) + "maleyoungeager.wav",
+                             _ln4) == ""
+    check(_f4 and _g4 and _h4,
+          "run: a greeting names nobody, a full line names its own voice, and neither "
+          "can bind a name that already speaks through another sample",
+          str([_f4, _g4, _h4]))
+
+    # the ledger: rule, fingerprint, missing file, contradiction alarm
+    _reset4()
+    _ref4 = os.path.join(_D4, "femaledarkelf.wav")
+    with open(_ref4, "wb") as _fh4:
+        _fh4.write(b"RIFF____WAVEfmt " + b"\0" * 200)
+    _ex4, _sz4, _sha4 = fp.tts_ref_fingerprint(_ref4)
+    _i4 = _ex4 and _sz4 == 216 and len(_sha4) == 12
+    _j4 = fp.tts_ref_fingerprint(os.path.join(_D4, "nope.wav")) == (False, 0, "")
+    fp.tts_identity_note({"settings": {"logDir": _D4}}, eid="e1", key="femaledarkelf",
+                         name="Nelysa", rule="the words of the line itself",
+                         cand={"pin": "Nelysa"}, sent=_ref4,
+                         asked="C:" + chr(92) + "up" + chr(92) + "femaledarkelf.wav",
+                         text="Morning.")
+    _led4 = open(fp.tts_identity_path({"settings": {"logDir": _D4}}),
+                 encoding="utf-8").read()
+    _k4 = ("name      : Nelysa" in _led4 and "by        : the words" in _led4
+           and _sha4 in _led4 and "asked" in _led4 and "said      : Morning." in _led4)
+    _heard4 = []
+    fp.TTSW.log = lambda m: _heard4.append(m)
+    fp.tts_identity_note({"settings": {"logDir": _D4}}, eid="e2",
+                         key="maleeventonedaccented", name="Nelysa",
+                         rule="the learned voicetype cache", sent=_ref4, text="Morning.")
+    fp.tts_identity_note({"settings": {"logDir": _D4}}, eid="e3", key="missingtype",
+                         name="Ghost", rule="x",
+                         sent=os.path.join(_D4, "gone.wav"), text="hi")
+    fp.TTSW.log = lambda *_a, **_k: None
+    _l4 = any("spoke through femaledarkelf before and through maleeventonedaccented now"
+              in _m for _m in _heard4)
+    _m4 = "MISSING - nothing to clone from" in open(
+        fp.tts_identity_path({"settings": {"logDir": _D4}}), encoding="utf-8").read()
+    check(_i4 and _j4 and _k4 and _l4 and _m4,
+          "run: the ledger records the rule and the sample's own bytes, names a "
+          "missing reference, and alarms one character arriving on a second sample",
+          str([_i4, _j4, _k4, _l4, _m4]))
+except Exception as _e4x:
+    check(False, "the identity runs did not RUN", str(_e4x)[:140])
+finally:
+    try:
+        fp.load_config, fp.load_config_cached, fp.log_dir = _lc4, _lcc4, _ld4
+        fp.panel_log = _pl4
+        fp.TTSW.log = _tl4
+        _reset4()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ v3.75 patch5
+# Naming, inverted: the words are the primary evidence, the queue is Dialogue-only,
+# a unique voicetype is its own proof, one utterance's chunks travel together, the
+# Meta pick breaks ties, and a generic voicetype with no live evidence prints as
+# itself. Plus the wire capture: what SkyrimNet actually sends, on record.
+section("v3.75 patch5: content-first naming, gated queue, runs, wire capture")
+
+_ns5 = seg(py, "def note_speaker", "def speaker_for_text")
+check("def note_speaker(body, enqueue=True):" in _ns5
+      and "if not enqueue:" in _ns5,
+      "the pairing queue is fed by choice, not by every route that names a character")
+check('note_speaker(body, enqueue=(rt["title"] == "Dialogue"))' in py,
+      "and the relay grants it to Dialogue requests alone")
+check("_spk_known.add(name)" in _ns5 and "_listener_note(name," in _ns5,
+      "every route still registers its character, and who they speak to")
+check("def _listener_note(" in py and '"being everyone\'s listener"' in py
+      and "len(_spk_listen[ln]) >= 2" in py,
+      "the player is the one everyone talks to and nobody ever is - two speakers is the bar")
+check("REPLY_RING = {}" in py and "RING_DEPTH = 4" in py
+      and "_rr.append(REPLY_FULL[who])" in py,
+      "a character's replies ring four deep - the second no longer erases the first")
+check("for who in set(list(REPLY_RING) + list(REPLY_FULL)):" in py
+      and "now - when > RING_LIFE_S" in py,
+      "the matcher reads the ring, one hit per character, two minutes deep")
+check("def _spk_unique_bind(" in py and '"unique" not in key' in py,
+      "a unique voicetype carries its character in its own filename")
+check("_spk_run = {}" in py and "RUN_GAP_S" in py
+      and '"carried by its own utterance\'s run"' in py,
+      "chunks of one utterance travel together")
+check("_elig = [nm for _w, nm in _spk_recent" in py
+      and "if run and run[2] and now - run[1] <= RUN_GAP_S and not _elig:" in py,
+      "but the run yields to a live request - a shared voicetype takes who just spoke")
+check("def meta_note(" in py
+      and '"the Meta selector\'s pick among waiting requests"' in py,
+      "the Meta pick breaks a tie among waiting requests, and only that")
+check('return "", "no live evidence - the voicetype stands", cand' in py,
+      "a generic voicetype with no live evidence answers as ITSELF, never from the cache")
+check("def tts_wire_note(" in py and "tts_wire_note(_j, self.headers)" in py,
+      "every generate_audio shape goes on record - keys and header names, no values")
+
+import collections as _c5
+try:
+    _lc5 = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log, fp.TTSW.log)
+    import tempfile as _tf5
+    _D5 = _tf5.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _D5}}
+    fp.load_config_cached = lambda *a, **k: {"settings": {"logDir": _D5}}
+    fp.log_dir = lambda cfg=None: _D5
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+    def _r5():
+        fp._spk_voices.clear(); fp._spk_pin.clear(); fp._spk_recent[:] = []
+        fp.REPLY_FULL.clear(); fp.REPLY_RING.clear(); fp._spk_run.clear()
+        fp._spk_unique_pos.clear(); fp._spk_known.clear(); fp._spk_listen.clear()
+        fp._spk_player[0] = ""; fp._spk_player_src[0] = ""
+        fp.META_LAST[0], fp.META_LAST[1] = "", 0.0
+        fp._PLAYER_SAID[0] = True
+
+    # the poisoned queue: a non-Dialogue request must not lend its name
+    _r5()
+    fp.note_speaker(b"You are Serana, a vampire of Volkihar in Skyrim.", enqueue=False)
+    _a5 = ("Serana" in fp._spk_known and not fp._spk_recent
+           and fp.speaker_for_voice("femalecommoner") == "")
+    fp.note_speaker(b"You are Serana, a vampire of Volkihar in Skyrim.")
+    _a5 = _a5 and len(fp._spk_recent) == 1
+    check(_a5, "run: a GM request registers its character and queues nothing - the "
+               "ambient line after it wears no borrowed name", str(_a5))
+
+    # the ring: a chunk of the FIRST reply survives the second
+    _r5()
+    fp.thought_lines("The moons are wrong tonight, and I intend to say so at length.",
+                     who="GateSerana5", cfg={"settings": {}})
+    fp.thought_lines("Second thoughts are for people with time to spare, novice.",
+                     who="GateSerana5", cfg={"settings": {}})
+    _b5 = (len(fp.REPLY_RING.get("GateSerana5", [])) == 2
+           and fp.tts_pin_speaker("C:" + chr(92) + "v" + chr(92) + "femalecommoner.wav",
+                                  "The moons are wrong tonight, and I intend to say "
+                                  "so at length.") == "GateSerana5")
+    check(_b5, "run: two replies ring side by side and a chunk of the first still "
+               "names its speaker", str(_b5))
+
+    # the run: a short sibling chunk inherits, a live request ends it, staleness ends it
+    _r5()
+    fp.thought_lines("You will stand exactly there and you will not move an inch.",
+                     who="GateFaralda5", cfg={"settings": {}})
+    fp.tts_pin_speaker("C:" + chr(92) + "v" + chr(92) + "femaleelfhaughty.wav",
+                       "You will stand exactly there and you will not move an inch.")
+    fp._spk_pin.clear()
+    _n1, _rl1, _ = fp.speaker_for_voice_ex("femaleelfhaughty")
+    fp.note_speaker(b"You are Ysolda Gatefive, a trader in Whiterun.")
+    _n2, _rl2, _ = fp.speaker_for_voice_ex("femaleelfhaughty")
+    fp._spk_run.clear(); fp._spk_recent[:] = []
+    _n3 = fp.speaker_for_voice("femaleelfhaughty")
+    _c5r = (_n1 == "GateFaralda5" and "run" in _rl1
+            and _n2 == "Ysolda Gatefive" and "paired" in _rl2
+            and _n3 == "")
+    check(_c5r, "run: the short chunk inherits its utterance, a live request takes "
+                "the voice over, and with neither the voicetype stands",
+          str([_n1, _rl1, _n2, _rl2, _n3]))
+
+    # unique voicetypes, meta tie-break, generic refusal, listener rule
+    _r5()
+    fp.note_speaker(b"You are Mirabelle Ervine, a Female Breton in Skyrim.", enqueue=False)
+    _d5 = fp.speaker_for_voice_ex("femaleuniquemirabelleervine")
+    _d5ok = _d5[0] == "Mirabelle Ervine" and "unique" in _d5[1]
+    _r5()
+    fp.note_speaker(b"You are Aela the Huntress, a Female Nord in Skyrim.")
+    fp.note_speaker(b"You are Lydia, a Female Nord in Skyrim.")
+    fp.meta_note("[Lydia]>[player]")
+    _e5 = fp.speaker_for_voice_ex("femaleevennormal")
+    _e5ok = (_e5[0] == "Lydia" and "Meta" in _e5[1]
+             and [n for _w, n in fp._spk_recent] == ["Aela the Huntress"])
+    _r5()
+    fp.note_speaker(b"You are Nelysa, a Female Dark Elf in Skyrim.")
+    _f5a = fp.speaker_for_voice("femaledarkelf")
+    fp._spk_run.clear()
+    _f5b, _f5rule, _f5c = fp.speaker_for_voice_ex("femaledarkelf")
+    _f5ok = (_f5a == "Nelysa" and _f5b == ""
+             and "voicetype stands" in _f5rule and _f5c.get("cache") == "Nelysa")
+    _r5()
+    fp.note_speaker(b"You are Adara, a mage. You are speaking to Maxxor, a Male Dark Elf.",
+                    enqueue=False)
+    fp.note_speaker(b"You are Brynjar, a bard. You are speaking to Maxxor, a Male Dark Elf.",
+                    enqueue=False)
+    _g5ok = (fp._spk_player[0] == "Maxxor"
+             and fp._spk_player_src[0] == "being everyone's listener")
+    check(_d5ok and _e5ok and _f5ok and _g5ok,
+          "run: the filename binds its unique character, the Meta pick breaks the "
+          "tie, the next dark elf refuses the last one's name, and the one everyone "
+          "addresses is the player", str([_d5ok, _e5ok, _f5ok, _g5ok]))
+
+    # the wire capture: one block per shape, names only
+    _r5()
+    fp._WIRE_SEEN.clear()
+    fp.tts_wire_note({"data": [1], "session_hash": "x"},
+                     {"Content-Type": "application/json"})
+    fp.tts_wire_note({"data": [1], "session_hash": "y"},
+                     {"Content-Type": "application/json"})
+    _led5 = open(fp.tts_identity_path({"settings": {"logDir": _D5}}),
+                 encoding="utf-8").read()
+    _h5 = _led5.count("wire: generate_audio") == 1 and "session_hash" in _led5
+    check(_h5, "run: the request's shape is on record once, keys and header names only",
+          str(_h5))
+except Exception as _e5x:
+    check(False, "the patch5 runs did not RUN", str(_e5x)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir,
+         fp.panel_log, fp.TTSW.log) = _lc5
+        _r5()
+        fp._WIRE_SEEN.clear()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ v3.75 patch6
+# The sample half: what reaches the engine is verified first. A dead path or
+# another voicetype's bytes never make it - recovered from the panel's own copy
+# or refused loudly, never improvised in whoever the engine conditioned on last.
+# Plus the warm-up probe for the session-carryover hypothesis, off by default.
+section("v3.75 patch6: the sample gate and the warm-up probe")
+
+check("def tts_sample_gate(" in py and '"refused-missing"' in py
+      and '"recovered-crosswired"' in py and '"refused-crosswired"' in py,
+      "the gate exists and knows its three faults by name")
+check("ref_path, _gatev = tts_sample_gate(ref_path, _idk, cfg)" in py,
+      "and the speak path passes every reference through it before the engine")
+check('if not ref_path:' in seg(py, "ref_path, _gatev = tts_sample_gate", "_t_post = time.time()")
+      and 'ev["err"] = "no trustworthy sample' in py,
+      "a refused line FAILS - the request errors instead of posting a dead path")
+check("_VT_SHA = {}" in py and "_SHA_VT = {}" in py,
+      "one voicetype, one sample - both directions on record")
+check("changed its sample mid-session" in py,
+      "new bytes under a known voicetype are accepted and alarmed, not refused")
+# retold patch29: the warm-up is REMOVED - measured at 749 ms per speaker change
+# against 33 ms without. _WARM_LAST stays: it is the conditioning tracker the
+# sample gate uses, which was never the warm-up.
+nin(py, "def tts_warmup_needed", "the warm-up probe is gone entirely")
+nin(py, "ttsVoiceWarmup", "setting and toggle with it")
+check("_WARM_LAST" in py, "and the conditioning tracker it borrowed remains")
+check('if kw.get("gate") and kw.get("gate") != "ok":' in py,
+      "the ledger carries a gate verdict only when there is something to say")
+
+import tempfile as _tf6
+try:
+    _lc6 = (fp.load_config, fp.load_config_cached, fp.log_dir,
+            fp.panel_log, fp.TTSW.log, fp.tts_voice_index)
+    _D6 = _tf6.mkdtemp(); _V6 = _tf6.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _D6}}
+    fp.load_config_cached = lambda *a, **k: {"settings": {"logDir": _D6}}
+    fp.log_dir = lambda cfg=None: _D6
+    fp.panel_log = lambda *a, **k: None
+    _al6 = []
+    fp.TTSW.log = lambda m: _al6.append(m)
+    _ix6 = {}
+    fp.tts_voice_index = lambda cfg=None: _ix6
+    def _wav6(path, seed):
+        with open(path, "wb") as f:
+            f.write(b"RIFF____WAVEfmt " + bytes([seed]) * 300)
+        return path
+    def _r6():
+        fp._VT_SHA.clear(); fp._SHA_VT.clear(); fp._ID_HASH.clear()
+        fp._WARM_LAST[0] = ""; _ix6.clear(); del _al6[:]
+
+    _r6()
+    _a6 = _wav6(os.path.join(_D6, "femaledarkelf.wav"), 1)
+    _ok1 = fp.tts_sample_gate(_a6, "femaledarkelf") == (_a6, "ok") and not _al6
+    _r6()
+    _own6 = _wav6(os.path.join(_V6, "maleoldkindly.wav"), 2)
+    _ix6["maleoldkindly"] = _own6
+    _ok2 = fp.tts_sample_gate(os.path.join(_D6, "gone.wav"),
+                              "maleoldkindly") == (_own6, "recovered")
+    _r6()
+    _ok3 = fp.tts_sample_gate(os.path.join(_D6, "gone.wav"),
+                              "femalesultry") == ("", "refused-missing")
+    _r6()
+    _nel6 = _wav6(os.path.join(_D6, "femaledarkelf.wav"), 3)
+    fp.tts_sample_gate(_nel6, "femaledarkelf")
+    _imp6 = _wav6(os.path.join(_D6, "maleeventonedaccented.wav"), 3)
+    _own7 = _wav6(os.path.join(_V6, "maleeventonedaccented.wav"), 4)
+    _ix6["maleeventonedaccented"] = _own7
+    _ok4 = (fp.tts_sample_gate(_imp6, "maleeventonedaccented")
+            == (_own7, "recovered-crosswired")
+            and any("femaledarkelf's bytes" in _m for _m in _al6))
+    _r6()
+    _nel6 = _wav6(os.path.join(_D6, "femaledarkelf.wav"), 3)
+    fp.tts_sample_gate(_nel6, "femaledarkelf")
+    _imp7 = _wav6(os.path.join(_D6, "malebrute.wav"), 3)
+    _ok5 = fp.tts_sample_gate(_imp7, "malebrute") == ("", "refused-crosswired")
+    _r6()
+    _b6 = _wav6(os.path.join(_D6, "femaleyoungeager.wav"), 5)
+    fp.tts_sample_gate(_b6, "femaleyoungeager")
+    _wav6(_b6, 6)
+    _ok6 = (fp.tts_sample_gate(_b6, "femaleyoungeager") == (_b6, "changed")
+            and any("changed its sample" in _m for _m in _al6)
+            and fp.tts_sample_gate(_b6, "femaleyoungeager") == (_b6, "ok"))
+    check(_ok1 and _ok2 and _ok3 and _ok4 and _ok5 and _ok6,
+          "run: healthy passes silently, missing recovers or refuses, cross-wired "
+          "bytes speak through the panel's copy or refuse, and a re-record is "
+          "accepted with one alarm", str([_ok1, _ok2, _ok3, _ok4, _ok5, _ok6]))
+
+    _r6()
+    check(not hasattr(fp, "tts_warmup_needed"),   # retold patch29
+          "run: there is no warm-up left to fire")
+except Exception as _e6x:
+    check(False, "the patch6 runs did not RUN", str(_e6x)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir,
+         fp.panel_log, fp.TTSW.log, fp.tts_voice_index) = _lc6
+        fp._VT_SHA.clear(); fp._SHA_VT.clear(); fp._ID_HASH.clear()
+        fp._WARM_LAST[0] = ""
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ v3.75 patch7
+# Engine state is mirrored, not inferred: the TTS engine keeps ONE session, and
+# what it last conditioned on is now tracked on EVERY synthesis path - a voiced
+# thought conditions it exactly like a spoken line. The ledger records it, which
+# is how the first field capture of a wrong voice was settled in one block: a
+# cold start with no previous take ends the carryover-only theory by itself.
+section("v3.75 patch7: the conditioning tracker and the ledger's engine-was line")
+
+check("def tts_conditioned(" in py and "prev = _WARM_LAST[0]" in py,
+      "one function records every synthesis and answers with the PREVIOUS")
+nin(py, "_WARM_LAST[0] = _idk",
+    "the dialogue path no longer writes the record by hand")
+check("tts_conditioned(_idk)" in py,
+      "it reports through the tracker like everything else")
+check("tts_conditioned(os.path.splitext(re.split(" in py,
+      "the THOUGHT path conditions the engine too, and the tracker sees it")
+check('prev=(_WARM_LAST[0]' in py and '!= _idk else "")' in py,   # retold p17: wrapped
+      "the ledger is told what the engine had been speaking as, when it differs")
+check('rows.append("  engine was: %s" % kw["prev"])' in py
+      and 'if kw.get("prev"):' in py,
+      "and the block prints it only then - a cold start shows nothing, by design")
+
+try:
+    _keep7 = fp._WARM_LAST[0]
+    fp._WARM_LAST[0] = ""
+    _a7 = fp.tts_conditioned("player") == ""
+    _b7 = fp.tts_conditioned("femaleshrill") == "player"
+    _c7 = fp.tts_conditioned("") == "femaleshrill" and fp._WARM_LAST[0] == "femaleshrill"
+    # retold patch29: the warm-up that consumed this tracker is gone; the tracker
+    # itself is the sample gate's, and still has to follow a voiced thought
+    fp._WARM_LAST[0] = ""
+    fp.tts_conditioned("player")
+    _d7 = fp._WARM_LAST[0] == "player"
+    fp.tts_conditioned("maleorc")
+    _e7 = fp._WARM_LAST[0] == "maleorc"
+    check(_a7 and _b7 and _c7 and _d7 and _e7,
+          "run: a cold start has no previous, each take reports what preceded it, "
+          "an empty voicetype reads without clobbering, and a thought's take moves "
+          "the tracker on", str([_a7, _b7, _c7, _d7, _e7]))
+    import tempfile as _tf7
+    _D7 = _tf7.mkdtemp()
+    _lc7 = (fp.load_config_cached, fp.log_dir, fp.panel_log, fp.TTSW.log)
+    fp.load_config_cached = lambda *a, **k: {"settings": {"logDir": _D7}}
+    fp.log_dir = lambda cfg=None: _D7
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+    _p7 = os.path.join(_D7, "player.wav")
+    with open(_p7, "wb") as _fh7:
+        _fh7.write(b"RIFF" + b"x" * 200)
+    fp.tts_identity_note({"settings": {"logDir": _D7}}, eid="e1", key="player",
+                         name="Maxxor", rule="x", sent=_p7, text="Morning.",
+                         prev="femaleshrill")
+    fp.tts_identity_note({"settings": {"logDir": _D7}}, eid="e2", key="player",
+                         name="Maxxor", rule="x", sent=_p7, text="again", prev="")
+    _led7 = open(fp.tts_identity_path({"settings": {"logDir": _D7}}),
+                 encoding="utf-8").read()
+    (fp.load_config_cached, fp.log_dir, fp.panel_log, fp.TTSW.log) = _lc7
+    check("engine was: femaleshrill" in _led7 and _led7.count("engine was:") == 1,
+          "run: the block carries the previous conditioning, and only when it differs")
+except Exception as _e7x:
+    check(False, "the patch7 runs did not RUN", str(_e7x)[:140])
+finally:
+    try:
+        fp._WARM_LAST[0] = _keep7
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ v3.75 patch8
+# audio.cpp 0.6 readiness, and the Audio Cache. The start retries once without
+# session options when the server exits at once - the retry a stale comment had
+# only DESCRIBED - and remembers the refusal for the panel run. A co-hosted
+# SenseVoice turns each voice sample into a reference transcript, once, keyed on
+# the file's hash. And the TTS page grew a button: every character met this run,
+# their sample, and their kept takes.
+section("v3.75 patch8: 0.6 start-fallback, reference transcripts, the Audio Cache")
+
+check("def tts_acpp_config(cfg=None, no_opts=False):" in py
+      and "_ACPP_NO_OPTS = [False]" in py,
+      "the config can leave its options at home, and a refusal is remembered")
+check("return _api_tts_server(body, _retry=True)" in py
+      and "retrying without" in py,
+      "the exit-at-once retry is CODE now, not a comment describing an intent")
+check('"family": "sense_asr"' in py and '"id": "sense"' in py,
+      "a configured ASR path co-hosts SenseVoice beside the TTS model")
+check("def tts_ref_text(ref_path, cfg=None, learn=False):" in py and "_RT_FAIL" in py
+      and "tts-ref-text.json" in py,     # retold patch10: learning is opt-in now
+      "transcripts are learned once per sample hash, persisted, and never hammered")
+check("_rt8 = tts_ref_text(ref_path, cfg)" in py
+      and "\n                                            _rt8)" in py,
+      "the dialogue take carries its reference transcript")
+check("tts_ref_text(ref, cfg))" in py,   # retold p29: the warm-up is gone
+      "and so does the voiced thought")
+check("def tts_takes_for(" in py and "_TAKE_RX" in py,
+      "takes are matched by name PLUS timestamp - a prefix alone is ambiguous")
+check("def api_tts_audio_cache(" in py and "def api_tts_audio_takes(" in py
+      and '"/api/tts-audio-cache": api_tts_audio_cache' in py,
+      "both endpoints exist and are routed")
+check('data-act="ttsAudioCache"' in py and "glowbtn" in py,
+      "the button sits on the TTS page")
+_gl8 = seg(py, ".glowbtn {", ".vramline {")
+check("box-shadow: 0 0 14px 2px rgba(255,255,255,0)" in _gl8
+      and "box-shadow: 0 0 14px 2px rgba(255,255,255,.35)" in _gl8,
+      "the glow keeps the SAME geometry at rest and on hover, alpha alone moves - "
+      "nothing flickers, and nothing at rest is a zero-blur ring")
+check("function audioCacheShow()" in py and "function audioCacheTakes(" in py
+      and 'audioCacheShow(); return;' in py,
+      "both views exist and the dispatcher reaches them")
+check('"ttsAcppAsrModel", "ttsAsrMode"' in py       # retold patch10: its own section
+      and 'id="tts-ttsAcppAsrModel"' in py,
+      "the ASR path is a saved setting with a field on the page")
+check("def _audio_cache_load(" in py and "def _audio_cache_save(" in py
+      and "tts-audio-cache.json" in py,
+      "the associations persist across restarts, loaded once, written through")
+check("TTS_REF_BY_NAME.setdefault(str(k), str(v))" in py,
+      "and live learning wins over the disk - setdefault, never overwrite")
+check("if _new8:" in py and "_audio_cache_save(cfg)" in py,
+      "the speak path saves the moment a pairing is new")
+check("def api_tts_audio_cache_clear(" in py
+      and '"/api/tts-audio-cache-clear": api_tts_audio_cache_clear' in py,
+      "the clear exists and is routed")
+check(py.count('["!!", "audiocache"],') == 2
+      and 'f[0] === "!!"' in py,
+      "the buttons render at the bottom of Audio Files, in both engine fieldsets")
+check('data-act="ttsAudioCacheClear"' in py
+      and "function audioCacheClear()" in py and "Clear the Audio Cache?" in py,
+      "Clear sits beside it, behind a confirm, and shows the emptied list after")
+_st8 = seg(py, 'data-act="ttsStart"', 'data-act="ttsStop"')
+nin(_st8, "ttsAudioCache",
+    "the Start TTS row no longer carries the button - it moved to Audio Files")
+
+import tempfile as _tf8, types as _ty8
+try:
+    _lc8 = (fp.load_config, fp.load_config_cached, fp.log_dir,
+            fp.panel_log, fp.TTSW.log, fp._ureq)
+    _D8 = _tf8.mkdtemp(); _O8 = _tf8.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _D8, "ttsOutDir": _O8}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _D8
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+    _keep8 = fp._ACPP_NO_OPTS[0]
+    _refs8 = dict(fp.TTS_REF_BY_NAME)
+    fp._ACPP_NO_OPTS[0] = False
+    fp._RT_MEM.clear(); fp._RT_FAIL.clear(); fp._ID_HASH.clear()
+
+    # the config's three shapes: default, refused, co-hosted
+    _asr8 = os.path.join(_D8, "sense.gguf")
+    with open(_asr8, "wb") as _f8:
+        _f8.write(b"GGUF")
+    _j8 = json.loads(fp.tts_acpp_config({"settings": {"logDir": _D8}}))
+    fp._ACPP_NO_OPTS[0] = True
+    _j8b = json.loads(fp.tts_acpp_config({"settings": {"logDir": _D8}}))
+    fp._ACPP_NO_OPTS[0] = False
+    _j8c = json.loads(fp.tts_acpp_config({"settings": {"logDir": _D8,
+                                                       "ttsAcppAsrModel": _asr8,
+                                                       "ttsAsrMode": "on"}}))
+    _a8 = ("session_options" in _j8["models"][0]
+           and "session_options" not in _j8b["models"][0]
+           and len(_j8c["models"]) == 2 and _j8c["models"][1]["family"] == "sense_asr")
+    check(_a8, "run: options by default, none after a refusal, SenseVoice when a "
+               "real path is set", str(_a8))
+
+    # the transcript store: once per hash, persisted, fail-open, gated
+    _ref8 = os.path.join(_D8, "femaledarkelf.wav")
+    with open(_ref8, "wb") as _f8:
+        _f8.write(b"RIFF" + b"a" * 300)
+    _calls8 = []
+    class _R8:
+        def read(self):
+            return json.dumps({"text": "Some call me nature."}).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    fp._ureq = _ty8.SimpleNamespace(
+        Request=_lc8[5].Request,
+        urlopen=lambda req, timeout=0: (_calls8.append(1), _R8())[1])
+    # retold patch10: a transcript is LEARNED only when asked; the speak path reads
+    _asrcfg8 = {"settings": {"logDir": _D8, "ttsAcppAsrModel": _asr8,
+                             "ttsAsrMode": "on"}}
+    fp._RT_LOADED[0] = False
+    _b8 = (fp.tts_ref_text(_ref8, {"settings": {"logDir": _D8}}) == ""
+           and fp.tts_ref_text(_ref8, _asrcfg8, learn=True) == "Some call me nature."
+           and fp.tts_ref_text(_ref8, _asrcfg8) == "Some call me nature."
+           and len(_calls8) == 1)
+    fp._RT_MEM.clear()
+    fp._RT_LOADED[0] = False
+    _b8 = _b8 and fp.tts_ref_text(_ref8, _asrcfg8) == "Some call me nature." \
+        and len(_calls8) == 1
+    _dead8 = []
+    def _boom8(req, timeout=0):
+        _dead8.append(1)
+        raise OSError("refused")
+    fp._ureq = _ty8.SimpleNamespace(Request=_lc8[5].Request, urlopen=_boom8)
+    _ref8b = os.path.join(_D8, "maleorc.wav")
+    with open(_ref8b, "wb") as _f8:
+        _f8.write(b"RIFF" + b"b" * 300)
+    _b8 = _b8 and fp.tts_ref_text(_ref8b, _asrcfg8, learn=True) == "" \
+        and fp.tts_ref_text(_ref8b, _asrcfg8, learn=True) == "" \
+        and len(_dead8) == 1
+    check(_b8, "run: gated off silently, learned once, reloaded from disk, and a "
+               "refusal never hammers the engine", str(_b8))
+
+    # the takes and the cache rows
+    for _leaf8 in ("Urag_20260816_093500.wav", "Urag_gro-Shub_20260816_093504.wav",
+                   "Urag_notes.wav"):
+        with open(os.path.join(_O8, _leaf8), "wb") as _f8:
+            _f8.write(b"RIFF" + b"x" * 100)
+    fp.TTS_REF_BY_NAME.clear()
+    fp.TTS_REF_BY_NAME["Urag gro-Shub"] = _ref8b
+    fp.TTS_REF_BY_NAME["Colette Marence"] = os.path.join(_D8, "gone.wav")
+    _r8 = fp.api_tts_audio_cache({})
+    _c8 = ([x["name"] for x in _r8["rows"]] == ["Colette Marence", "Urag gro-Shub"]
+           and [t["file"] for t in fp.tts_takes_for("Urag")]
+           == ["Urag_20260816_093500.wav"]
+           and _r8["rows"][1]["takes"] == 1 and _r8["rows"][0]["present"] is False
+           and fp.api_tts_audio_takes({}).get("error") == "no name")
+    check(_c8, "run: alphabetical rows, per-name takes with the timestamp rule, a "
+               "missing sample says so, a nameless ask is refused", str(_c8))
+
+    # persistence: back from disk, live wins, clear forgets both copies
+    fp.TTS_REF_BY_NAME.clear()
+    fp._AC_LOADED[0] = True
+    fp.TTS_REF_BY_NAME["Urag gro-Shub"] = _ref8b
+    fp._audio_cache_save({"settings": {"logDir": _D8}})
+    fp.TTS_REF_BY_NAME.clear()
+    fp._AC_LOADED[0] = False
+    with fp._spk_lock:
+        fp._audio_cache_load({"settings": {"logDir": _D8}})
+    _d8 = fp.TTS_REF_BY_NAME.get("Urag gro-Shub") == _ref8b
+    fp.TTS_REF_BY_NAME["Urag gro-Shub"] = "C:/new/maleorc.wav"
+    fp._AC_LOADED[0] = False
+    with fp._spk_lock:
+        fp._audio_cache_load({"settings": {"logDir": _D8}})
+    _d8 = _d8 and fp.TTS_REF_BY_NAME["Urag gro-Shub"] == "C:/new/maleorc.wav"
+    _r8c = fp.api_tts_audio_cache_clear({})
+    _d8 = (_d8 and _r8c.get("cleared") == 1 and not fp.TTS_REF_BY_NAME
+           and not os.path.exists(fp._audio_cache_path({"settings": {"logDir": _D8}})))
+    check(_d8, "run: yesterday's characters return from disk, live learning wins, "
+               "and Clear forgets the list in memory AND on disk", str(_d8))
+except Exception as _e8x:
+    check(False, "the patch8 runs did not RUN", str(_e8x)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir,
+         fp.panel_log, fp.TTSW.log, fp._ureq) = _lc8
+        fp._ACPP_NO_OPTS[0] = _keep8
+        fp.TTS_REF_BY_NAME.clear()
+        fp.TTS_REF_BY_NAME.update(_refs8)
+        fp._AC_LOADED[0] = True    # the tree's own store must not be read after this
+        fp._RT_MEM.clear(); fp._RT_FAIL.clear(); fp._ID_HASH.clear()
+        fp._RT_LOADED[0] = True; fp._RT_BUSY.clear(); fp._ACPP_NO_ASR[0] = False
+    except Exception:
+        pass
+
+
+# ------------------------------------------------------------------ v3.75 patch9
+# Speculative decoding grows a settings segment on the server card - the master
+# llama.cpp surface, kind-aware - and Qwen 3.8 lands as a new reasoning category:
+# a switch AND a depth at once, with its multi-step MTP head already detected by
+# the nextn scan the qwen35 generation shares.
+section("v3.75 patch9: the spec-decoding segment, and Qwen 3.8")
+
+check('ARCH_REASON_EFFORT = ("qwen35", "qwen35moe")' in py
+      and 'REASON_EFFORTS = ("low", "medium", "xhigh")' in py,
+      "Qwen 3.8 is its own category: the on/off dial stays live beside a depth")
+check('def draft_launch_args(draft_path, ngl="", params=None):' in py,
+      "the drafter's stored parameters ride through the one function that renders them")
+check('if kind not in ("draft-dflash", "draft-dspark"):' in py,
+      "a user n-max never overrides a header that carries the block contract")
+check('out.append(("--no-spec-draft-backend-sampling", None))' in py
+      and 'out.append(("--spec-draft-backend-sampling", None))' in py,
+      "backend sampling is a bare switch, both polarities")
+check('and str(draft_path or "") != DRAFT_BUILTIN:' in py,
+      "the builtin head carries no placement or cache of its own - it rides the target")
+check('draft_launch_args(t.get("draft"), _ngl, t)' in py
+      and 'draft_launch_args(p["draft"], gv("ngl"), p)' in py
+      and 'draft_launch_args(p.get("draft"), p.get("ngl") or "", p)' in py,
+      "all three render sites hand the stored parameters over")
+check(chr(123) + '"reasoning_effort":"%s"' + chr(125) in py and "% _re9" in py
+      and py.count("reasoning_effort") >= 4,
+      "the effort kwarg is written by creator and fix-up alike")
+check("# off outranks effort" in py,
+      "and thinking OFF outranks a depth for thinking that is not happening")
+check('"specNMax", "specNMin", "specPMin", "specPSplit", "specSample"' in py
+      and '"specCtkD", "specCtvD"' in py,
+      "the card saves every one of them")
+check('out["specSample"] = ("off" if present("--no-spec-draft-backend-sampling")' in py
+      and "_re9 = re.search(" in py,
+      "a hand-edited launcher reads back, tri-state switch included")
+check("const wantsEffort = EFFORT_ARCH.indexOf(mArch) >= 0;" in py
+      and 'data-key="reasonEffort"' in py,
+      "the effort select renders beside the reasoning dial, for this family alone")
+check("Speculative Decoding" in py and 'num9("specNMax"' in py
+      and "if (drFile9) {" in py,
+      "the segment renders when a drafter is chosen, cache types for files only")
+
+try:
+    _ma9, _mf9, _gm9, _if9 = fp.model_arch, fp.model_facts, fp.gguf_meta, os.path.isfile
+    _pl9 = fp.panel_log
+    fp.panel_log = lambda *a, **k: None
+    _P9 = {"specNMax": "4", "specNMin": "2", "specPMin": "0.75", "specPSplit": "0.1",
+           "specSample": "on", "specCtkD": "q8_0", "specCtvD": "q4_0"}
+    _a9 = dict(fp.draft_launch_args(fp.DRAFT_BUILTIN, "12", _P9))
+    _ok1 = (_a9.get("--spec-type") == "draft-mtp" and _a9.get("--spec-draft-n-max") == "4"
+            and _a9.get("--spec-draft-p-split") == "0.1"
+            and "--spec-draft-backend-sampling" in _a9
+            and "--spec-draft-type-k" not in _a9 and "--spec-draft-ngl" not in _a9)
+    fp.model_facts = lambda p: {"spec": "draft-simple"}
+    _b9 = dict(fp.draft_launch_args("D:/d/small.gguf", "12", _P9))
+    _ok2 = (_b9.get("--spec-draft-ngl") == "12" and _b9.get("--spec-draft-type-k") == "q8_0")
+    fp.model_facts = lambda p: {"spec": "draft-dflash"}
+    fp.gguf_meta = lambda p: {"dflash.block_size": 16}
+    os.path.isfile = lambda p: True
+    _c9 = dict(fp.draft_launch_args("D:/d/df.gguf", "", _P9))
+    os.path.isfile = _if9
+    _ok3 = _c9.get("--spec-draft-n-max") == "15"   # retold p25
+    _d9 = dict(fp.draft_launch_args(fp.DRAFT_BUILTIN, "", {"specSample": "off",
+                                                           "specNMax": "junk"}))
+    _ok4 = ("--no-spec-draft-backend-sampling" in _d9
+            and "--spec-draft-n-max" not in _d9)
+    check(_ok1 and _ok2 and _ok3 and _ok4,
+          "run: builtin carries depth without placement or cache types, a file "
+          "carries all of it, DFlash keeps its header, off is a bare --no- switch, "
+          "junk is not written", str([_ok1, _ok2, _ok3, _ok4]))
+
+    _q9 = chr(39)
+    _txt9 = ('$llamaArgs = @(' + chr(10)
+             + '    "--model", "D:/m/q.gguf",' + chr(10)
+             + '    "--spec-type", "draft-mtp",' + chr(10)
+             + '    "--spec-draft-n-max", "4",' + chr(10)
+             + '    "--no-spec-draft-backend-sampling",' + chr(10)
+             + '    "--chat-template-kwargs", ' + _q9
+             + chr(123) + '"reasoning_effort":"medium"' + chr(125) + _q9 + chr(10)
+             + ')')
+    _o9 = fp.parse_launcher_params(_txt9)
+    _ok5 = (_o9.get("draft") == fp.DRAFT_BUILTIN and _o9.get("specNMax") == "4"
+            and _o9.get("specSample") == "off" and _o9.get("reasonEffort") == "medium")
+    _o9b = fp.parse_launcher_params('$llamaArgs = @(' + chr(10)
+                                    + '    "--model", "D:/m/x.gguf"' + chr(10) + ')')
+    _ok6 = _o9b.get("specSample") == "" and _o9b.get("reasonEffort") == ""
+    check(_ok5 and _ok6,
+          "run: a hand-written launcher reads back exactly, and absence reads as empty",
+          str([_ok5, _ok6]))
+
+    fp.model_arch = lambda p: "qwen35"
+    _cfg9 = {"settings": {}, "gpus": []}
+    _s9 = {"id": "slot9g", "label": "s", "port": 1299, "gpu": "", "gpuId": "",
+           "params": {"model": "D:/m/q.gguf", "reasonEffort": "medium",
+                      "reasoning": "on", "draft": fp.DRAFT_BUILTIN, "specNMax": "4"}}
+    _t9a = fp.build_param_launcher(_cfg9, _s9, "D:/l/llama-server.exe")
+    _s9["params"]["reasoning"] = "off"
+    _t9b = fp.build_param_launcher(_cfg9, _s9, "D:/l/llama-server.exe")
+    fp.model_arch = lambda p: "llama"
+    _s9["params"]["reasoning"] = "on"
+    _t9c = fp.build_param_launcher(_cfg9, _s9, "D:/l/llama-server.exe")
+    _ok7 = ("reasoning_effort" in _t9a and '"--spec-draft-n-max", "4"' in _t9a
+            and "reasoning_effort" not in _t9b and "enable_thinking" in _t9b
+            and "reasoning_effort" not in _t9c)
+    check(_ok7, "run: the creator writes effort for Qwen 3.8 with thinking on, "
+                "never over off, never for a family without it", str(_ok7))
+except Exception as _e9x:
+    check(False, "the patch9 runs did not RUN", str(_e9x)[:140])
+finally:
+    try:
+        fp.model_arch, fp.model_facts, fp.gguf_meta, os.path.isfile = _ma9, _mf9, _gm9, _if9
+        fp.panel_log = _pl9
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch10
+# Reference transcripts become a settings field of their own, with the options
+# audio.cpp's sense_asr family actually documents - and the work moves OFF the
+# speak path: a store read before the timing wall, learning behind the line.
+section("v3.75 patch10: the transcript field, and the work behind the line")
+
+check('"ttsAsrMode": "on",' in py and '"ttsAsrLang": "auto",' in py  # retold p29
+      and '"ttsAsrItn": "words",' in py,   # retold p16: Meta tags is gone
+      "the field is three settings, each with a defensible default")
+check('str(st.get("ttsAsrMode") or "on").strip().lower() == "on"' in py  # retold p14
+      and 'and not _ACPP_NO_ASR[0]' in py,
+      "only ON co-hosts a model - Stored costs no VRAM, and a refusal is remembered")
+check('"default_request_options"' in py and '"audio_chunk_mode": "none"' in py,
+      "the entry carries the documented request options; short samples take one pass")
+check("def acpp_retry_rung(" in py and "still exiting - retrying without the ASR" in py
+      and '_rung = acpp_retry_rung(cfg) if eng == "audiocpp" else ""' in py,
+      "the start ladder's decision is a function the gate can RUN, not prose in a spawn")
+check("def tts_ref_learn(" in py and "threading.Thread(target=_work, daemon=True)" in py
+      and "_RT_BUSY" in py,
+      "learning happens in the background, once per sample, never twice at a time")
+_wall10 = seg(py, "_rt8 = tts_ref_text(ref_path, cfg)", "srv_s = time.time() - _t_post")
+check("_t_post = time.time()" in _wall10
+      and "tts_ref_learn(ref_path, cfg)" in _wall10.split("_t_post = time.time()")[0],
+      "the read and the learner sit BEFORE the wall - neither is synthesis")
+check("_RT_TAGS = re.compile" in py and "_RT_TAGS.sub(" in py,
+      "meta markers are stripped from a transcript whatever the engine was told")
+check('"voice": os.path.splitext(' in py and "_rt_store_load" in py,
+      "the store names the voicetype beside each line, so a person can correct it")
+check('if isinstance(v, dict):' in py,
+      "and the flat file patch8 wrote still reads")
+check("def api_tts_ref_text_clear(" in py
+      and '"/api/tts-ref-text-clear": api_tts_ref_text_clear' in py
+      and 'data-act="ttsAsrClear"' in py,
+      "Clear transcripts exists, routed, and on the page")
+check("function ttsAsrRow(" in py and 'id="tts-ttsAsrMode"' in py
+      and "ASR_LANGS" in py and 'id="tts-ttsAsrItn"' in py,
+      "the section renders with every control the settings name")
+check(py.index("ttsAsrRow(st)") < py.index('<div class="tsect">Audio Tags</div>'),
+      "and it sits above Audio Tags, where it was asked for")
+nin(py, 'ttsTitle("ASR model for reference transcripts"',
+    "the old lone path field is gone, not left beside its replacement")
+
+import tempfile as _tfA, types as _tyA, time as _tmA
+try:
+    _lcA = (fp.load_config, fp.load_config_cached, fp.log_dir,
+            fp.panel_log, fp.TTSW.log, fp._ureq)
+    _DA = _tfA.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _DA}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _DA
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+    _asrA = os.path.join(_DA, "sense.gguf")
+    with open(_asrA, "wb") as _f:
+        _f.write(b"GGUF")
+    _refA = os.path.join(_DA, "femaledarkelf.wav")
+    with open(_refA, "wb") as _f:
+        _f.write(b"RIFF" + b"a" * 300)
+    def _cfgA(mode="on", **kw):
+        _s = {"logDir": _DA, "ttsAsrMode": mode, "ttsAcppAsrModel": _asrA}
+        _s.update(kw)
+        return {"settings": _s}
+    _callsA = []
+    class _RA:
+        def __init__(self, txt):
+            self.txt = txt
+        def read(self):
+            return json.dumps({"text": self.txt}).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    def _speakA(txt, delay=0.0):
+        def _f(req, timeout=0):
+            _callsA.append(1)
+            if delay:
+                _tmA.sleep(delay)
+            return _RA(txt)
+        fp._ureq = _tyA.SimpleNamespace(Request=_lcA[5].Request, urlopen=_f)
+    def _resetA():
+        fp._RT_MEM.clear(); fp._RT_FAIL.clear(); fp._RT_BUSY.clear()
+        fp._RT_LOADED[0] = False
+        fp._ACPP_NO_ASR[0] = False
+        del _callsA[:]
+        try:
+            os.remove(fp._rt_store_path(_cfgA()))
+        except OSError:
+            pass
+
+    _resetA(); _speakA("x")
+    _m1 = len(json.loads(fp.tts_acpp_config(_cfgA("off")))["models"]) == 1
+    _m2 = len(json.loads(fp.tts_acpp_config(_cfgA("stored")))["models"]) == 1
+    _jA = json.loads(fp.tts_acpp_config(_cfgA("on")))
+    _m3 = (len(_jA["models"]) == 2
+           and _jA["models"][1]["default_request_options"]
+           == {"language": "en", "enable_itn": False, "keep_tags": False,
+               "audio_chunk_mode": "none"})
+    # retold p16: markers are never asked for - the option is pinned False
+    _jB = json.loads(fp.tts_acpp_config(_cfgA("on", ttsAsrLang="ja",
+                                              ttsAsrItn="digits")))
+    _rB = _jB["models"][1]["default_request_options"]
+    _m4 = (_rB["language"] == "ja" and _rB["enable_itn"] is True
+           and _rB["keep_tags"] is False)
+    check(_m1 and _m2 and _m3 and _m4,
+          "run: Off and Stored co-host nothing, On co-hosts SenseVoice with the "
+          "documented options, and every control reaches the engine",
+          str([_m1, _m2, _m3, _m4]))
+
+    _resetA(); _speakA("Some call me nature.")
+    _r1 = fp.tts_ref_text(_refA, _cfgA("on")) == "" and not _callsA
+    _r2 = (fp.tts_ref_text(_refA, _cfgA("on"), learn=True) == "Some call me nature."
+           and len(_callsA) == 1)
+    _r3 = (fp.tts_ref_text(_refA, _cfgA("on")) == "Some call me nature."
+           and len(_callsA) == 1)
+    _r4 = fp.tts_ref_text(_refA, _cfgA("stored")) == "Some call me nature."
+    _r5 = fp.tts_ref_text(_refA, _cfgA("off")) == ""
+    check(_r1 and _r2 and _r3 and _r4 and _r5,
+          "run: the speak path reads and calls nothing, the learner transcribes once, "
+          "Stored serves it with no model, Off says nothing",
+          str([_r1, _r2, _r3, _r4, _r5]))
+
+    _resetA(); _speakA("<<TAG>>Some call me nature.".replace("<<TAG>>",
+                                                             "<|en|><|NEUTRAL|>"))
+    _t1 = (fp.tts_ref_text(_refA, _cfgA("on"), learn=True)   # retold p16
+           == "Some call me nature.")
+    _storeA = json.load(open(fp._rt_store_path(_cfgA()), encoding="utf-8"))
+    _rowA = list(_storeA.values())[0]
+    _t2 = _rowA.get("voice") == "femaledarkelf"
+    with open(fp._rt_store_path(_cfgA()), "w", encoding="utf-8") as _f:
+        json.dump({list(_storeA)[0]: "the flat patch8 shape"}, _f)
+    fp._RT_MEM.clear(); fp._RT_LOADED[0] = False
+    _t3 = fp.tts_ref_text(_refA, _cfgA("on")) == "the flat patch8 shape"
+    check(_t1 and _t2 and _t3,
+          "run: markers never reach the store, the voicetype is written beside the "
+          "text, and the older flat file still reads", str([_t1, _t2, _t3]))
+
+    _resetA(); _speakA("slow one", delay=0.35)
+    _tA = _tmA.time()
+    fp.tts_ref_learn(_refA, _cfgA("on"))
+    _fast = (_tmA.time() - _tA) < 0.15
+    fp.tts_ref_learn(_refA, _cfgA("on"))
+    _tmA.sleep(0.7)
+    _once = len(_callsA) == 1
+    _landed = fp.tts_ref_text(_refA, _cfgA("on")) == "slow one"
+    _resetA(); _speakA("x")
+    fp.tts_ref_learn(_refA, _cfgA("stored"))
+    _tmA.sleep(0.15)
+    _quiet = not _callsA
+    check(_fast and _once and _landed and _quiet,
+          "run: the learner returns at once, never doubles up, lands its result, and "
+          "stays silent in Stored", str([_fast, _once, _landed, _quiet]))
+
+    # the ladder: options first, then the ASR entry, then nothing left
+    _resetA()
+    fp._ACPP_NO_OPTS[0] = False; fp._ACPP_NO_ASR[0] = False
+    _l1 = fp.acpp_retry_rung(_cfgA("on")) == "opts"
+    fp._ACPP_NO_OPTS[0] = True
+    _l2 = fp.acpp_retry_rung(_cfgA("on")) == "asr"
+    fp._ACPP_NO_ASR[0] = True
+    _l3 = fp.acpp_retry_rung(_cfgA("on")) == ""
+    fp._ACPP_NO_OPTS[0] = True; fp._ACPP_NO_ASR[0] = False
+    _l4 = fp.acpp_retry_rung(_cfgA("off")) == ""
+    fp._ACPP_NO_OPTS[0] = False; fp._ACPP_NO_ASR[0] = False
+    check(_l1 and _l2 and _l3 and _l4,
+          "run: the ladder drops session options first, the ASR entry second, and "
+          "has nothing to offer a config that carries neither",
+          str([_l1, _l2, _l3, _l4]))
+
+    _resetA(); _speakA("Some call me nature.")
+    fp.tts_ref_text(_refA, _cfgA("on"), learn=True)
+    _cA = fp.api_tts_ref_text_clear({})
+    _cl = (_cA.get("cleared") == 1 and not fp._RT_MEM
+           and not os.path.exists(fp._rt_store_path(_cfgA()))
+           and fp.api_tts_ref_text_clear({}).get("cleared") == 0)
+    check(_cl, "run: Clear forgets memory and disk, counts what it forgot, and an "
+               "empty store clears quietly", str(_cl))
+except Exception as _eAx:
+    check(False, "the patch10 runs did not RUN", str(_eAx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir,
+         fp.panel_log, fp.TTSW.log, fp._ureq) = _lcA
+        fp._RT_MEM.clear(); fp._RT_FAIL.clear(); fp._RT_BUSY.clear()
+        fp._RT_LOADED[0] = True
+        fp._ACPP_NO_ASR[0] = False
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch11
+# The sample vault: SkyrimNet's own clips are read once, repaired into a header
+# that says what the file holds, trimmed to an example rather than a performance,
+# and used from then on. The fault that made 160 clips unplayable stops mattering
+# without a single byte of the originals being touched. Plus the provider title,
+# which glowed in its own colour and so had no edges left.
+section("v3.75 patch11: the repaired sample vault, and the provider glow")
+
+check("def tts_sample_dir(" in py and '"voice-samples"' in py,
+      "the vault has a default home, so a blank setting is still a working one")
+check("def tts_sample_trim(" in py and "0x7FFFFFFF" in py,
+      "frames are read for what the file HOLDS, not the length its header claims")
+check("def tts_sample_adopt(" in py and "os.replace(tmp, dst)" in py,
+      "a repaired copy is written whole or not at all")
+check("_had_vault = os.path.isfile(" in py and '"adopted" if _adopted else "ok"' in py,
+      "only the FIRST repair is news - after that the ledger stays quiet")
+check('.get("ttsSampleAdopt") or "on"' in py,
+      "and the whole behaviour can be turned off")
+check('"ttsSampleDir": ""' in py and '"ttsSampleSec": "10"' in py
+      and py.count('["ttsSampleDir", "Repaired Sample Vault') == 2,
+      "the vault's rows sit in the Audio Files field for both engines")
+check(".provlink:hover { color:var(--txt); text-shadow:0 0 9px var(--pgl); }" in py,
+      "the provider title keeps its glyph light and its colour in the halo")
+nin(py, "color:var(--pgl); text-shadow:0 0 10px var(--pgl)",
+    "the rule that dissolved the title into its own halo is gone")
+
+import tempfile as _tfB, io as _ioB, struct as _stB, wave as _wvB
+try:
+    _lcB = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log,
+            fp.TTSW.log, fp.tts_voice_index)
+    _DB = _tfB.mkdtemp()
+    _VB = os.path.join(_DB, "vault")
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _DB, "ttsSampleDir": _VB}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _DB
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+    fp.tts_voice_index = lambda cfg=None: {}
+    _CB = {"settings": {"logDir": _DB, "ttsSampleDir": _VB, "ttsSampleSec": "10"}}
+
+    def _mkB(path, seconds=20.0, rate=16000, lead=1.0, broken=False):
+        _n = int(rate * seconds)
+        _body = bytearray()
+        for _i in range(_n):
+            _v = 0 if _i < int(rate * lead) else (6000 if (_i // 40) % 2 else -6000)
+            _body += _stB.pack("<h", _v)
+        _buf = _ioB.BytesIO()
+        with _wvB.open(_buf, "wb") as _w:
+            _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(rate)
+            _w.writeframes(bytes(_body))
+        _raw = bytearray(_buf.getvalue())
+        if broken:
+            _raw[4:8] = b"\xff\xff\xff\xff"
+            _raw[40:44] = b"\xff\xff\xff\xff"
+        with open(path, "wb") as _f:
+            _f.write(bytes(_raw))
+        return path
+
+    def _secB(b):
+        with _wvB.open(_ioB.BytesIO(b), "rb") as _w:
+            return _w.getnframes() / float(_w.getframerate())
+
+    _srcB = _mkB(os.path.join(_DB, "femaledarkelf.wav"), 20.0, lead=1.0)
+    _cut = fp.tts_sample_trim(open(_srcB, "rb").read(), 10.0)
+    _t1 = 9.9 < _secB(_cut) <= 10.05
+    _badB = _mkB(os.path.join(_DB, "maleorc.wav"), 8.0, broken=True)
+    _rawB = open(_badB, "rb").read()
+    _fix = fp.tts_sample_trim(_rawB, 10.0)
+    _t2 = bool(_fix) and 7.0 < _secB(_fix) < 8.1
+    with open(os.path.join(_DB, "chk.wav"), "wb") as _f:
+        _f.write(_fix)
+    _t3 = fp.tts_wav_head_ok(open(os.path.join(_DB, "chk.wav"), "rb").read(fp.TTS_WAV_HEAD),
+                             os.stat(os.path.join(_DB, "chk.wav")).st_size)
+    check(_t1 and _t2 and _t3,
+          "run: a long clip is capped, a 0xFFFFFFFF clip is read for what it holds, "
+          "and what comes out passes the panel's own header check",
+          str([_t1, _t2, _t3]))
+
+    _pB = fp.tts_sample_adopt(_badB, "maleorc", _CB)
+    _a1 = _pB == os.path.join(_VB, "maleorc.wav") and os.path.isfile(_pB)
+    _a2 = os.path.getsize(_badB) == len(_rawB)
+    _mtB = os.stat(_pB).st_mtime_ns
+    _a3 = (fp.tts_sample_adopt(_badB, "maleorc", _CB) == _pB
+           and os.stat(_pB).st_mtime_ns == _mtB)
+    with open(os.path.join(_DB, "notawav.wav"), "wb") as _f:
+        _f.write(b"this is not audio")
+    _a4 = (fp.tts_sample_adopt(os.path.join(_DB, "nope.wav"), "ghost", _CB) == ""
+           and fp.tts_sample_adopt(os.path.join(_DB, "notawav.wav"), "junk", _CB) == "")
+    check(_a1 and _a2 and _a3 and _a4,
+          "run: the copy lands under the voicetype's name, the original is never "
+          "touched, a repaired voice is not repaired twice, and rubbish is refused",
+          str([_a1, _a2, _a3, _a4]))
+
+    fp._VT_SHA.clear(); fp._SHA_VT.clear()
+    _s2B = _mkB(os.path.join(_DB, "femaleshrill.wav"), 12.0, broken=True)
+    _g1, _v1 = fp.tts_sample_gate(_s2B, "femaleshrill", _CB)
+    _g2, _v2 = fp.tts_sample_gate(_s2B, "femaleshrill", _CB)
+    _r1 = (_g1 == os.path.join(_VB, "femaleshrill.wav") and _v1 == "adopted"
+           and _g2 == _g1 and _v2 == "ok")
+    _r2 = fp._VT_SHA.get("femaleshrill") == fp.tts_ref_fingerprint(_g1)[2]
+    _offB = dict(_CB["settings"]); _offB["ttsSampleAdopt"] = "off"
+    fp._VT_SHA.clear(); fp._SHA_VT.clear()
+    _s3B = _mkB(os.path.join(_DB, "malebrute.wav"), 6.0)
+    _g3, _v3 = fp.tts_sample_gate(_s3B, "malebrute", {"settings": _offB})
+    _r3 = _g3 == _s3B and not os.path.exists(os.path.join(_VB, "malebrute.wav"))
+    check(_r1 and _r2 and _r3,
+          "run: the first line repairs and speaks from the vault, later lines are "
+          "quiet, the ledger records the copy's hash, and Off changes nothing",
+          str([_r1, _r2, _r3]))
+except Exception as _eBx:
+    check(False, "the patch11 runs did not RUN", str(_eBx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log,
+         fp.TTSW.log, fp.tts_voice_index) = _lcB
+        fp._VT_SHA.clear(); fp._SHA_VT.clear()
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch12
+# The server card reads as ONE design: every group boundary is the same height
+# with its divider dead centre, the Speculative Decoding section is built from
+# the same anatomy as its neighbours - tight cells, blue flag references - and
+# the two model-head notes are the yellow chip they were describing.
+section("v3.75 patch12: the card reads as one design")
+
+check(".slotgrid .pcell:has(+ .pgrp) { margin-bottom:0 !important; }" in py,
+      "the cell before a heading gives its margin up, whatever kind of cell it was")
+check(".slotgrid .pgrp { margin:18px 0 12px; padding-top:18px; }" in py,
+      "so the heading owns the whole gap: 18 above the line, 18 below it, every group")
+check("'<div class=\"pgrp\">Speculative Decoding'" in py,
+      "the segment opens with a real group heading, not a bold row pretending")
+check("const ref9 = function(flag)" in py and 'style="cursor:default"' in py,
+      "its flag references are styled like the others and honest about not opening")
+check('ref9(flag)' in py and py.count('"--spec-draft-') >= 14,
+      "every cell names the flag it writes, in blue, like every cell above it")
+check("'<div class=\"pcell ptight\"'" in py,
+      "and its cells are as tight as the generation cells they sit under")
+check("'Built-in MTP head</span>')" in py and 'class="mandy"' in py,
+      "the built-in head is a yellow chip beside the heading, only when it is the drafter")
+check("+ 'Built-in MTP head</span></div>'" in py,
+      "and the note under the model dropdown is the same chip, not a coloured hint")
+nin(py, "Built-in MTP head detected",
+    "the prose version of that note is gone")
+nin(py, "type: draft-mtp - the model's own head",
+    "so is the right-aligned type caption the chip replaces")
+nin(py, "type read from the drafter's own header",
+    "for file drafters the picker already names the type - no caption repeats it")
+
+# ----------------------------------------------------------------- v3.75 patch13
+# The runaway is met with a measurement, not a clock: audio held against what the
+# TEXT should take, one retry, both takes on record - Line Time Limit remains as
+# the alternate mode. And the Sample Vault becomes the default home for voices:
+# created by the installer, fed by SkyrimNet or by the owner's local clips, with
+# a local clip's edits taking effect the moment its bytes change.
+section("v3.75 patch13: runaway detection and the vault as the default")
+
+check('"ttsRunawayMode": "detect",' in py and '"ttsRunawayRatio": "1.7",' in py,
+      "detection is the default handling, with the threshold a setting")
+check('"ttsAcppRefSlots": "1024",' in py
+      and 'st.get("ttsAcppRefSlots", "1024")' in py,
+      "the voice cache defaults to 1024 everywhere a default is read")
+check("def tts_wav_seconds(" in py and "def tts_runaway_expect(" in py
+      and "def tts_runaway_verdict(" in py,
+      "the audio is measured, the text sets the expectation, the verdict compares")
+# retold patch16: the fitted constants live in the voice model the cap uses
+check("VOICE_SLOPE0" in py and "VOICE_BASE0" in py and "RUNAWAY_SHORT = 0.5" in py
+      and "return tts_voice_tokens(text, vt, rows)[0] / TTS_ACPP_FRAME_RATE" in py,
+      "the expectation IS the voice model - one number prices and judges alike")
+check("deliberately independent of the auto-cal estimator" in py,
+      "and it cannot collapse with a setting - the fault the first draft carried")
+check('_rv13, _sec13, _exp13 = tts_runaway_verdict(' in py   # retold p16: vt rides along
+      and 'if _b2 and abs(_s2 - _exp13) < abs(_sec13 - _exp13):' in py,
+      "a runaway is retried once and the take closer to its estimate speaks")
+check('elif _rv13 == "short":' in py and "words may have been dropped" in py,
+      "a short take is measured and said, never retried - the rate comes first")
+check('busy_ms = max(busy_ms, 30000)' in py,
+      "detect mode floors the server clock so the cap, not the clock, is the bound")
+check('os.path.join(STACK, "Sample Vault")' in py and '"voice-samples"' in py,
+      "the vault lives beside the panel, and a populated patch11 vault still reads")
+check("def _vault_index_get(" in py and "def _vault_index_set(" in py
+      and "_vault_index_set(d, vt, src_sha)" in py,
+      "every vault entry remembers the source bytes that built it")
+check("is_local = bool(vdir)" in py
+      and "if not (is_local and src_sha and _vault_index_get(d, vt) != src_sha):" in py,
+      "a changed LOCAL clip re-adopts; a changed upload does not churn the vault")
+# retold patch31: one writer for all four discovered paths, not a block per branch
+check('st["ttsSampleDir"] = vault' in py
+      and "os.makedirs(vault, exist_ok=True)" in py
+      and "tts_write_install_paths(paths[" in py,
+      "the installer creates the vault and writes the path into the field")
+check('["ttsRunawayMode", "Runaway Handling' in py
+      and '["ttsRunawayRatio", "Runaway Threshold' in py,
+      "the dropdown and its rows are on the page")
+check('f[2] === "sel"' in py and 'if (f.length < 5 || !f[4]) return true;' in py,
+      "the fieldset renders selects, and a row tied to a mode exists only under it")
+
+import io as _ioC, wave as _wvC, json as _jsC, tempfile as _tfC, struct as _stC
+try:
+    _lcC = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log, fp.TTSW.log)
+    _DC = _tfC.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _DC}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _DC
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+
+    def _bodyC(s):
+        _b = _ioC.BytesIO()
+        with _wvC.open(_b, "wb") as _w:
+            _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(24000)
+            _w.writeframes(bytes(2) * int(24000 * s))   # two zero bytes, no escapes
+        return _b.getvalue()
+
+    _stD = {"ttsRunawayRatio": "1.7"}
+    _tagC = "<|emotion:sadness|>... <|sfx:sigh|>Ahh, Morning."
+    _longC = "Good morning to you, my friend, and welcome to the college today."
+    _v1 = fp.tts_runaway_verdict(_bodyC(27.52), "Good morning.", _stD)[0] == "runaway"
+    _v2 = fp.tts_runaway_verdict(_bodyC(1.54), "Good morning.", _stD)[0] == ""
+    _v3 = fp.tts_runaway_verdict(_bodyC(4.8), _longC, _stD)[0] == ""
+    # retold patch16: a sigh-line is a PERFORMANCE - exempt, and verified by the
+    # recogniser instead when it is suspect
+    _v4 = fp.tts_runaway_verdict(_bodyC(1.28), _tagC, _stD)[0] == ""
+    _v5 = fp.tts_runaway_verdict(_bodyC(4.0), _tagC, _stD)[0] == ""
+    _v6 = fp.tts_runaway_verdict(b"junk", "x", _stD)[0] == ""
+    check(_v1 and _v2 and _v3 and _v4 and _v5 and _v6,
+          "run: the 27.5s field runaway flags, the sigh-line is exempt as a "
+          "performance, and every legitimate field take - median, long, "
+          "slow-tagged - passes", str([_v1, _v2, _v3, _v4, _v5, _v6]))
+
+    _b1 = _jsC.loads(fp.tts_acpp_config({"settings": {"logDir": _DC,
+                                                      "ttsAcppBusyMs": "9000"}}))
+    _b2 = _jsC.loads(fp.tts_acpp_config({"settings": {"logDir": _DC,
+                                                      "ttsAcppBusyMs": "9000",
+                                                      "ttsRunawayMode": "limit"}}))
+    _b3 = _jsC.loads(fp.tts_acpp_config({"settings": {"logDir": _DC,
+                                                      "ttsAcppBusyMs": "45000"}}))
+    _bb = (_b1["models"][0]["busy_timeout_ms"] == 30000
+           and _b2["models"][0]["busy_timeout_ms"] == 9000
+           and _b3["models"][0]["busy_timeout_ms"] == 45000)
+    check(_bb, "run: detect floors the clock at 30s, limit keeps the user's, and a "
+               "clock already above the floor is respected", str(_bb))
+
+    _VC = _tfC.mkdtemp(); _LC = _tfC.mkdtemp(); _UC = _tfC.mkdtemp()
+    def _mkC(path, seed):
+        _b = _ioC.BytesIO()
+        with _wvC.open(_b, "wb") as _w:
+            _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(16000)
+            _w.writeframes(_stC.pack("<h", 5000 - seed) * 48000)
+        with open(path, "wb") as _f:
+            _f.write(_b.getvalue())
+        return path
+    _CVC = {"settings": {"logDir": _DC, "ttsSampleDir": _VC, "ttsVoiceDir": _LC,
+                         "ttsSampleSec": "10"}}
+    _upC = _mkC(os.path.join(_UC, "femaledarkelf.wav"), 1)
+    _p1 = fp.tts_sample_adopt(_upC, "femaledarkelf", _CVC)
+    _r1 = _p1 == os.path.join(_VC, "femaledarkelf.wav")
+    _mkC(_upC, 2)
+    _shaA = fp.tts_ref_fingerprint(_p1)[2]
+    fp.tts_sample_adopt(_upC, "femaledarkelf", _CVC)
+    _r2 = fp.tts_ref_fingerprint(_p1)[2] == _shaA
+    _lcC2 = _mkC(os.path.join(_LC, "femaledarkelf.wav"), 3)
+    fp.tts_sample_adopt(_lcC2, "femaledarkelf", _CVC)
+    _r3 = fp.tts_ref_fingerprint(_p1)[2] != _shaA
+    _shaB = fp.tts_ref_fingerprint(_p1)[2]
+    fp.tts_sample_adopt(_lcC2, "femaledarkelf", _CVC)
+    _r4 = fp.tts_ref_fingerprint(_p1)[2] == _shaB
+    _mkC(_lcC2, 4)
+    fp.tts_sample_adopt(_lcC2, "femaledarkelf", _CVC)
+    _r5 = fp.tts_ref_fingerprint(_p1)[2] != _shaB
+    _idxC = _jsC.load(open(os.path.join(_VC, "vault-index.json"), encoding="utf-8"))
+    _r6 = _idxC.get("femaledarkelf") == fp.tts_ref_fingerprint(_lcC2)[2]
+    check(_r1 and _r2 and _r3 and _r4 and _r5 and _r6,
+          "run: uploads adopt once and never churn, a local clip re-adopts exactly "
+          "when its bytes change, and the index records the source",
+          str([_r1, _r2, _r3, _r4, _r5, _r6]))
+except Exception as _eCx:
+    check(False, "the patch13 runs did not RUN", str(_eCx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir,
+         fp.panel_log, fp.TTSW.log) = _lcC
+    except Exception:
+        pass
+
+
+
+# ----------------------------------------------------------------- v3.75 patch14
+# Reference transcripts become the default rather than an option: On out of the
+# box (costing nothing until a model exists), the Higgs installer fetches the
+# SenseVoice recogniser audio.cpp's own documentation names and points the field
+# at it, the page guards against picking the TTS model itself, every control in
+# the section carries a ? explanation, and finishing an install refreshes the
+# very settings and model lists the install just changed.
+section("v3.75 patch14: transcripts by default, SenseVoice by installer")
+
+check('"ttsAsrMode": "on",' in py
+      and py.count('st.get("ttsAsrMode") or "on"') == 4,   # retold p16: +tts_asr_live
+      "On is the default in the setting AND in every fallback that reads it")
+check('SENSE_GGUF_REPO = "FunAudioLLM/SenseVoiceSmall-GGUF-audiocpp"' in py
+      and 'SENSE_GGUF_PATH = "sensevoice-small-q8-audiocpp-v1.gguf"' in py,
+      "the source is the one audio.cpp's sense_asr doc names for this release")
+check('_hi_download(url, sv, "sensevoice")' in py
+      and "transcripts stay idle until a model is picked" in py,
+      "the installer fetches it and a miss is logged, never fatal")
+check('st["ttsAcppAsrModel"] = sv' in py and 'if sv:' in py,
+      "and the field is pointed at it only when it actually arrived")
+check(py.count('ttsTitle("SenseVoice model (.gguf)"')
+      + py.count('ttsTitle("Recognition language"')
+      + py.count('ttsTitle("Numbers"') == 3,   # retold p16: Meta tags removed
+      "every control in the section explains itself the way the title does")
+check("not a recogniser - the server will refuse the entry" in py,
+      "picking the TTS model as the recogniser is named for what it is")
+check("ttsModels = null;" in py and 'if (curTab === "tts") renderTts(true);' in py,
+      "the install's end forces fresh settings, a fresh model list, a fresh page")
+
+import tempfile as _tfE, json as _jsE
+try:
+    _lcE = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log)
+    _DE = _tfE.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _DE}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _DE
+    fp.panel_log = lambda *a, **k: None
+    _svE = os.path.join(_DE, "sensevoice-small-q8-audiocpp-v1.gguf")
+    with open(_svE, "wb") as _f:
+        _f.write(b"GGUF")
+    _base = {"logDir": _DE, "ttsAcppModel": "D:/m/h.gguf", "ttsAcppAsrModel": _svE}
+    _j1 = _jsE.loads(fp.tts_acpp_config({"settings": dict(_base)}))
+    _j2 = _jsE.loads(fp.tts_acpp_config({"settings": dict(_base, ttsAsrMode="off")}))
+    _j3 = _jsE.loads(fp.tts_acpp_config({"settings": dict(_base, ttsAsrMode="stored")}))
+    _e1 = len(_j1["models"]) == 2 and _j1["models"][1]["family"] == "sense_asr"
+    _e2 = len(_j2["models"]) == 1 and len(_j3["models"]) == 1
+    check(_e1 and _e2,
+          "run: a config that never mentions the mode co-hosts the recogniser - On "
+          "IS the default - while Off and Stored still co-host nothing",
+          str([_e1, _e2]))
+except Exception as _eEx:
+    check(False, "the patch14 run did not RUN", str(_eEx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log) = _lcE
+    except Exception:
+        pass
+
+# ----------------------------------------------------------------- v3.75 patch15
+# What a line costs is now FITTED from what that voice has actually cost, not
+# guessed from a constant that was too tight on short lines - where a cap-hit
+# returns 500 and NO audio, losing the line - and too loose on long ones, where
+# it let a runaway burn twice as long as it needed to.
+section("v3.75 patch15: every voice prices its own lines")
+
+check("VOICE_SLOPE0 = 1.065" in py and "VOICE_BASE0 = 25.2" in py,
+      "the cold-start fit is the one measured from the sweeps, written down")
+check("def tts_voice_extra(" in py and py.count("tts_voice_extra(") >= 3
+      and "def tts_voice_parts(" in py,          # retold p16: one decomposition
+      "ONE function prices what a line performs - predictor and record share it")
+check('"bare": len(re.sub(' in py and '"extra": round(tts_voice_extra(t), 1),' in py
+      and '"vt": str(vt or ""),' in py,
+      "a measurement records the voice, the spoken length, and the performed cost")
+check("resid = tk - slope * c - float(r.get(\"extra\") or 0)" in py
+      and 'if int(r.get("lex", 1)) == 0:' in py,   # retold p16
+      "and the fit subtracts exactly what the predictor added")
+check("if resid > VOICE_BASE0 * 6:      # a runaway, not an overhead" in py,
+      "a runaway never teaches the model, or it inflates every later cap")
+check('else (r.get("bare") or r.get("chars") or 0))' in py,   # retold p16
+      "rows written before this patch still count, on their raw length")
+check("def tts_voice_key(" in py and "tts_auto_cap(text, _st0, vt=tts_voice_key(ref_path))" in py
+      and "vt=tts_voice_key(ref_path)," in py,
+      "the vault's filename IS the voicetype, on the cap path and the record alike")
+check("if _n15 >= VOICE_MIN_N:" in py,
+      "a voice that has not spoken enough keeps the old constant, unchanged")
+
+try:
+    _lcF = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log)
+    import tempfile as _tfF
+    _DF = _tfF.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _DF}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _DF
+    fp.panel_log = lambda *a, **k: None
+
+    def _bareF(x):
+        return len(re.sub(r"<\|[^|>]*\|>", "", x).strip())
+    def _rowF(text, sec, vt="player"):
+        return {"chars": len(text), "bare": _bareF(text), "vt": vt,
+                "extra": round(fp.tts_voice_extra(text), 1), "tok": round(sec*25, 1)}
+    # the real corpus shape: three lengths, a tagged cell, and ONE runaway
+    _R = ([_rowF("Good morning", 1.54) for _ in range(6)]
+          + [_rowF("Good morning to you", 1.68) for _ in range(6)]
+          + [_rowF("Good morning to you, my friend, and welcome", 2.84) for _ in range(6)]
+          + [_rowF("<|sfx:sigh|>Good morning", 1.90) for _ in range(6)]
+          + [_rowF("Good morning", 27.52)])
+    _n, _b, _sd, _sl = fp.tts_voice_stats(_R, "player")
+    _f1 = _n == len(_R) - 1
+    _f2 = 15 < _b < 40 and 0.6 < _sl < 1.5
+    _p = fp.tts_voice_tokens("Good morning", "player", _R)[0]
+    _f3 = abs(_p - 38.5) < 12
+    _short = fp.tts_voice_cap("Good morning.", "player", _R, {})
+    _long = fp.tts_voice_cap("Good morning to you, my friend, and welcome to the "
+                             "college today.", "player", _R, {})
+    _f4 = _short > fp.acpp_token_cap("Good morning.", {})
+    _f5 = _long < fp.acpp_token_cap("Good morning to you, my friend, and welcome to "
+                                    "the college today.", {})
+    check(_f1 and _f2 and _f3 and _f4 and _f5,
+          "run: the runaway is dropped, the fit lands on speech, and the cap gains "
+          "room on short lines while losing it on long ones",
+          str([_f1, _f2, _f3, _f4, _f5]))
+
+    _n0, _b0, _sd0, _sl0 = fp.tts_voice_stats([], "stranger")
+    _g1 = _n0 == 0 and _b0 == fp.VOICE_BASE0 and _sl0 == fp.VOICE_SLOPE0
+    _g2 = 0 < fp.tts_voice_cap("Good morning.", "stranger", [], {}) <= fp.TTS_CAP_CEILING
+    _cv, _nv, _ev = fp.tts_auto_cap("Good morning.", {}, rows=_R, vt="player")
+    _cn, _nn, _en = fp.tts_auto_cap("Good morning.", {}, rows=_R, vt="")
+    _g3 = _cv == _short and "player" in _nv and _ev > 0
+    _g4 = _cn == fp.acpp_token_cap("Good morning.", {}) and _nn == "" and _en == 0.0
+    check(_g1 and _g2 and _g3 and _g4,
+          "run: an unheard voice uses the shipped fit and still caps, a known voice "
+          "prices its own line and says so, and no voicetype means no change at all",
+          str([_g1, _g2, _g3, _g4]))
+
+    _t = "<|emotion:sadness|>... <|sfx:sigh|>Ahh, Morning."
+    _rec = fp.tts_measure_row(_t, 2.0, vt="femaledarkelf")
+    _h1 = (_rec.get("vt") == "femaledarkelf" and _rec.get("bare") == _bareF(_t)
+           and abs(_rec.get("extra") - fp.tts_voice_extra(_t)) < 0.01)
+    _h2 = (abs(fp.tts_voice_tokens(_t, "nobody", [])[0]   # retold p16: SPOKEN length
+               - (fp.VOICE_BASE0 + fp.VOICE_SLOPE0 * fp.tts_voice_parts(_t)[0]
+                  + fp.tts_voice_extra(_t, [])))
+           < 0.01)
+    _h3 = fp.tts_voice_extra("Good morning.") == 0.0
+    check(_h1 and _h2 and _h3,
+          "run: the record carries what the fit needs, and a line is priced by one "
+          "arithmetic on both sides", str([_h1, _h2, _h3]))
+except Exception as _eFx:
+    check(False, "the patch15 runs did not RUN", str(_eFx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log) = _lcF
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch16
+# One model prices, judges and now VERIFIES. The verdict runs on the same
+# per-voice fit as the cap; performances - "Ahh...", a lone sigh - are exempt
+# from judgement and from teaching the fit; tag costs are learned from lines
+# that carried them; a suspect short take is transcribed and convicted or
+# acquitted on its words; and the dial that was wired to nothing is gone.
+section("v3.75 patch16: the recogniser joins the verdict")
+
+check("def tts_voice_parts(" in py and 'r"\\.{2,}|\\u2026"' in py
+      and py.count("tts_voice_parts(") >= 5,
+      "one decomposition of a line, shared by pricing, fitting and exemption")
+check("def tts_line_lexical(" in py and 'r"[aeiouhmw]+"' in py
+      and 'r"(.)\\1"' in py,
+      "a performance is breathy letters WITH a stretch - a charset cannot tell "
+      "an order from a moan")
+check("def tts_tag_costs(" in py and "max(3.0, min(60.0," in py
+      and "if len(vals) < 6:" in py,
+      "tag costs are learned from measured lines, clamped, and defer to the "
+      "prior until enough exist")
+check('"keep_tags": False,' in py and "ttsAsrTags" not in py,
+      "the recogniser is never asked for markers, and the dial is gone")
+check("def tts_asr_live(" in py and "def tts_asr_transcribe(" in py
+      and py.count("/v1/audio/transcriptions") == 1,
+      "one place speaks to the endpoint; the learner, verifier and note share it")
+check("def tts_take_verify(" in py and "hit * 2 > len(words)" in py
+      and 'os.remove(tmp)' in py,
+      "a suspect take is judged on a strict majority of its words, and the "
+      "scratch file does not outlive the question")
+check('_vfy = tts_take_verify(body, processed, cfg)' in py
+      and 'if _vfy == "dropped":' in py and '\\u2713 short take verified' in py,
+      "dropped words earn one retry; a brief take that spoke them is praised")
+check("if not tts_line_lexical(text):" in py
+      and 'vt=tts_voice_key(ref_path))' in py,
+      "the verdict knows the voice and passes a performance unjudged")
+check('"vault-notes.json"' in py and "tts_asr_live(cfg)" in py,
+      "what the recogniser heard in a sample is kept beside the vault, as a note")
+
+import types as _tyG, json as _jsG, tempfile as _tfG
+try:
+    _lcG = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log,
+            fp._ureq, fp._ACPP_NO_ASR[0])
+    _DG = _tfG.mkdtemp()
+    fp.load_config = lambda *a, **k: {"settings": {"logDir": _DG, "ttsAsrMode": "on",
+                                                   "ttsAcppAsrModel": "D:/m/s.gguf"}}
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda cfg=None: _DG
+    fp.panel_log = lambda *a, **k: None
+    fp._ACPP_NO_ASR[0] = False
+
+    import io as _ioG, wave as _wvG
+    def _bodyG(s):
+        _b = _ioG.BytesIO()
+        with _wvG.open(_b, "wb") as _w:
+            _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(24000)
+            _w.writeframes(bytes(2) * int(24000 * s))
+        return _b.getvalue()
+
+    _sp, _sx, _dt, _pz = fp.tts_voice_parts(
+        "<|emotion:sadness|>... <|sfx:sigh|>Ahh, Morning.")
+    _p1 = _sx == 1 and _dt == 1 and _sp == len("Ahh, Morning.")
+    _p2 = (fp.tts_line_lexical("Run. Now.")
+           and not fp.tts_line_lexical("Ahh...")
+           and not fp.tts_line_lexical("<|sfx:moan|>Mmm"))
+    check(_p1 and _p2, "run: the ellipsis is a pause, not characters, and an order "
+          "is words while a moan is not", str([_p1, _p2]))
+
+    def _rowG(text, tok):
+        _s, _x, _d, _ = fp.tts_voice_parts(text)
+        return {"spoken": _s, "sfx": _x, "dots": _d,
+                "lex": 1 if fp.tts_line_lexical(text) else 0,
+                "extra": 0.0, "tok": float(tok), "vt": "player",
+                "chars": len(text), "bare": _s}
+    _base = [_rowG("Good morning to you my friend",
+                   fp.VOICE_BASE0 + fp.VOICE_SLOPE0 * 29) for _ in range(8)]
+    _sfxr = [_rowG("<|sfx:sigh|>Good morning to you my friend",
+                   fp.VOICE_BASE0 + fp.VOICE_SLOPE0 * 29 + 30) for _ in range(8)]
+    _c1, _d1 = fp.tts_tag_costs(_base + _sfxr)
+    _q1 = abs(_c1 - 30) < 2 and _d1 == fp.VOICE_DOTS_TOK
+    _c2, _ = fp.tts_tag_costs(_base + _sfxr[:5]
+                              + [_rowG("<|sfx:sigh|>Good morning to you my friend",
+                                       3000)])
+    _q2 = _c2 <= 60
+    _q3 = fp.tts_tag_costs(_base + _sfxr[:3])[0] == fp.VOICE_SFX_TOK
+    _perf = [_rowG("Ahh...", 200) for _ in range(6)]
+    _q4 = (fp.tts_voice_stats(_base, "player")[:2]
+           == fp.tts_voice_stats(_base + _perf, "player")[:2])
+    check(_q1 and _q2 and _q3 and _q4,
+          "run: eight measured sighs teach ~30 tokens, one poisoned row cannot "
+          "teach 3000, five are too few, and moans teach nothing",
+          str([_q1, _q2, _q3, _q4]))
+
+    _exp = fp.tts_runaway_expect("Good morning.", "player", _base)
+    _prd = fp.tts_voice_tokens("Good morning.", "player", _base)[0] / 25.0
+    _r1 = abs(_exp - _prd) < 1e-9
+    _r2 = fp.tts_runaway_verdict(_bodyG(27.52), "Good morning.", {},
+                                 vt="player", rows=_base)[0] == "runaway"
+    _r3 = fp.tts_runaway_verdict(_bodyG(9.0), "Ahh...", {}, vt="player",
+                                 rows=_base)[0] == ""
+    _r4 = fp.tts_runaway_verdict(_bodyG(0.4), "<|sfx:moan|>Mmm", {},
+                                 vt="player", rows=_base)[0] == ""
+    _long = "Good morning to you, my friend, and welcome to the college today."
+    _r5 = fp.tts_runaway_verdict(_bodyG(fp.tts_runaway_expect(_long) * 0.2),
+                                 _long, {})[0] == "short"
+    check(_r1 and _r2 and _r3 and _r4 and _r5,
+          "run: one expectation for cap and verdict, the field runaway still "
+          "flags, performances pass in both directions, worded shorts still flag",
+          str([_r1, _r2, _r3, _r4, _r5]))
+
+    _heard = ["<|en|><|NEUTRAL|><|Speech|>Ahh."]
+    class _RespG:
+        def read(self):
+            return _jsG.dumps({"text": _heard[0]}).encode()
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+    fp._ureq = _tyG.SimpleNamespace(Request=fp._ureq.Request,
+                                    urlopen=lambda req, timeout=0: _RespG())
+    _s1 = fp.tts_take_verify(_bodyG(1.28), "Ahh, Morning.", None) == "dropped"
+    _heard[0] = "<|en|>ahh, morning"
+    _s2 = fp.tts_take_verify(_bodyG(1.28), "Ahh, Morning.", None) == "spoken"
+    _s3 = fp.tts_take_verify(_bodyG(1.0), "Mmm", None) == ""
+    fp._ACPP_NO_ASR[0] = True
+    _s4 = fp.tts_take_verify(_bodyG(1.28), "Ahh, Morning.", None) == ""
+    fp._ACPP_NO_ASR[0] = False
+    _s5 = not [f for f in os.listdir(_DG) if f.startswith("verify-")]
+    check(_s1 and _s2 and _s3 and _s4 and _s5,
+          "run: a transcript missing the words convicts, one carrying them "
+          "acquits, one word cannot convict, no recogniser no verdict, and the "
+          "scratch is gone", str([_s1, _s2, _s3, _s4, _s5]))
+except Exception as _eGx:
+    check(False, "the patch16 runs did not RUN", str(_eGx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log,
+         fp._ureq, fp._ACPP_NO_ASR[0]) = _lcG
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch17
+# A session that fails must leave enough behind to say WHY. audio.cpp is asked to
+# log; the panel writes its own launch banner whatever the server chooses to say;
+# failures carry stable codes and, for the memory ones, what was resident; an
+# allocation failure is retried rather than silently dropping the line; and every
+# step on the audio path books its own milliseconds instead of vanishing into one
+# residual called "panel".
+section("v3.75 patch17: the audio path explains itself")
+
+check('args = [exe, "--config", cfgp, "--log"]' in py,
+      "audio.cpp is asked for its own logs - without this it barely speaks")
+check("def tts_launch_banner(" in py and "tts_launch_banner(cfg, args," in py
+      and "PandorumLLM %s launching audio.cpp at %s" in py,
+      "the panel records what IT launched, whatever the server then says")
+check('"  model  id=%-8s family=%-18s task=%-5s  %8.1f MiB  %s"' in py
+      and 'lines.append("  argv   %s"' in py,
+      "every model, family, size and the argv are in that banner")
+check("def tts_vram_probe(" in py and "query-compute-apps=pid,process_name,used_memory" in py
+      and "def tts_vram_line(" in py,
+      "and what is resident on the card, which no log could say before")
+check("TTS_ERR = {" in py and '"ALLOC": ("TTS-E01"' in py and '"EOC": ("TTS-E02"' in py
+      and "def tts_err(" in py,
+      "failures carry stable codes that survive rewording and grep cleanly")
+check('_alloc = ("allocate" in _msg or "out of memory" in _msg' in py
+      and "if _alloc and _try < 2:" in py and "time.sleep(0.6 * (_try + 1))" in py,
+      "an allocation failure waits and asks again - it used to lose the line")
+check("def tts_gpu_uuid(" in py and py.count("tts_gpu_uuid(") >= 3,
+      "one resolver for the pinned card, used everywhere it is needed")
+check("class spend_step(" in py and "def spend_reset(" in py
+      and py.count("with spend_step(") >= 5,
+      "each audio-path step books its own time")
+check('spend_bits(\n' in py or 'for _st17, _ms17 in spend_bits(' in py,
+      "and the report prints the ledger, not one residual")
+check('"thought audio"' in py and '"sample gate"' in py and '"transcript"' in py,
+      "including thought synthesis, which hid 2.6s inside 'panel' in the field")
+check("!/higgs|vibevoice|indextts|fish-audio|voxcpm/i.test" in py,
+      "the recogniser picker stops offering speech models as recognisers")
+
+try:
+    _lcH = (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log)
+    import tempfile as _tfH
+    _DH = _tfH.mkdtemp()
+    _cfgH = {"settings": {"logDir": _DH, "ttsGpuId": "gpu1",
+                          "ttsAcppModel": os.path.join(_DH, "higgs.gguf"),
+                          "ttsAsrMode": "off"},
+             "gpus": [{"id": "gpu0", "uuid": "GPU-aaa"},
+                      {"id": "gpu1", "uuid": "GPU-zotac"}]}
+    fp.load_config = lambda *a, **k: _cfgH
+    fp.load_config_cached = fp.load_config
+    fp.log_dir = lambda c=None: _DH
+    fp.panel_log = lambda *a, **k: None
+    with open(_cfgH["settings"]["ttsAcppModel"], "wb") as _f:
+        _f.write(b"x" * 4096)
+
+    _u1 = fp.tts_gpu_uuid(_cfgH) == "GPU-zotac"
+    _u2 = fp.tts_gpu_uuid({"settings": {}, "gpus": []}) == ""
+    _v1 = fp.tts_vram_probe("") == (0, 0, []) and fp.tts_vram_line("") == ""
+    check(_u1 and _u2 and _v1,
+          "run: the pinned card resolves by id, an unset one is empty, and a probe "
+          "with no card is silent rather than fatal", str([_u1, _u2, _v1]))
+
+    fp.tts_launch_banner(_cfgH, ["audiocpp_server", "--config", "c.json", "--log"],
+                         "GPU-zotac")
+    with open(fp.tts_server_log_path(_cfgH), encoding="utf-8") as _f:
+        _txt = _f.read()
+    _b1 = "launching audio.cpp" in _txt and "higgs_audio_tts" in _txt
+    _b2 = "GPU-zotac" in _txt and "--log" in _txt
+    _b3 = "MiB" in _txt
+    check(_b1 and _b2 and _b3,
+          "run: the banner names the model, its family, the pinned card and the "
+          "argv - a silent server is still diagnosable", str([_b1, _b2, _b3]))
+
+    _e1 = fp.tts_err("ALLOC", "x").startswith("TTS-E01")
+    _e2 = fp.tts_err("EOC").startswith("TTS-E02")
+    _e3 = fp.tts_err("NOPE").startswith("TTS-E00")
+    fp.spend_reset()
+    with fp.spend_step("thought audio"):
+        time.sleep(0.02)
+    fp.spend_add("sample gate", 0.01)
+    fp.spend_add("identity note", 0.0)
+    _bits = fp.spend_bits(("thought audio", "sample gate"))
+    _s1 = [k for k, _v in _bits] == ["thought audio", "sample gate"]
+    _s2 = all(v > 0 for _k, v in _bits)
+    fp.spend_reset()
+    _s3 = fp.spend_bits() == []
+    check(_e1 and _e2 and _e3 and _s1 and _s2 and _s3,
+          "run: every code is stable, an unknown one still answers, the ledger "
+          "keeps its order, ignores nothing-time and empties per line",
+          str([_e1, _e2, _e3, _s1, _s2, _s3]))
+except Exception as _eHx:
+    check(False, "the patch17 runs did not RUN", str(_eHx)[:140])
+finally:
+    try:
+        (fp.load_config, fp.load_config_cached, fp.log_dir, fp.panel_log) = _lcH
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch18
+# The ruler, before anything is measured against it. A line that failed once and
+# succeeded once was reported as ONE slow synthesis - realtime factor, tps and
+# the record all read a number no single take ever took, which is how a healthy
+# engine came to look like a broken one. The take that played is now reported on
+# its own, the discarded attempts beside it, and every line's numbers are also
+# written machine-readably so a fixed cost can finally be told from a per-token
+# one across hundreds of lines rather than six.
+section("v3.75 patch18: the take, not the ladder")
+
+check('"final_s": 0.0, "wasted_s": 0.0, "tries": 0' in py   # retold p19: per-thread
+      and 'TTS_TAKE["final_s"] = time.time() - _t0' in py
+      and 'TTS_TAKE["wasted_s"] += _spent' in py,
+      "the ladder records the take that played and the time thrown away, apart")
+check('_fin18 = float(TTS_TAKE.get("final_s") or 0.0) or synth' in py
+      and '(secs / _fin18) if _fin18 else 0.0, _fin18, secs' in py,
+      "the realtime factor is the take alone")
+check('% ("server:", _fin18 * 1000.0, toks,' in py
+      and '(toks / _fin18) if _fin18 else 0.0' in py,
+      "and so is the tps - the number that read 43 while the take ran at 75")
+check('"discard:", _wst18 * 1000.0' in py and "attempt(s) thrown away before" in py,
+      "what was discarded is still shown, on its own line, never hidden")
+check('wall=(float(TTS_TAKE.get("final_s") or 0.0)' in py,
+      "the measure record keeps the take's own wall time, not the ladder's")
+check("TTS_TIMING_CSV" in py and "def tts_timing_row(" in py
+      and '"ref_s", "ref_bytes", "ref_text_chars", "cap"' in py,
+      "every line's numbers are written machine-readably, reference included")
+check("def tts_ref_facts(" in py and "w.getnframes() / float(w.getframerate() or 1)" in py,
+      "including how long the reference sample actually is")
+check("the server returns no generate/" in py,
+      "and a missing server-side split is said plainly, not silently absorbed")
+check('"ttsSampleSec": "10",' in py,
+      "the sample length is unchanged - a guess does not become a default")
+
+import tempfile as _tfJ, io as _ioJ, wave as _wvJ, struct as _stJ
+try:
+    _lcJ = (fp.log_dir, fp.panel_log)
+    _DJ = _tfJ.mkdtemp()
+    fp.log_dir = lambda cfg=None: _DJ
+    fp.panel_log = lambda *a, **k: None
+    _refJ = os.path.join(_DJ, "player.wav")
+    _bJ = _ioJ.BytesIO()
+    with _wvJ.open(_bJ, "wb") as _w:
+        _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(16000)
+        _w.writeframes(_stJ.pack("<h", 1000) * 16000 * 3)
+    with open(_refJ, "wb") as _f:
+        _f.write(_bJ.getvalue())
+    _s, _by = fp.tts_ref_facts(_refJ)
+    _f1 = abs(_s - 3.0) < 0.01 and _by > 90000
+    _f2 = fp.tts_ref_facts(os.path.join(_DJ, "nope.wav")) == (0.0, 0)
+    fp.tts_timing_row(at="06:06:52", voice="player", chars=44, tokens=83.0,
+                      final_ms=1108, wasted_ms=800, tries=2, cap=95)
+    fp.tts_timing_row(at="06:06:49", voice="player", chars=44, tokens=81.0,
+                      final_ms=1867, wasted_ms=0, tries=1, cap=95)
+    with open(os.path.join(_DJ, "tts-timing.csv"), encoding="utf-8") as _f:
+        _txt = _f.read()
+    _f3 = _txt.count("\n") == 3 and _txt.startswith("at,voice,chars,tokens")
+    _f4 = "1108,800,2" in _txt and "1867,0,1" in _txt
+    check(_f1 and _f2 and _f3 and _f4,
+          "run: a 3s reference reads as 3s, a missing one as zeroes, and the "
+          "stream writes one header and one row per line carrying take, waste "
+          "and attempts apart", str([_f1, _f2, _f3, _f4]))
+except Exception as _eJx:
+    check(False, "the patch18 runs did not RUN", str(_eJx)[:140])
+finally:
+    try:
+        (fp.log_dir, fp.panel_log) = _lcJ
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch19
+# Higgs keeps its reference prompt state in the model session, and nothing was
+# serialising access to it: a dialogue line and a thought could be inside the
+# engine together. The field log shows two reports interleaved mid-write, a take
+# that ran 15.2s for 3.1s of audio, and a hash-verified MALE reference returning
+# a female voice. One request holds the engine at a time now. And an allocation
+# refusal no longer escalates the cap - the prefill graph is sized from
+# max_tokens, so raising it asked the card for a bigger buffer than the one it
+# had just refused, with 19 GB free.
+section("v3.75 patch19: one line at a time, and a refusal is not a shortage")
+
+check("_ENGINE_LOCK = threading.Lock()" in py and "with _ENGINE_LOCK:" in py,
+      "one request holds the engine at a time - its session is stateful")
+check("ENGINE_WAIT = threading.local()" in py and "def engine_wait_get(" in py
+      and '"queued:", _wait19 * 1000.0' in py and '"queued_ms"' in py,
+      "and the wait for it is measured, reported and recorded - never hidden")
+check("_TAKE = threading.local()" in py and "class _TakeProxy(" in py,
+      "two lines in flight keep their own timings instead of one shared dict")
+check("_ACPP_HOLD_CAP = [False]" in py
+      and "if attempt > 1 and not _ACPP_HOLD_CAP[0]:" in py
+      and "the card refused a buffer, " in py,
+      "an allocation refusal holds the cap - escalating asks for MORE of what "
+      "was just refused")
+check("_ACPP_HOLD_CAP[0] = False" in py, "and the hold is per line, not per session")
+check('("failed to allocate",' in py and "is not a shortage" in py
+      and "not enough VRAM - try a shorter reference voice" not in py,
+      "the advice that was wrong with 19 GB free is gone")
+
+import threading as _thK, time as _tmK
+try:
+    _seenK = {}
+    def _wK(name, val):
+        fp.TTS_TAKE.update(final_s=val, wasted_s=0.0, tries=1)
+        _tmK.sleep(0.03)
+        _seenK[name] = fp.TTS_TAKE.get("final_s")
+    _tsK = [_thK.Thread(target=_wK, args=(n, v)) for n, v in (("a", 1.0), ("b", 2.0))]
+    for _t in _tsK:
+        _t.start()
+    for _t in _tsK:
+        _t.join()
+    _k1 = _seenK == {"a": 1.0, "b": 2.0}
+    _orderK = []
+    def _hK(n):
+        with fp._ENGINE_LOCK:
+            _orderK.append(("in", n)); _tmK.sleep(0.03); _orderK.append(("out", n))
+    _tsK = [_thK.Thread(target=_hK, args=(n,)) for n in (1, 2, 3)]
+    for _t in _tsK:
+        _t.start()
+    for _t in _tsK:
+        _t.join()
+    _k2 = not any(_orderK[i][0] == "in" and _orderK[i + 1][0] == "in"
+                  for i in range(len(_orderK) - 1))
+    fp.engine_wait_reset()
+    _k3 = fp.engine_wait_get() == 0.0
+    check(_k1 and _k2 and _k3,
+          "run: two threads keep their own take timings, no two requests are ever "
+          "inside the engine at once, and the wait clock starts at zero",
+          str([_k1, _k2, _k3, _seenK]))
+except Exception as _eKx:
+    check(False, "the patch19 runs did not RUN", str(_eKx)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch20
+# The headroom was learning correctly and then having its answer thrown away: the
+# fit asked for 2.65 and a 1.60 ceiling clamped it, in every session for weeks.
+# The clamp was self-justifying - a line that hits an estimate-decided cap enters
+# the fit at cap/est, which IS the current headroom, so 452 of 1124 scored lines
+# entered at exactly 1.60 and held p95 down where the clamp was satisfied. The cap
+# is already bounded by the guard, so the headroom defers to it now. And the
+# record can be cleared deliberately, because a long run under a binding clamp
+# leaves evidence that cannot say what it truly needed.
+section("v3.75 patch20: the margin was pinned, not converged")
+
+check("AUTOCAL_HEAD_MAX = 4.00" in py,
+      "the ceiling is a sanity stop, not a working limit")
+check("it is a margin pinned" in py or "it is a margin pinned." in py
+      or "That is not a" in py,
+      "and why it was raised is written where the constant lives")
+check("def api_tts_cal_clear(" in py
+      and '"/api/tts-cal-clear": api_tts_cal_clear,' in py,
+      "the estimator's memory can be forgotten, deliberately and by hand")
+# sliced to the function: MEASURE_GEN is bumped on every append too, so an
+# unscoped pin cannot see it removed from HERE
+_calseg = seg(py, "def api_tts_cal_clear(", "def api_tts_audio_cache_clear(")
+check("for p in (TTS_MEASURE_LOG, TTS_MEASURE_LEGACY, EOC_LOG):" in _calseg
+      and "MEASURE_GEN[0] += 1" in _calseg
+      and '_MEASURE_CACHE["rows"] = []' in _calseg,
+      "both stores go, and the warm copy does not survive the clear")
+check('data-act="ttsCalClear"' in py and 'if (d.act === "ttsCalClear")' in py
+      and "function calClear() {" in py,
+      "the button is on the calibration section and wired to an action")
+check('title: "Clear calibration data?"' in py
+      and "This cannot be undone" in py and "What happens next" in py
+      and "What is NOT touched" in py
+      and 'label: "Yes, clear it", value: true' in py
+      and 'label: "No", value: false' in py,
+      "and it asks first, saying what is lost, what follows, and what is safe")
+
+try:
+    _lcL = (fp.TTS_MEASURE_LOG, fp.TTS_MEASURE_LEGACY, fp.EOC_LOG,
+            fp.panel_log, fp.TTSW.log)
+    import tempfile as _tfL, json as _jsL
+    _DL = _tfL.mkdtemp()
+    fp.TTS_MEASURE_LOG = os.path.join(_DL, "tts-measure.jsonl")
+    fp.TTS_MEASURE_LEGACY = os.path.join(_DL, "tts-measure.json")
+    fp.EOC_LOG = os.path.join(_DL, "eoc-events.json")
+    fp.panel_log = lambda *a, **k: None
+    fp.TTSW.log = lambda *a, **k: None
+    _p95L = 2.41
+    _wantL = min(fp.AUTOCAL_HEAD_MAX, max(fp.AUTOCAL_HEAD_MIN,
+                                          _p95L * fp.AUTOCAL_HEAD_PAD))
+    _l1 = abs(_wantL - 2.651) < 0.01
+    with open(fp.TTS_MEASURE_LOG, "w", encoding="utf-8") as _f:
+        _f.write(_jsL.dumps({"chars": 10, "tok": 30}) + "\n")
+    with open(fp.EOC_LOG, "w", encoding="utf-8") as _f:
+        _jsL.dump([{"a": 1}, {"a": 2}], _f)
+    fp._MEASURE_CACHE["gen"] = 99
+    fp._MEASURE_CACHE["rows"] = [{"x": 1}]
+    _rL = fp.api_tts_cal_clear({})
+    _l2 = _rL["ok"] and _rL["rows"] == 1 and _rL["eoc"] == 2
+    _l3 = (not os.path.exists(fp.TTS_MEASURE_LOG)
+           and not os.path.exists(fp.EOC_LOG))
+    _l4 = fp._MEASURE_CACHE["rows"] == [] and fp._MEASURE_CACHE["gen"] == -1
+    _l5 = fp.api_tts_cal_clear({})["rows"] == 0
+    check(_l1 and _l2 and _l3 and _l4 and _l5,
+          "run: the field's own p95 of 2.41 now yields 2.65 where it was pinned at "
+          "1.60, and a clear removes both stores, reports what it forgot, drops "
+          "the warm copy and is harmless when empty",
+          str([_l1, _l2, _l3, _l4, _l5]))
+except Exception as _eLx:
+    check(False, "the patch20 runs did not RUN", str(_eLx)[:140])
+finally:
+    try:
+        (fp.TTS_MEASURE_LOG, fp.TTS_MEASURE_LEGACY, fp.EOC_LOG,
+         fp.panel_log, fp.TTSW.log) = _lcL
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch22
+# The tagger returned [STYLE-SINGING] for a flat test sentence, and the prompt
+# was the cause: "return it word for word WITH TAGS ADDED" presupposes markup on
+# every line, and only one example in three showed a line returned unchanged. A
+# prompt that asks for markup gets markup. And a stopped PTI server cost every
+# player line a full timeout before failing open, silently.
+section("v3.75 patch22: a tagger that can say nothing, and skips a dead server")
+
+check('"MOST LINES NEED NO TAGS: a plain statement is returned exactly as it came."'
+      in py and '"Add a tag only when the words themselves clearly call for one' in py
+      and "with tags added" not in py,
+      "the prompt states the default is NO tag, and no longer presupposes markup")
+check('    ("This is a test of the text-to-speech system.",' in py
+      and '    ("I will meet you at the gate at dawn.",' in py,
+      "the observed failure is now a neutral example, verbatim")
+check('_st22 = slot_status(_port22).get("state", "")' in py   # retold p36
+      and 'if _st22 != "serving":' in py,
+      "the tagger checks its server is SERVING before paying for a call")
+check("_PTI_DOWN_SAID = [False]" in py
+      and "the PTI server is back - player tags resume" in py,
+      "the outage is said once, and the recovery is announced")
+
+try:
+    _lcN = (fp.panel_log, fp.load_config, fp.panel_prov_on, fp.panel_route,
+            fp.slot_status, fp.mood_context)
+    _p22 = fp.tts_tag_prompt()
+    _n1 = ("MOST LINES NEED NO TAGS" in _p22
+           and _p22.count("This is a test of the text-to-speech system.") == 2)
+    _neu = sum(1 for _l, _t in fp.TAG_EXAMPLES if _l == _t)
+    _n2 = _neu > len(fp.TAG_EXAMPLES) - _neu
+    _logsN = []
+    fp.panel_log = lambda m: _logsN.append(m)
+    _cfgN = {"settings": {}, "gpus": [],
+             "slots": [{"port": 5001, "providers": [{"id": "pti"}]}]}
+    fp.load_config = lambda *a, **k: _cfgN
+    fp.panel_prov_on = lambda *a: True
+    fp.panel_route = lambda pid, cfg=None: {"port": 5001, "server": "S1",
+                                            "url": "http://x"}
+    fp.slot_status = lambda port: {"state": "down"}
+    fp._PTI_DOWN_SAID[0] = False
+    _r1 = fp.tts_player_tag("Hello there.", _cfgN)
+    _r2 = fp.tts_player_tag("Hello again.", _cfgN)
+    _n3 = _r1 == "" and _r2 == "" and len(
+        [m for m in _logsN if "skipped" in m]) == 1 and "port 5001" in _logsN[0]
+    fp.slot_status = lambda port: {"state": "serving"}
+    fp.mood_context = lambda: ""
+    _oldc = fp._pti_cached
+    fp._pti_cached = lambda k: "Hello there."
+    _r3 = fp.tts_player_tag("Hello there.", _cfgN)
+    fp._pti_cached = _oldc
+    _n4 = _r3 == "Hello there." and any("back" in m for m in _logsN)
+    check(_n1 and _n2 and _n3 and _n4,
+          "run: the prompt teaches silence by majority, a dead server skips "
+          "instantly and is named once, and recovery resumes tagging",
+          str([_n1, _n2, _n3, _n4]))
+except Exception as _eNx:
+    check(False, "the patch22 runs did not RUN", str(_eNx)[:140])
+finally:
+    try:
+        (fp.panel_log, fp.load_config, fp.panel_prov_on, fp.panel_route,
+         fp.slot_status, fp.mood_context) = _lcN
+        fp._PTI_DOWN_SAID[0] = False
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch23
+# Only the samplers Higgs v3 actually uses, set by hand, and nothing that moves
+# them. Boson's reference is temperature 0.8 with top_k 50 and nothing else;
+# audio.cpp documents repetition_penalty as accepted-but-unconsumed for this
+# family; top_p and min_p only ever narrowed the distribution toward the
+# degenerate repeat. Both movers are gone - the automatic step and the retry
+# ladder's narrowing - because moving these values was the fault, not the fix.
+section("v3.75 patch23: two samplers, no movers")
+
+check(set(fp.TTS_SAMP_KEYS) == {"temp", "top_k"}
+      and set(fp.TTS_SAMP_FIELD) == {"temp", "top_k"}
+      and set(fp.CAL_REQUEST_KEYS.values()) == {"temperature", "top_k"},
+      "two samplers, named once, and they are the two this engine takes")
+check(set(fp.SN_TTS_FORWARD) == {"temperature", "top_k"},
+      "and a top_p arriving from SkyrimNet is dropped, not forwarded")
+check(fp.HIGGS_REF_SAMPLERS == {"ttsCalTemp": "0.8", "ttsCalTopK": "50"}
+      and fp.DEF_SETTINGS.get("ttsCalTemp") == "0.8"
+      and fp.DEF_SETTINGS.get("ttsCalTopK") == "50",
+      "Boson's reference pair is the shipped default")
+nin(py, "def autocal_sampler_arith", "the automatic sampler mover is gone entirely")
+nin(py, "ttsSampAutoCal", "and its switch with it")
+nin(py, "ttsRetrySafe", "Steady Retry is gone - a retry carries the same samplers")
+nin(py, "ttsCalTopP", "top_p is not a setting this build carries")
+nin(py, "ttsCalMinP", "nor min_p")
+nin(py, "ttsCalRepPen", "nor repetition_penalty, which this family ignores anyway")
+nin(py, "Sampler Calibration", "and the name it used to go by is gone too")
+check('"sampKeys": {k: 1 for k in TTS_SAMP_KEYS}' in py
+      and py.count('"sampKeys": {k: 1 for k in TTS_SAMP_KEYS}') == 2
+      and 'Object.keys((d && d.sampKeys) || {})' in JS,
+      "the chips read their keys from the panel - a second hard-coded list is how "
+      "top-k was added everywhere except the page")
+check('.plpay:hover { text-shadow:0 0 6px var(--acc); color:var(--txt); }' in py
+      and "filter:drop-shadow(0 0 5px color-mix(in srgb, var(--acc) 75%" not in py,
+      "the terminal hover is ONE tight glow: a drop-shadow filter over two "
+      "text-shadows re-blurred pixels that were already blurred")
+
+try:
+    _lcP = fp.sn_tts_observed
+    fp.sn_tts_observed = lambda: {"temperature": 0.6, "top_p": 0.9, "min_p": 0.05}
+    _stP = dict(fp.DEF_SETTINGS)
+    _s1P = fp.tts_samplers(_stP, 1)
+    _p1 = _s1P == {"temperature": 0.8, "top_k": 50}
+    _p2 = fp.tts_samplers(_stP, 2) == _s1P and fp.tts_samplers(_stP, 3) == _s1P
+    _p3 = isinstance(_s1P["top_k"], int)
+    _p4 = "top_p" not in _s1P and "min_p" not in _s1P
+    check(_p1 and _p2 and _p3 and _p4,
+          "run: a line carries Boson's pair, every attempt carries the SAME pair, "
+          "top_k is an integer, and what this engine cannot use never reaches it",
+          str([_p1, _p2, _p3, _p4, _s1P]))
+except Exception as _ePx:
+    check(False, "the patch23 runs did not RUN", str(_ePx)[:140])
+finally:
+    try:
+        fp.sn_tts_observed = _lcP
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch24
+# SenseVoice was invisible. Its inference is a second model on the same card, and
+# it was either folded into "transcript" with a store read or off the line
+# entirely on the learner thread. Worse, the meter bar named its seven bands in
+# its own code, so every step the ledger had measured since patch17 - thought
+# audio, the sample gate, the recogniser - could not appear on it however long it
+# ran. The bands ARE what was spent.
+section("v3.75 patch24: the recogniser gets a band, and the bar reads the record")
+
+check("def _tts_asr_transcribe(" in py
+      and 'spend_add("SenseVoice", time.time() - _t24)' in py,
+      "every transcription is timed, wherever it is called from")
+check("def _meter_ms(" in py and "for step, ms in spend_bits():" in py
+      and 'out["panel"] = round(max(0.0, (prep - pti_s - mood_s) * 1000.0 - known))' in py,
+      "the record carries every band the ledger has, with panel as the remainder")
+check("ms=_meter_ms(_pti_s, _mood_s, est_s, prep," in py
+      and 'ms={"player tags"' not in py,
+      "and the fixed seven-band dict it replaced is gone")
+check('const mid = Object.keys(ms).filter(k => lead.indexOf(k) < 0' in py
+      and 'return ["player tags", "mood", "token estimate", "panel",' not in py,
+      "the bar draws what the record holds - it used to name its bands itself")
+for _b24 in ("SenseVoice", "thought audio", "sample gate", "transcript",
+             "identity note"):        # retold p29: no warm-up band
+    check(('"%s":' % _b24) in seg(py, "const METER_WHY = {", "let meterPin")
+          and ('"%s":' % _b24) in seg(py, "const METER_COL = {", "function meterSegs"),
+          "%s has a legend entry and a colour" % _b24)
+check('calterm_log(["%s spent  %s"' in py,
+      "and the calibration terminal carries the spend, after the take rather than "
+      "before it")
+
+try:
+    fp.spend_reset()
+    fp.spend_add("SenseVoice", 0.42)
+    fp.spend_add("thought audio", 1.29)
+    fp.spend_add("sample gate", 0.003)
+    fp.spend_add("identity note", 0.0001)
+    _ms24 = fp._meter_ms(0.10, 0.001, 0.008, 2.0, 1.1, 0.2, 1.3, 1.5)
+    _q1 = _ms24.get("SenseVoice") == 420 and _ms24.get("thought audio") == 1290
+    _q2 = _ms24.get("sample gate") == 3 and "identity note" not in _ms24
+    _q3 = _ms24["panel"] == round((2.0 - 0.10 - 0.001) * 1000.0 - (1290 + 420 + 3))
+    fp.spend_reset()
+    _q4 = "SenseVoice" not in fp._meter_ms(0.1, 0.0, 0.0, 0.2, 1.0, 0.0, 1.0, 1.0)
+    check(_q1 and _q2 and _q3 and _q4,
+          "run: the recogniser and the thought each get their own band, a step that "
+          "cost nothing does not, panel is the remainder so the bands sum to the "
+          "wall, and a line that used no recogniser draws no band for it",
+          str([_q1, _q2, _q3, _q4]))
+except Exception as _eQx:
+    check(False, "the patch24 runs did not RUN", str(_eQx)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch25
+# Two things a server could not tell you. A fleet slot is launched into its own
+# console, so unlike the speech server there is no handle to poll - a launch that
+# died left a card that simply never turned green, silently. And the panel was
+# sending a DFlash drafter its own block size as the draft cap, which llama.cpp
+# clamps every launch, so the number in the launcher was never the number that ran.
+section("v3.75 patch25: a slot says why it did not start, and a drafter is asked "
+        "for what it can give")
+
+check("def draft_n_max_ceiling(" in py
+      and "n_draft_max = (is_dspark and sample_from_anchor) ? block_size" in py
+      and 'return bs if (str(kind) == "draft-dspark" and anchor) else bs - 1' in py,
+      "the draft ceiling is llama.cpp's own rule, written where it is used")
+check('.endswith(".sample_from_anchor")' in py
+      and '".sample_from_anchor")):' in py,   # captured AND consulted
+      "and both inputs are READ from the drafter's header")
+check('_nmax = draft_n_max_ceiling(meta, kind)' in py
+      and 'str(int(meta.get("dflash.block_size") or 16))' not in py,
+      "the launcher is given what the drafter can produce, not the block size "
+      "that gets clamped")
+check('"clamping to" in low and "draft size" in low' in py
+      and 'out["clamped"] = ln.strip()[:200]' in py,
+      "and a clamp the engine applies anyway is captured verbatim from the log")
+check("def slot_launch_fault(" in py and "SLOT_STALL_S = 45.0" in py
+      and 'if state == "serving" or not path:' in py,
+      "a slot that was asked to start and is not answering is diagnosed from its log")
+check('last log line: %s' in py
+      and "it may have exited afterwards" in py,
+      "with the last line it managed, and a different reading when it HAD loaded")
+check('st["fault"] = _flt' in py and "const why = String(st.fault" in py,
+      "and the card carries it instead of an unexplained down")
+
+try:
+    import tempfile as _tfR, os as _osR, time as _tmR
+    _DR = _tfR.mkdtemp(); _pR = _osR.path.join(_DR, "srv.log")
+    with open(_pR, "w", encoding="utf-8") as _f:
+        _f.write("=== s ===\nload_model: loading model 'X.gguf'\n"
+                 "load_model: local path 'X.gguf'\n")
+    _osR.utime(_pR, (_tmR.time() - 120, _tmR.time() - 120))
+    _r1 = "stopped after" in fp.slot_launch_fault(_pR, "down")
+    _r2 = fp.slot_launch_fault(_pR, "serving") == ""
+    _osR.utime(_pR, (_tmR.time(), _tmR.time()))
+    _r3 = fp.slot_launch_fault(_pR, "down") == ""
+    _r4 = (fp.draft_n_max_ceiling({"dflash.block_size": 16}, "draft-dflash") == 15
+           and fp.draft_n_max_ceiling({"dflash.block_size": 16}, "draft-dspark") == 16
+           and fp.draft_n_max_ceiling({"dflash.block_size": 16,
+                                       "dflash.sample_from_anchor": "false"},
+                                      "draft-dspark") == 15
+           and fp.draft_n_max_ceiling({"dflash.block_size": 8}, "draft-dflash") == 7
+           and fp.draft_n_max_ceiling({}, "draft-dflash") == 0)
+    check(_r1 and _r2 and _r3 and _r4,
+          "run: a dead load is named with its last line, a serving slot is never "
+          "accused, a log still being written is loading, and the ceiling follows "
+          "the drafter's own block and kind", str([_r1, _r2, _r3, _r4]))
+except Exception as _eRx:
+    check(False, "the patch25 runs did not RUN", str(_eRx)[:140])
+
+
+TPL_SINGLE = ""
+TPL_CREATOR = ""
+try:
+    with open(os.path.join(ROOT, "templates", "single-gpu.ps1"),
+              encoding="utf-8-sig") as _f:
+        TPL_SINGLE = _f.read()
+    with open(os.path.join(ROOT, "launcher-template.ps1"),
+              encoding="utf-8-sig") as _f:
+        TPL_CREATOR = _f.read()
+except Exception as _eT0:
+    TPL_SINGLE = TPL_CREATOR = "(unreadable: %s)" % _eT0
+
+# ----------------------------------------------------------------- v3.75 patch26
+# The default launcher had a contract with the panel that it did not keep. The
+# panel's log reader tells a server that DIED from one still loading by one exact
+# sentence - "Server process exited before it became ready" - which llama.cpp
+# never prints, so only the launcher can. It never did. And the last line of the
+# file re-invoked the file, so a server that could not start looped instead of
+# stopping, replacing the console that held the reason with the next attempt.
+section("v3.75 patch26: the default launcher keeps its side of the bargain")
+
+for _tpl26, _name26 in ((TPL_SINGLE, "single-gpu"), (TPL_CREATOR, "launcher-template")):
+    nin(_tpl26, '& "<SELF_PATH>"',
+        "%s: no self-relaunch - a failed start must stop, not loop" % _name26)
+    # BOTH branches must carry it: a template that says it only on exit 0 leaves
+    # the crash - the case that matters - unreportable, and a check for "in" alone
+    # cannot see that (the negative control passed until this counted)
+    check(_tpl26.count("Server process exited before it became ready") == 2,
+          "%s: prints the sentence the panel watches for, on BOTH exit paths"
+          % _name26)
+    check("$code = $LASTEXITCODE" in _tpl26 and "exit $code" in _tpl26,
+          "%s: carries llama-server's own exit code" % _name26)
+    check("ReadKey" in _tpl26,
+          "%s: holds the window so the reason can be read" % _name26)
+    check("& $exe @args_" in _tpl26 and "ForEach-Object" not in _tpl26,
+          "%s: llama.cpp's output reaches the log unfiltered - the VRAM report is "
+          "parsed from THESE lines" % _name26)
+
+try:
+    import tempfile as _tfT, os as _osT
+    _okT = True
+    for _c26 in (TPL_SINGLE, TPL_CREATOR):
+        _t26 = {"title": "S", "model": "D:/m/m.gguf", "vision": "N/A", "draft": "N/A",
+                "gpu": "GPU-a", "port": "1236", "content": _c26}
+        _txt26 = "\n".join(fp.render_launcher_lines(_t26, "C:/P/slot1.ps1",
+                                                    "C:/l/llama-server.exe"))
+        _okT = _okT and ('& "C:/P/slot1.ps1"' not in _txt26
+                         and "<SELF_PATH>" not in _txt26
+                         and "Server process exited before it became ready" in _txt26)
+    _DT = _tfT.mkdtemp(); _pT = _osT.path.join(_DT, "srv.log")
+    with open(_pT, "w", encoding="utf-8") as _f:
+        _f.write("=== s ===\nload_model: loading 'x'\n"
+                 "Server process exited before it became ready (exit 3221225477)\n")
+    _e1 = fp.slot_vram_report(_pT).get("exited") is True
+    with open(_pT, "w", encoding="utf-8") as _f:
+        _f.write("=== s ===\nServer ready\nall slots are idle\n")
+    _e2 = fp.slot_vram_report(_pT).get("ready") is True
+    check(_okT and _e1 and _e2,
+          "run: a rendered launcher from either template drops the relaunch and "
+          "keeps the sentence, and the panel reads that sentence as a death while "
+          "a ready server still reads as ready", str([_okT, _e1, _e2]))
+except Exception as _eTx:
+    check(False, "the patch26 runs did not RUN", str(_eTx)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch27
+# Current llama.cpp folded --no-mmap, --mlock and --direct-io into one --load-mode
+# flag and warns on every old spelling - and warns AGAIN if the old and new are
+# combined, so this replaces rather than adds. --chat-template-kwargs is also
+# deprecated upstream and is deliberately kept: some models honour only the
+# template kwarg, which is why the panel writes both it and --reasoning.
+section("v3.75 patch27: the load flag llama.cpp actually wants")
+
+check('("loadmode",  "Model load mode",' in py and '"--load-mode",' in py,
+      "the card setting is Model load mode, emitting --load-mode")
+check('"auto", "none", "mmap", "mlock", "mmap+mlock", "dio"' in py,
+      "with the exact value set llama.cpp accepts, in its own order")
+nin(py, '"--no-mmap",          ', "no setting emits --no-mmap any more")
+nin(py, '"nommap"', "and the old key is gone from every table that held it")
+check('"--mlock": "DEPRECATED - use --load-mode mlock"' in py
+      and '"--defrag-thold": "DEPRECATED' in py,
+      "the two flags a user may still type by hand say they are deprecated")
+check("--chat-template-kwargs" in py and "CTK_FLAG" in py,
+      "and the kwarg the panel writes on purpose is untouched")
+check('{ name:"Load mode", flag:"--load-mode",' in py
+      and 'auto | none | mmap | mlock | mmap+mlock | dio' in py   # retold p33
+      and "replaces the old --no-mmap, --mlock and --direct-io" in py,
+      "the Sampler Guide carries a Load mode page that says what it replaced")
+check('{ name:"Threads / fit"' in py and '"Threads / mmap / fit"' not in py,
+      "and the page it was folded out of no longer claims mmap")
+
+try:
+    import re as _reU
+    _tblU = _reU.search(r"LAUNCH_PARAMS = \(\n(.*?)\n\)\n", py, _reU.S)
+    _rowsU = _reU.findall(
+        r'\("([a-z]+)",\s+"[^"]+",\s+"[a-z]+",\s+"[^"]*",\s+\{.*?\},\s*\n?\s*'
+        r'"(--[a-z0-9-]+)",\s+"([^"]+)"\)',
+        _tblU.group(1) if _tblU else py, _reU.S)
+    _pagesU = set(_reU.findall(r'\{ name:"([^"]+)", flag:', py))
+    _missU = sorted({_g for _k, _f, _g in _rowsU} - _pagesU)
+    _u1 = bool(_rowsU) and not _missU
+    _u2 = any(_k == "loadmode" and _f == "--load-mode" and _g == "Load mode"
+              for _k, _f, _g in _rowsU)
+    _u3 = not any(_k == "nommap" for _k, _f, _g in _rowsU)
+    check(_u1 and _u2 and _u3,
+          "run: every card setting cross-references a guide page that EXISTS - "
+          "renaming a page without repointing its settings is how that link dies "
+          "silently", "%d rows, missing %s" % (len(_rowsU), _missU))
+except Exception as _eUx:
+    check(False, "the patch27 runs did not RUN", str(_eUx)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch28
+# Eight requests from the owner in one pass. The two that were bugs: Dismiss
+# bounced off a confirm gate meant for destructive actions - it hides a finished
+# banner and destroys nothing - and a repaint refused while focus sat inside the
+# TTS pane was CANCELLED rather than deferred, which with the settings-value
+# signature is exactly why the page after an install showed the world as it was.
+section("v3.75 patch28: eight owner requests - dismiss, defaults, and a repaint owed")
+
+check('.uuid { user-select:text; }' in py
+      and " filter:blur(4px)" not in py,   # text blur; backdrop-filter panels stay
+      "the setup page addresses are plainly readable - no blur, text selectable")
+check('ttsPaneDrawn = "";' in py and "window.__ttsOwe" in py,   # retold p32
+      "a repaint deferred for focus clears the drawn signature, so the next "
+      "render redraws from fresh state instead of declining forever")
+_dmz = py.find('== "dismiss"')
+check(_dmz >= 0 and _dmz < py.find('.get("confirm")'),
+      "dismiss is answered BEFORE the confirm gate - it destroys nothing")
+check('"ttsChunkChars": "170",' in py,   # retold p37
+      "long lines split at 170 - fewer chunks, fewer boundaries to wait on")
+check('st["ttsSampleSec"] = "10"' in py and '"ttsSampleSec"] = "4"' not in py
+      and '"ttsSampleSec": "10",' in py,
+      "the 10-second sample window survives an install - both writers say 10")
+check('"ttsOutDir": os.path.join(STACK, "TTSaudio")' in py   # retold p29: full path
+      and "a bare name lands beside the panel" in py,
+      "saved audio defaults to TTSaudio beside the panel, resolved absolute")
+check('data-act="ttsDefaults"' in py and 'function ttsDefaults() {' in py
+      and '"/api/tts-defaults": api_tts_defaults,' in py,
+      "the revert button sits by the TTS selector, dialog-first, wired end to end")
+check("for k in [k for k in st if k.startswith(\"tts\")]:" in py
+      and 'if k.startswith("tts"):' in py,
+      "and the endpoint deletes stray tts keys before writing the shipped set")
+check("Clear TTS calibration data; revert TTS settings to defaults" in py
+      and "Reads each slot's own log to say why a launch ended" in py,
+      "the permission tree names what this build can actually do")
+
+try:
+    _svQ = [None]
+    _realQ = (fp.save_config, fp.sse_notify, fp.load_config)
+    fp.save_config = lambda c: _svQ.__setitem__(0, c)
+    fp.sse_notify = lambda *a, **k: None
+    _q1 = fp.api_higgs_install({"action": "dismiss"}) == {"ok": True}
+    fp.load_config = lambda *a, **k: {"settings": {
+        "ttsCalTopP": "0.8", "ttsRetrySafe": "on", "ttsChunkChars": "90",
+        "yamlOutDir": "keep", "ttsEngine": "moss"}}
+    fp.api_tts_defaults()
+    _stQ = _svQ[0]["settings"]
+    _q2 = "ttsCalTopP" not in _stQ and "ttsRetrySafe" not in _stQ
+    # retold patch29: the audio folder default is a full path now
+    _q3 = (_stQ.get("ttsChunkChars") == "170" and _stQ.get("yamlOutDir") == "keep"
+           and _stQ.get("ttsSampleSec") == "10"
+           and str(_stQ.get("ttsOutDir") or "").endswith("TTSaudio"))
+    import os as _osQ
+    fp.load_config = lambda *a, **k: {"settings": {"ttsOutDir": "TTSaudio"}}
+    _pQ = fp.tts_save_named(b"RIFFxxxxWAVE", "GateNpc")
+    _q4 = bool(_pQ) and _osQ.path.isabs(_pQ)
+    if _pQ:
+        try:
+            _osQ.remove(_pQ); _osQ.rmdir(_osQ.path.dirname(_pQ))
+        except OSError:
+            pass
+    check(_q1 and _q2 and _q3 and _q4,
+          "run: dismiss answers ok bare, defaults purge strays and restore the "
+          "shipped set without touching other settings, and a bare audio folder "
+          "resolves beside the panel", str([_q1, _q2, _q3, _q4]))
+except Exception as _eQy:
+    check(False, "the patch28 runs did not RUN", str(_eQy)[:140])
+finally:
+    try:
+        fp.save_config, fp.sse_notify, fp.load_config = _realQ
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch29
+# The voice warm-up was the unexplained preparation cost. Measured over 185 lines:
+# 33 ms of preparation when the speaker was unchanged, 749 ms when it changed, and
+# 1459 ms NPC-to-NPC. It synthesised a whole discarded take on every speaker change
+# to absorb engine carryover - a fix the reference samplers had already made
+# unnecessary - and it landed in the panel remainder rather than its own band,
+# which is why the bar never showed it.
+section("v3.75 patch29: the warm-up goes, and addresses stop hiding")
+
+nin(py, "tts_warmup_needed", "the warm-up test is gone, function and all")
+nin(py, "ttsVoiceWarmup", "and its setting with it - no hidden 'on' left behind")
+nin(py, 'spend_step("voice warm-up")', "and the ledger step it booked")
+check("voice warm-up" not in JS, "the meter has no band or legend for it either")
+check(".hb { cursor: pointer; }" in py and "blur(3.5px)" not in py,   # p31
+      "the address fields are plainly readable - patch28 changed .uuid, which is "
+      "not the class they use")
+check('"ttsOutDir": os.path.join(STACK, "TTSaudio")' in py,
+      "saved audio defaults to a FULL path, so the field says where files go")
+check('"ttsAsrLang": "auto",' in py,
+      "recognition guesses the language rather than assuming English")
+check("TTS_INSTALL_KEYS = (" in py and "keep = {k: st[k] for k in TTS_INSTALL_KEYS" in py
+      and "st.update(keep)" in py,
+      "a revert keeps where the engine is installed - that is a discovery, not a "
+      "preference")
+check('L.append("$code = $LASTEXITCODE")' in py
+      and "Server process exited before it became ready" in seg(
+          py, "def build_param_launcher", "def ps1_args_span"),
+      "the SERVER CARD launcher reports how it ended - patch26 taught the two "
+      "templates and missed the builder every card actually uses")
+
+try:
+    _cfgW = {"settings": {"llamaExe": "C:/l/llama-server.exe"},
+             "gpus": [{"id": "gpu0", "uuid": "GPU-abc", "index": "0"}],
+             "slots": [{"id": "1", "label": "S1", "port": 1236, "gpuId": "gpu0",
+                        "model": "D:/m.gguf", "params": {"ngl": "99"}}]}
+    _txtW = fp.build_param_launcher(_cfgW, _cfgW["slots"][0], "C:/P/s1.ps1")
+    _w1 = ('$env:CUDA_VISIBLE_DEVICES = "GPU-abc"' in _txtW
+           and "Server process exited before it became ready" in _txtW
+           and "@llamaArgs" in _txtW and _txtW.rstrip().endswith("exit $code"))
+    _svW = [None]
+    _realW = (fp.save_config, fp.sse_notify, fp.load_config)
+    fp.save_config = lambda c: _svW.__setitem__(0, c)
+    fp.sse_notify = lambda *a, **k: None
+    fp.load_config = lambda *a, **k: {"settings": {
+        "ttsAcppDir": "C:/P/audio.cpp", "ttsAcppExe": "C:/P/a/x.exe",
+        "ttsAsrLang": "de", "ttsChunkChars": "90", "ttsCalTopP": "0.8"}}
+    fp.api_tts_defaults()
+    _stW = _svW[0]["settings"]
+    _w2 = _stW.get("ttsAcppDir") == "C:/P/audio.cpp" and _stW.get("ttsAcppExe")
+    _w3 = (_stW.get("ttsAsrLang") == "auto" and _stW.get("ttsChunkChars") == "170"
+           and "ttsCalTopP" not in _stW)
+    _w4 = "ttsVoiceWarmup" not in fp.DEF_SETTINGS
+    check(_w1 and _w2 and _w3 and _w4,
+          "run: a card launcher pins its GPU and reports its exit, a revert keeps "
+          "the install and resets the rest, and no warm-up setting survives",
+          str([_w1, bool(_w2), _w3, _w4]))
+except Exception as _eWx:
+    check(False, "the patch29 runs did not RUN", str(_eWx)[:140])
+finally:
+    try:
+        fp.save_config, fp.sse_notify, fp.load_config = _realW
+    except Exception:
+        pass
+
+
+# ----------------------------------------------------------------- v3.75 patch30
+# Why a three-card fleet spread every model across every card and into host RAM.
+# Two causes, both ours. --fit was treated as a bare switch, so "off" wrote
+# NOTHING and llama.cpp - which fits by default - fitted across every visible
+# device while the card read "Auto fit to VRAM: off". And the server card's
+# template list was read from the Launcher Creator's folder, so a template whose
+# own header says "no GPU pinning - for 1 PC / 1 GPU" was offered to a fleet
+# server; taking it left CUDA_VISIBLE_DEVICES unwritten and every GPU visible.
+section("v3.75 patch30: the fit flag speaks, and the fleet gets its own templates")
+
+check('bare = {"nocontbat"}' in py and 'out, bare = {}, {"nocontbat"}' in py
+      and 'bare = {"nocontbat", "fit"}' not in py,
+      "--fit is no longer a bare switch - absent is not off when the engine "
+      "defaults to on")
+check("A dial whose engine-side default" in py,
+      "and why it must say off out loud is written where it is decided")
+check('SERVER_TPL_DIR = "server-templates"' in py
+      and 'CREATOR_TPL_DIR = "templates"' in py
+      and "def read_named_template(name, where=SERVER_TPL_DIR):" in py
+      and "def list_templates(where=SERVER_TPL_DIR):" in py,
+      "the fleet and the Launcher Creator read from different folders")
+check(os.path.isfile(os.path.join(ROOT, "server-templates", "pinned-server.ps1")),
+      "and the fleet's own template ships")
+
+try:
+    with open(os.path.join(ROOT, "server-templates", "pinned-server.ps1"),
+              encoding="utf-8-sig") as _f:
+        _stpl = _f.read()
+    check('$env:CUDA_VISIBLE_DEVICES = "<GPU_ID>"' in _stpl,   # retold p31
+          "the server template pins its card, which is the whole point of it")
+    check('"--fit", "off"' in _stpl and '"--n-gpu-layers", "99"' in _stpl,
+          "every layer on that card, and fitting off so they stay there")
+    check(_stpl.count("Server process exited before it became ready") == 1
+          and "$code = $LASTEXITCODE" in _stpl and "ReadKey" in _stpl,
+          "it reports how it ended and holds the window")
+    nin(_stpl, "ForEach-Object",
+        "and leaves llama.cpp's output alone - the VRAM report is parsed from it")
+except Exception as _eZ0:
+    check(False, "the server template could not be read", str(_eZ0)[:120])
+
+try:
+    _cfgZ = {"settings": {"llamaExe": "C:/l/llama-server.exe"},
+             "gpus": [{"id": "gpu0", "uuid": "GPU-abc", "index": "0"}],
+             "slots": [{"id": "1", "label": "S1", "port": 1236, "gpuId": "gpu0",
+                        "model": "D:/m.gguf",
+                        "params": {"ngl": "99", "fit": "off"}}]}
+    _txtZ = fp.build_param_launcher(_cfgZ, _cfgZ["slots"][0], "C:/P/s1.ps1")
+    _z1 = '"--fit", "off"' in _txtZ
+    _z2 = '$env:CUDA_VISIBLE_DEVICES = "GPU-abc"' in _txtZ
+    _cfgZ["slots"][0]["params"]["fit"] = "on"
+    _z3 = '"--fit"' in fp.build_param_launcher(_cfgZ, _cfgZ["slots"][0], "C:/P/s1.ps1")
+    _realZ = fp.STACK
+    fp.STACK = ROOT
+    _idsZ = [x["id"] for x in fp.list_templates()]
+    _nmsZ = [x["name"] for x in fp.list_templates()]
+    fp.STACK = _realZ
+    _z4 = "pinned-server" in _idsZ and not any("no GPU pinning" in n for n in _nmsZ)
+    check(_z1 and _z2 and _z3 and _z4,
+          "run: a card that says fit off WRITES fit off, still pins its GPU, fit "
+          "on still writes, and the fleet list offers only fleet templates",
+          str([_z1, _z2, _z3, _z4, _idsZ]))
+except Exception as _eZx:
+    check(False, "the patch30 runs did not RUN", str(_eZx)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch31
+# The pin was still not reaching the file that runs. patch30 shipped a template
+# using <GPU_UUID>, a placeholder the renderer has never implemented - it knows
+# <GPU_ID> - so the line survived into the launcher as literal text, CUDA could
+# not parse it, and every card stayed visible. And a server card never renders a
+# template anyway: it stores the text and the panel writes it verbatim, editing
+# only flags INSIDE $llamaArgs. So the pin is now enforced on the written bytes.
+section("v3.75 patch31: the pin is written, not hoped for")
+
+check("def ps1_force_gpu_pin(" in py and 'PIN_LINE = "$env:CUDA_VISIBLE_DEVICES"' in py,
+      "the pin is imposed on the launcher text, whatever produced it")
+check("body = ps1_force_gpu_pin(body, _pin31)" in py,
+      "and on the way to disk, so custom text cannot escape it")
+check("had no GPU chosen - pinned to" in py    # retold p32: assigned, not warned
+      and "has no GPU chosen and none exists to assign" in py,
+      "a slot with no card chosen says so rather than pinning nothing silently")
+nin(py, "<GPU_UUID>", "the placeholder the renderer never knew is gone")
+check("def tts_write_install_paths(" in py and py.count("tts_write_install_paths(") == 3,
+      "one writer for every path an install discovers, used by both callers")
+check('.hb { cursor: pointer; }' in py and "input.hb:focus { cursor: text; }" in py,
+      "an address is a thing to click, not a field to type a caret into")
+
+try:
+    with open(os.path.join(ROOT, "server-templates", "pinned-server.ps1"),
+              encoding="utf-8-sig") as _f:
+        _tp31 = _f.read()
+    nin(_tp31, "<GPU_UUID>", "the shipped template uses a placeholder that exists")
+    nin(_tp31, "<CTX>", "and no invented ones at all")
+    check('$env:CUDA_VISIBLE_DEVICES = "<GPU_ID>"' in _tp31,
+          "pinning by the name the renderer substitutes")
+except Exception as _eY0:
+    check(False, "the server template could not be read", str(_eY0)[:120])
+
+try:
+    _tplY = ('# head\n$env:CUDA_VISIBLE_DEVICES = "<GPU_ID>"\n\n$llamaArgs = @(\n'
+             '    "--model", "x.gguf"\n)\n& "llama-server.exe" @llamaArgs\n')
+    _y1 = ('$env:CUDA_VISIBLE_DEVICES = "GPU-abc"'
+           in fp.ps1_force_gpu_pin(_tplY, "GPU-abc"))
+    _y2 = "<GPU_ID>" not in fp.ps1_force_gpu_pin(_tplY, "GPU-abc")
+    _bareY = '$llamaArgs = @(\n    "--model", "x"\n)\n'
+    _y3 = ('$env:CUDA_VISIBLE_DEVICES = "GPU-zzz"'
+           in fp.ps1_force_gpu_pin(_bareY, "GPU-zzz"))
+    _y4 = "CUDA_VISIBLE_DEVICES" not in fp.ps1_force_gpu_pin(_tplY, "")
+    _y5 = fp.ps1_force_gpu_pin(_tplY, "GPU-a").count("CUDA_VISIBLE_DEVICES") == 1
+    check(_y1 and _y2 and _y3 and _y4 and _y5,
+          "run: a placeholder is replaced by the real card, a launcher without a "
+          "pin gains one before the argument array, no card chosen writes no pin, "
+          "and the line is never duplicated", str([_y1, _y2, _y3, _y4, _y5]))
+except Exception as _eYx:
+    check(False, "the patch31 runs did not RUN", str(_eYx)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch32
+# The owner's panel.log said it plainly, ten times: "server N has no GPU chosen -
+# its launcher pins nothing". patch31's enforcement worked and had nothing to
+# enforce: a fresh install creates slots with no gpuId, so every server saw every
+# card. A warning nobody reads is not a fix. A slot with no card now GETS one at
+# write time - least-loaded card first, bigger card on a tie - written back to
+# the slot and logged. Plus three smaller regressions of ours, each found in the
+# owner's report: the installer stored a model basename where the dropdown
+# matches full paths; the IP suggestion chip wrapped its text in a second span;
+# and a repaint deferred for focus never came due, because a BUTTON holds focus
+# until something takes it away.
+section("v3.75 patch32: a slot with no card gets one, and three regressions")
+
+check("had no GPU chosen - pinned to" in py,
+      "an unassigned slot is assigned and the assignment is logged")
+check("_cnt32" in py and "-_mem32(g)" in py,
+      "least-loaded card first, the bigger card on a tie")
+check("has no GPU chosen and none exists to assign" in py,
+      "only a machine with no GPUs at all still writes an unpinned launcher")
+check("tts_write_install_paths(paths[\"engine\"], paths[\"models\"], gguf)" in py,
+      "the installer stores the model's FULL path, the shape the dropdown matches")
+check('data-act="ipUse"' in py,
+      "the IP suggestion chip still exists")
+nin(seg(py, "async function detectIp", "let slotMsg"),
+    chr(60) + 'span class="hb"' + chr(62),
+    "and no longer wraps its text in a second span - the whole chip is the button")
+check("window.__ttsOwe = setTimeout" in py and "clearTimeout(window.__ttsOwe)" in py,
+      "a repaint deferred for focus has a due date")
+check('/^(INPUT|TEXTAREA|SELECT)$/.test' in py,
+      "and the due date yields to someone actually typing")
+
+try:
+    import tempfile as _tf32, os as _os32
+    _D32 = _tf32.mkdtemp()
+    _m32 = _os32.path.join(_D32, "a.gguf")
+    with open(_m32, "wb") as _f:
+        _f.write(b"GGUF")
+    _cfg32 = {"settings": {"llamaExe": "C:/l/llama-server.exe",
+                           "outputDir": _D32, "launcherDir": _D32},
+              "gpus": [{"id": "gpu0", "uuid": "GPU-A", "index": "0",
+                        "name": "big", "mem": "32606 MiB"},
+                       {"id": "gpu1", "uuid": "GPU-B", "index": "1",
+                        "name": "small", "mem": "24575 MiB"}],
+              "slots": [{"id": "1", "label": "S1", "port": 1236, "gpuId": "",
+                         "params": {"model": _m32}},
+                        {"id": "2", "label": "S2", "port": 1237, "gpuId": "",
+                         "params": {"model": _m32}}]}
+    _lg32 = []
+    _realA32 = (fp.ARCHIVE, fp.GEN_LAUNCHER_DIR)
+    fp.ARCHIVE = _os32.path.join(_D32, "ps1-launchers")
+    fp.GEN_LAUNCHER_DIR = _os32.path.join(_D32, "generated-launchers")
+    _real32 = fp.panel_log
+    fp.panel_log = lambda m: _lg32.append(m)
+    _pins32 = []
+    for _s32 in _cfg32["slots"]:
+        _d32 = fp.regen_slot_script(_cfg32, _s32)
+        with open(_d32, encoding="utf-8-sig") as _f:
+            _t32 = _f.read()
+        _pins32.append((_s32["gpuId"],
+                        [l for l in _t32.splitlines()
+                         if "CUDA_VISIBLE_DEVICES" in l]))
+    fp.panel_log = _real32
+    fp.ARCHIVE, fp.GEN_LAUNCHER_DIR = _realA32
+    _z1 = [p[0] for p in _pins32] == ["gpu0", "gpu1"]
+    _z2 = all(len(p[1]) == 1 for p in _pins32)
+    _z3 = "GPU-A" in _pins32[0][1][0] and "GPU-B" in _pins32[1][1][0]
+    _z4 = sum("had no GPU chosen - pinned to" in m for m in _lg32) == 2
+    check(_z1 and _z2 and _z3 and _z4,
+          "run: two bare slots take the two cards biggest-first, each launcher "
+          "pins exactly its own, and both assignments are logged",
+          str([_z1, _z2, _z3, _z4]))
+except Exception as _e32x:
+    check(False, "the patch32 runs did not RUN", str(_e32x)[:140])
+
+
+tpl_server = ""
+try:
+    with open(os.path.join(ROOT, "server-templates", "pinned-server.ps1"),
+              encoding="utf-8-sig") as _f:
+        tpl_server = _f.read()
+except Exception as _eT33:
+    tpl_server = "(unreadable: %s)" % _eT33
+
+# ----------------------------------------------------------------- v3.75 patch33
+# The owner was right about --load-mode and was told twice that he was not. He
+# tested it: "auto" spread each model over three cards and into system RAM,
+# "--no-mmap" fixed it, "--load-mode dio" fixed it. Memory-mapped weights stay
+# host-resident and get placed across whatever llama.cpp can reach, so this flag
+# decides WHERE the weights live and not merely how fast they load. Worse, the
+# panel had greyed the control out on any fully-offloaded card, on the strength
+# of a comment asserting the very thing the measurement disproved.
+section("v3.75 patch33: load mode decides where the weights live")
+
+check('("loadmode",  "Model load mode",     "sel",  "dio",' in py,
+      "dio is the default load mode for every server card")
+check('"--load-mode", "dio"' in tpl_server,
+      "and the fleet template ships with it")
+check("dio, not auto. MEASURED on a three-card rig" in py,
+      "with the measurement recorded where the default is set")
+nin(seg(py, "const OFF = {", "};"), "loadmode:",
+    "load mode is NOT in the map that greys a control out - it is always settable")
+check("Its guidance lives in the hint under the control instead" in py,
+      "and its guidance moved somewhere that does not disable it")
+check("in practice, <b>where they end up</b>" in py
+      and "(default dio)" in py,
+      "the Sampler Guide says what the flag actually decides")
+nin(py, "only affects load time, not generation",
+    "and no longer repeats the claim the measurement disproved")
+check('sse_notify("tts-installed")' in py and "async function ttsInstalled(" in py
+      and 'if (ev.t === "tts-installed") ttsInstalled();' in py,   # retold p36
+      "an install or adoption raises its own event, end to end")
+check("this repaint is NOT deferred" in py
+      and "clearTimeout(window.__ttsOwe);" in seg(py, "async function ttsInstalled",
+                                                  "async function stateRepull"),
+      "and that repaint is not deferred - the button that started it holds focus")
+
+try:
+    _row33 = [r for r in fp.SERVER_PARAMS if r[0] == "loadmode"][0]
+    _o33 = _row33[4].get("opts") or []
+    _d1 = _row33[3] == "dio" and "dio" in _o33 and "auto" in _o33
+    _cfg33 = {"settings": {"llamaExe": "C:/l/llama-server.exe"},
+              "gpus": [{"id": "gpu0", "uuid": "GPU-A", "index": "0"}],
+              "slots": [{"id": "1", "label": "S1", "port": 1236, "gpuId": "gpu0",
+                         "model": "D:/m.gguf", "params": {"ngl": "99"}}]}
+    _t33 = fp.build_param_launcher(_cfg33, _cfg33["slots"][0], "C:/P/s1.ps1")
+    _d2 = '"--load-mode", "dio"' in _t33
+    _cfg33["slots"][0]["params"]["loadmode"] = "mmap"
+    _d3 = '"--load-mode", "mmap"' in fp.build_param_launcher(
+        _cfg33, _cfg33["slots"][0], "C:/P/s1.ps1")
+    check(_d1 and _d2 and _d3,
+          "run: dio is the default and is written, and a card that chooses another "
+          "mode gets the one it chose", str([_d1, _d2, _d3]))
+except Exception as _e33x:
+    check(False, "the patch33 runs did not RUN", str(_e33x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch34
+# The last of the host memory. After --fit off (p30), the pin (p31/p32) and
+# --load-mode dio (p33), models still borrowed system RAM. One host-side knob
+# still differed from the owner's known-good launcher: --ctx-checkpoints, which
+# keeps N rollback copies of a slot's context in HOST memory. The panel shipped
+# llama.cpp's default of 8 while its own Sampler Guide told the user to set it to
+# zero. Four ways to end up in host memory, and a fleet server wants none of them.
+section("v3.75 patch34: the last host-memory default")
+
+check('("ctxcheck",  "Context checkpoints", "int",  "0",' in py,
+      "context checkpoints default to 0 - no rollback copies in host memory")
+check("kept in HOST memory" in py and "own guide already said" in py,
+      "and the reason is recorded where the default is set")
+check('"--ctx-checkpoints", "0"' in tpl_server and '"--cache-ram", "0"' in tpl_server,
+      "the fleet template states BOTH zeros, because both must be explicit")
+check("Both zeros explicit, and both must be" in tpl_server,
+      "and says why an unsaid zero is not a zero")
+
+try:
+    _cfg34 = {"settings": {"llamaExe": "C:/l/llama-server.exe"},
+              "gpus": [{"id": "gpu0", "uuid": "GPU-A", "index": "0"}],
+              "slots": [{"id": "1", "label": "S1", "port": 1236, "gpuId": "gpu0",
+                         "model": "D:/m.gguf", "params": {"ngl": "99"}}]}
+    _t34 = fp.build_param_launcher(_cfg34, _cfg34["slots"][0], "C:/P/s1.ps1")
+    # every route into host memory, shut by default, in one generated launcher
+    _e1 = '"--ctx-checkpoints", "0"' in _t34
+    _e2 = '"--cache-ram", "0"' in _t34
+    _e3 = '"--load-mode", "dio"' in _t34
+    _e4 = '"--fit", "off"' in _t34
+    _e5 = '$env:CUDA_VISIBLE_DEVICES = "GPU-A"' in _t34
+    # and a card that WANTS a host cache still gets one
+    _cfg34["slots"][0]["params"]["ctxcheck"] = "8"
+    _e6 = '"--ctx-checkpoints", "8"' in fp.build_param_launcher(
+        _cfg34, _cfg34["slots"][0], "C:/P/s1.ps1")
+    check(_e1 and _e2 and _e3 and _e4 and _e5 and _e6,
+          "run: a default launcher pins its card and closes every route into host "
+          "memory - checkpoints, cache spill, mmap and fitting - while a card that "
+          "asks for checkpoints still gets them",
+          str([_e1, _e2, _e3, _e4, _e5, _e6]))
+except Exception as _e34x:
+    check(False, "the patch34 runs did not RUN", str(_e34x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch35
+# Two things the owner had to work around by hand. The OFF map on a server card
+# explains when one setting overrules another - and also set `disabled`, so a
+# GUESS written into one of those strings removed the control. Load mode was
+# greyed out on exactly the cards that needed it changed, and the fix had to be
+# applied by editing launchers in a text editor. And three patches of ever more
+# careful repainting still left CTRL+F5 as the only way to see post-install
+# paths, because a repaint cannot rebuild what the page read once at load.
+section("v3.75 patch35: nothing on a card is locked, and an install reloads")
+
+check('const dis = "";' in py,
+      "no server card setting is ever disabled - the map explains, it does not lock")
+check("const why = OFF[d.key]" in py,
+      "and the explanation itself is kept")
+nin(py, 'const dis = why ? " disabled" : "";',
+    "the line that turned an explanation into a lock is gone")
+# retold p36: the reload is gone - it discarded the terminal, the scroll and any
+# half-typed field to deliver four strings, which are now written in directly
+check("async function ttsInstalled()" in py
+      and 'if (ev.t === "tts-installed") ttsInstalled();' in py
+      and 'const el = $("tts-" + k);' in py,
+      "an install or adoption fills its fields without discarding the page")
+check("if the repaint" in py and "already did it this changes nothing" in py,
+      "and the reason is recorded where the fields are written")
+
+try:
+    _dis35 = seg(py, "const why = OFF[d.key]", "let ctl;")
+    _q35 = not any(l.strip().startswith("//") is False and "disabled" in l
+                   for l in _dis35.split("\n"))
+    _row35 = [r for r in fp.SERVER_PARAMS if r[0] == "ctxcheck"]
+    _q36 = bool(_row35) and _row35[0][3] == "0"
+    _cfg35 = {"settings": {"llamaExe": "C:/l/llama-server.exe"},
+              "gpus": [{"id": "gpu0", "uuid": "GPU-A", "index": "0"}],
+              "slots": [{"id": "1", "label": "S1", "port": 1236, "gpuId": "gpu0",
+                         "model": "D:/m.gguf", "params": {"ngl": "99"}}]}
+    _t35 = fp.build_param_launcher(_cfg35, _cfg35["slots"][0], "C:/P/s1.ps1")
+    _q37 = '"--ctx-checkpoints", "0"' in _t35 and '"--load-mode", "dio"' in _t35
+    check(_q35 and _q36 and _q37,
+          "run: the control renderer emits no disabled attribute, checkpoints "
+          "default to zero, and a generated launcher states both",
+          str([_q35, _q36, _q37]))
+except Exception as _e35x:
+    check(False, "the patch35 runs did not RUN", str(_e35x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch36
+# Three the owner had to diagnose from the outside. PTI and PME hang off a server
+# WITHOUT a listener of their own - Live Network draws them as "Proxy", not a
+# port - so the readiness gate asked slot_status("") about them, got "unknown"
+# forever, and every player line went out untagged while the server sat serving.
+# Remote Access bound the socket at startup only, so the switch did nothing until
+# a restart while the page printed the address to visit. And patch35's reload
+# worked by throwing the whole page away to deliver four strings.
+section("v3.75 patch36: a proxy provider has no port, and a switch that switches")
+
+check('_port22 = rt.get("port") or rt.get("server") or ""' in py,
+      "a panel-called provider's readiness is judged by its SERVER's port")
+check('_st22 = slot_status(_port22)' in py,
+      "and that is the port actually probed")
+check('% (rt.get("server", "?"), _port22 or "?",' in py,
+      "the log names the port it really asked about")
+check('_bind = "0.0.0.0"' in py and 'net_mode() == "lan" else "127.0.0.1"' not in py,
+      "the panel listens on the LAN interface always - client_scope decides who "
+      "may speak, per request, so the switch takes effect when it is thrown")
+check("listens on the LAN interface always" in py
+      and "made the switch a lie" in py,
+      "and the reason is recorded where the bind is chosen")
+nin(seg(py, "async function ttsInstalled", "async function stateRepull"),
+    "location.reload",
+    "an install does not throw the page away")
+check('const el = $("tts-" + k);' in py
+      and '"ttsAcppDir", "ttsAcppModelsDir", "ttsAcppModel", "ttsSampleDir",' in py,
+      "it writes the fields an install fills, straight from the state just fetched")
+
+try:
+    _sc36 = seg(py, "def client_scope", "def listen_host")
+    _c1 = 'if net_mode() != "lan":' in _sc36 and "return None" in _sc36
+    _c2 = 'return None                              # external: always denied' in _sc36
+    _rt36 = {"server": "1237", "port": "", "id": "pti"}
+    _p36 = _rt36.get("port") or _rt36.get("server") or ""
+    _c3 = _p36 == "1237"
+    _rt37 = {"server": "1237", "port": "1251", "id": "dialogue"}
+    _c4 = (_rt37.get("port") or _rt37.get("server") or "") == "1251"
+    check(_c1 and _c2 and _c3 and _c4,
+          "run: LAN callers are still refused while Remote Access is off and "
+          "external always, a portless provider resolves to its server's port, "
+          "and a provider with its own port keeps it", str([_c1, _c2, _c3, _c4]))
+except Exception as _e36x:
+    check(False, "the patch36 runs did not RUN", str(_e36x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch37
+# Four defaults and one control the owner asked for. The thought switch is the
+# one worth naming: it shipped off, and a session was spent hunting a "thoughts
+# are broken" bug that was this setting sitting at its shipped value - which is
+# the second time an off-by-default display switch has cost a diagnosis.
+section("v3.75 patch37: defaults that match how the panel is actually used")
+
+check('"ttsAnswerPing": "banned",' in py,
+      "the startup ping is answered with silence and not announced")
+check('"ttsThoughtOut": "on",' in py,
+      "an NPC's thought is shown by default")
+check('"termStampsOff": "dashboard,thinking,tts,ptipme,splitd,splitt,ttscal",' in py,
+      "and every terminal starts without the time column")
+check('d.act === "provAll"' in py and 'data-act="provAll"' in py
+      and "const allOff = all.length > 0 && all.every(p => off.has(p.id));" in py,
+      "one button turns every provider on or off, labelled from the current state")
+check("#provfilter { display: grid;" in py and ".provall { grid-column: 1 / -1;" in py,
+      "and the providers wrap into an even grid rather than one long row")
+
+try:
+    import re as _re37
+    _kinds37 = set(_re37.findall(r'id="tail-([a-z]+)"', py))
+    _stamps37 = set(fp.DEF_SETTINGS["termStampsOff"].split(","))
+    _y1 = bool(_kinds37) and _kinds37 == _stamps37
+    _y2 = fp.DEF_SETTINGS["ttsAnswerPing"] in fp.TTS_PING_MODES
+    _y3 = fp.DEF_SETTINGS["ttsThoughtOut"] == "on"
+    check(_y1 and _y2 and _y3,
+          "run: the stamps default names EVERY terminal that exists and invents "
+          "none, and the ping default is a value the reader accepts",
+          "terminals %s vs %s" % (sorted(_kinds37), sorted(_stamps37)))
+except Exception as _e37x:
+    check(False, "the patch37 runs did not RUN", str(_e37x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch38
+# The owner's thoughts still land after the FIRST chunk, and chunk size was not
+# it - 170 changed nothing. Fed the owner's own strings, tts_chunk_is_last
+# answers True on the real final chunk, so the function is right and something
+# about its INPUTS is not: the kept reply is missing, stale, or holds different
+# text. Three different faults, one symptom, and the decision was silent. It now
+# says which, in the log the owner already sends.
+section("v3.75 patch38: the last-chunk decision explains itself")
+
+check("def _th_why(" in py and "thought NOT-FINAL" in py,
+      "a chunk judged not-final records why")
+check('"no reply kept for this speaker"' in py
+      and '"the kept reply is %.1fs old"' in py
+      and '"the chunk does not end where the reply ends (%d shared)"' in py,
+      "and the three causes are told apart - missing, stale, mismatched")
+check("| reply tail %r | chunk tail %r" in py,
+      "with both tails, which is what the comparison actually looks at")
+check('"ttsActionOut": "on",' in py,
+      "the action a character chose is shown by default")
+check('"%s: %s" % (k, " ".join(str(v).split()))' in py,
+      "an action parameter is written whole")
+nin(py, '" ".join(str(v).split())[:60]',
+    "the 60-character cut that removed the end of the useful ones is gone")
+
+try:
+    # nothing here writes: the log call is stubbed and action_row is pure, so
+    # log_dir and CONFIG are left alone - redirecting them broke the cleanup a
+    # LATER section does through the same names
+    _saidZ = []
+    _realZ = fp.calterm_log
+    fp.calterm_log = lambda rows: _saidZ.extend(rows)
+    _whoZ = "GateSpeaker"
+    # a thought must be waiting, or the verdict is not explained at all
+    with fp.TH_AFTER_LOCK:
+        fp.TH_AFTER[_whoZ] = [{"end": 0.0, "fin": False}]
+    fp.REPLY_FULL.pop(_whoZ, None)
+    fp.tts_chunk_is_last(_whoZ, "anything at all")
+    _z1 = any("no reply kept" in s for s in _saidZ)
+    _saidZ.clear()
+    fp.REPLY_FULL[_whoZ] = (fp._th_norm("hello there friend"), time.time() - 99)
+    fp.tts_chunk_is_last(_whoZ, "hello there friend")
+    _z2 = any("old" in s for s in _saidZ)
+    _saidZ.clear()
+    fp.REPLY_FULL[_whoZ] = (fp._th_norm("the whole reply ends here"), time.time())
+    _z3 = fp.tts_chunk_is_last(_whoZ, "reply ends here") is True and not _saidZ
+    fp.tts_chunk_is_last(_whoZ, "something else entirely")
+    _z4 = any("does not end where" in s for s in _saidZ)
+    fp.calterm_log = _realZ
+    with fp.TH_AFTER_LOCK:
+        fp.TH_AFTER.pop(_whoZ, None)
+    fp.REPLY_FULL.pop(_whoZ, None)
+    _rowZ = fp.action_row('{"ACTION":"Travel","PARAMS":{"to":"%s"}}' % ("x" * 200),
+                          "Ada")
+    _z5 = ("x" * 200) in _rowZ
+    check(_z1 and _z2 and _z3 and _z4 and _z5,
+          "run: missing, stale and mismatched each name themselves, a true final "
+          "chunk still passes silently, and a long action parameter is not cut",
+          str([_z1, _z2, _z3, _z4, _z5]))
+except Exception as _e38x:
+    check(False, "the patch38 runs did not RUN", str(_e38x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch39
+# The thought code did NOT regress: tts_thought_fire, tts_thought_after_chunk and
+# tts_chunk_trace are byte-identical to patch11, the build the owner calls good.
+# A chunk is traced when its synthesis RETURNS, so "the reply is still arriving"
+# was decided from returned chunks alone - and a request still open leaves no mark
+# anywhere. The owner's 08:50:44 line spent 12.7s inside one request, the 3.5s
+# quiet window closed mid-flight, and the thought spoke 3.0s before the last chunk
+# was delivered. patch11 had the same hole and never fell in it: its calibration
+# store was warm, so no chunk ever took 3.5s.
+section("v3.75 patch39: a chunk still open holds the reply open")
+
+check("TTS_INFLIGHT = {}" in py and "def tts_inflight_add(" in py
+      and "def tts_inflight_drop(" in py and "def tts_inflight_since(" in py,
+      "an open chunk request is recorded against its speaker")
+check("_held = tts_inflight_since(who)" in py
+      and "_arriving = bool(_held) or (time.time() - _last_rx) <= 3.5" in py,
+      "and the arriving window counts it, not only chunks already returned")
+nin(py, "_arriving = (time.time() - _last_rx) <= 3.5",
+    "the returned-chunks-only window is gone")
+check("_cap = 3 if not _held else int(TTS_INFLIGHT_MAX_S / 2.0)" in py,
+      "three defers still bounds a GUESS; an open request waits on the clock")
+check("tts_inflight_add(eid, _thWho)" in py
+      and "tts_inflight_drop(eid)" in seg(py, "    def _run(self, eid, text,",
+                                          "    def _run_inner(self, eid, text,"),
+      "registered once the speaker is settled, cleared in _run's finally")
+
+# One synthesis per thought. The warm-up and the fire ask for the same eid and a
+# file-exists cache cannot see a wav still being written: both synthesised, and the
+# second take held the single audio.cpp slot while the reply's own next chunk queued
+# behind it - which is the delay that closed the window in the first place.
+check("_TH_MAKE_LOCK" in py and "_mk = _TH_MAKE.setdefault(eid, threading.Lock())" in py,
+      "a thought being synthesised is not synthesised a second time")
+check("for _k in list(_TH_MAKE)[:-24]:" in py
+      and "if _k != eid and not _TH_MAKE[_k].locked():" in py,
+      "and the lock table is bounded without ever dropping a held one")
+
+# A thought is spoken by the panel, dialogue by the game. Nothing joined them, so
+# the next character's first line started on top of the thought still sounding.
+check("TTS_FLOOR = [0.0]" in py and "def tts_floor_set(" in py,
+      "a thought being spoken holds the room")
+check("tts_floor_set(_secs)" in py,
+      "claimed by a fired thought before it is broadcast")
+check("0.0 if (_isp or ping) else TTS_FLOOR[0] - time.time()" in py,
+      "and the next line waits for it - never the player's own voice or the ping")
+nin(py, "_hold_s = min(_thw, 12.0)",
+    "the bare 12.0 became the named ceiling both holds share")
+
+try:
+    import threading as _th39, tempfile as _tf39, shutil as _sh39, io as _io39
+    import wave as _wv39, os as _os39
+
+    # -- the field replay: chunk 1 back, the final chunk POSTed and still open.
+    #    The decision moments are walked exactly as the timer chain would.
+    class _Clk39(object):
+        def __init__(self, t): self.now = t
+        def time(self): return self.now
+        def sleep(self, s): self.now += s
+        def __getattr__(self, k): return getattr(_realtime39, k)
+
+    import time as _realtime39
+    _oldtime39, _oldcal39, _oldsse39, _oldmake39 = (
+        fp.time, fp.calterm_log, fp.sse_notify, fp.tts_thought_make)
+    _clk39 = _Clk39(1000000.0)
+    fp.time = _clk39
+    fp.calterm_log = lambda rows: None
+    fp.sse_notify = lambda *a, **k: None
+    fp.tts_thought_make = lambda who, text, cfg=None: ("th_gate", 6.0)
+
+    def _replay39(who, ret_s, fires_in):
+        """True when the thought waited for the still-open final chunk."""
+        base = _clk39.now
+        fp.REPLY_FULL.clear(); fp.CHUNK_TRACE.clear(); fp.TH_AFTER.clear()
+        fp.TTS_INFLIGHT.clear()
+        _full = fp._th_norm("chunk one opening words and then the rest of the reply "
+                            "which ends right here")
+        fp.REPLY_FULL[who] = (_full, base)
+        fp.CHUNK_TRACE[who] = [(base, 1.5, fp._th_norm("chunk one opening words"))]
+        fp.TH_AFTER[who] = [{"text": "a thought", "end": base + fires_in,
+                             "t0": base, "timer": None}]
+        _clk39.now = base + 0.09
+        fp.tts_inflight_add("gate-final", who)
+        _t, _g = base + fires_in, 0
+        while _g < 40:
+            _g += 1
+            _clk39.now = _t
+            if _clk39.now >= base + ret_s:
+                _clk39.now = base + ret_s + 5.0
+                return True                       # the chunk came back first
+            _b = len(fp.TH_AFTER.get(who) or [])
+            fp.tts_thought_fire(who)
+            if len(fp.TH_AFTER.get(who) or []) < _b:
+                _clk39.now = base + ret_s + 5.0
+                return False                      # fired while it was still open
+            _t = _clk39.now + 2.0 + fp.TH_FIRE_PAD
+        _clk39.now = base + ret_s + 5.0
+        return True
+
+    _y1 = _replay39("GateTolfdir", 5.58, 2.8)     # the owner's 08:50:03 reply
+    _y2 = _replay39("GateEleanor", 12.77, 2.4)    # the owner's 08:50:44 reply
+    # and the ghost the bounded ladder exists for: NOTHING open, quiet window shut,
+    # so the chain must still fire rather than wait on a chunk that is not coming
+    _base39 = _clk39.now
+    fp.REPLY_FULL.clear(); fp.CHUNK_TRACE.clear(); fp.TH_AFTER.clear()
+    fp.TTS_INFLIGHT.clear()
+    fp.REPLY_FULL["GateGhost"] = (fp._th_norm("a reply whose last chunk never came"),
+                                  _base39)
+    fp.CHUNK_TRACE["GateGhost"] = [(_base39, 1.0, fp._th_norm("a reply whose"))]
+    fp.TH_AFTER["GateGhost"] = [{"text": "t", "end": _base39, "t0": _base39,
+                                 "timer": None}]
+    for _i39 in range(6):
+        _clk39.now += 2.2
+        fp.tts_thought_fire("GateGhost")
+    _y3 = not fp.TH_AFTER.get("GateGhost")
+
+    # -- the floor: a thought's own length plus the half second, replaced not raised
+    fp.time = _realtime39
+    _t039 = _realtime39.time()
+    fp.tts_floor_set(4.0)
+    _y4 = 4.4 < (fp.TTS_FLOOR[0] - _t039) < 4.6
+    fp.tts_floor_set(1.0)
+    _y5 = (fp.TTS_FLOOR[0] - _t039) < 2.0
+    fp.TTS_FLOOR[0] = 0.0
+
+    # -- one synthesis, two simultaneous callers. The REAL tts_thought_make is
+    #    needed here, so the replay's stub comes off first.
+    fp.time = _realtime39
+    fp.tts_thought_make = _oldmake39
+    _tmp39 = _tf39.mkdtemp(prefix="gate39-")
+    _hits39, _hl39 = [], _th39.Lock()
+
+    def _spk39(base, mid, text, ref, reftext=None):
+        with _hl39:
+            _hits39.append(text)
+        _realtime39.sleep(0.25)
+        _b = _io39.BytesIO()
+        with _wv39.open(_b, "wb") as _w:
+            _w.setnchannels(1); _w.setsampwidth(2); _w.setframerate(24000)
+            _w.writeframes(b"\x00\x00" * 2400)
+        return _b.getvalue(), {}
+
+    _sv39 = (fp.tts_acpp_speak, fp.tts_ref_learn, fp.tts_conditioned, fp.tts_echo_wav,
+             fp.tts_ref_canonical, fp.tts_ref_text, fp.tts_server_port, fp.tts_engine,
+             fp.TTSW.dir, fp.TTSW.prune, fp.TTSW.log)
+    fp.tts_acpp_speak = _spk39
+    fp.tts_ref_learn = lambda *a, **k: None
+    fp.tts_conditioned = lambda *a, **k: None
+    fp.tts_echo_wav = lambda p: True
+    fp.tts_ref_canonical = lambda r: r
+    fp.tts_ref_text = lambda r, c=None: ""
+    fp.tts_server_port = lambda cfg: 1240
+    fp.tts_engine = lambda cfg: "audiocpp"
+    fp.TTSW.dir = lambda: _tmp39
+    fp.TTSW.prune = lambda: None
+    fp.TTSW.log = lambda s: None
+    fp.TTS_REF_BY_NAME["GateAda"] = _os39.path.join(_tmp39, "ada.wav")
+    _got39 = []
+    _thr39 = [_th39.Thread(target=lambda: _got39.append(
+        fp.tts_thought_make("GateAda", "One short thought.", {"settings": {}})))
+        for _ in range(2)]
+    for _t39 in _thr39: _t39.start()
+    for _t39 in _thr39: _t39.join()
+    _y6 = len(_hits39) == 1 and len({_e for _e, _ in _got39}) == 1
+
+    (fp.tts_acpp_speak, fp.tts_ref_learn, fp.tts_conditioned, fp.tts_echo_wav,
+     fp.tts_ref_canonical, fp.tts_ref_text, fp.tts_server_port, fp.tts_engine,
+     fp.TTSW.dir, fp.TTSW.prune, fp.TTSW.log) = _sv39
+    fp.TTS_REF_BY_NAME.pop("GateAda", None)
+    _sh39.rmtree(_tmp39, ignore_errors=True)
+    fp.time, fp.calterm_log, fp.sse_notify = _oldtime39, _oldcal39, _oldsse39
+    fp.REPLY_FULL.clear(); fp.CHUNK_TRACE.clear(); fp.TH_AFTER.clear()
+    fp.TTS_INFLIGHT.clear()
+
+    check(_y1 and _y2 and _y3 and _y4 and _y5 and _y6,
+          "run: both field replies wait for their open chunk, an abandoned chunk "
+          "still fires on the bounded ladder, the floor is a thought's length plus "
+          "the gap and a newer one replaces it, and two callers get one synthesis",
+          str([_y1, _y2, _y3, _y4, _y5, _y6]))
+except Exception as _e39x:
+    check(False, "the patch39 runs did not RUN", str(_e39x)[:140])
+
+
+# A character's name was capped at 29 characters and failed SILENTLY: note_speaker
+# returned "", and the mood queue, the kept reply, the reply ring and the freshest
+# thought are all guarded by `if who:`. The owner's Ertzebet the Librarian's
+# Assistant is 34 characters, so she had no emotion tags, no reply text for the
+# last-chunk matcher, no thought audio, and the dashboard wrote a bare "thought:".
+section("v3.75 patch39: a character's name is not capped below Skyrim's own")
+
+check(rb"{1,59}?" in fp.SPEAKER_RX.pattern and rb"{1,28}?" not in fp.SPEAKER_RX.pattern,
+      "a titled character's name is read, not silently dropped")
+check(rb"{1,59}?" in fp.PLAYER_RX.pattern,
+      "and the player's own name has the same room")
+try:
+    _n39 = []
+    for _nm39 in ("Ertzebet the Librarian's Assistant", "Mirabelle Ervine",
+                  "Urag gro-Shub", "Tolfdir", "Colette Marence"):
+        _b39 = ("You are %s, a member of the College." % _nm39).encode("utf-8")
+        _m39 = fp.SPEAKER_RX.search(_b39)
+        _n39.append(bool(_m39) and _m39.group(1).decode("utf-8") == _nm39)
+    # and it still cannot run away: a capture may not cross a comma or a full stop
+    _runaway = fp.SPEAKER_RX.search(b"You are here. Everyone is, a bit tired")
+    _n39.append(_runaway is None or b"." not in _runaway.group(1))
+    _p39 = fp.PLAYER_RX.search(b"## Ertzebet the Librarian's Assistant's Party's Quests")
+    _n39.append(bool(_p39))
+    check(all(_n39),
+          "run: every name reads back whole, long ones included, and the capture "
+          "still stops at a comma or a full stop",
+          str(_n39))
+except Exception as _e39n:
+    check(False, "the patch39 name runs did not RUN", str(_e39n)[:140])
+
+
+section("v3.75 patch39: one popover, one visual language")
+
+_adj39 = seg(_css, ".tpanel { display: none;", ".tchrome.adjopen .tpanel")
+for _cls39, _name39 in ((".topanel", "Options"), (".tppanel", "Providers")):
+    _p39 = seg(_css, _cls39 + " { display: none;",
+               ".tchrome.%sopen %s" % ("opt" if _cls39 == ".topanel" else "prov", _cls39))
+    nin(_p39, "border: 1px solid var(--line)",
+        "the %s panel draws no grey line" % _name39)
+    check("border: none;" in _p39, "%s: it is stated, not merely absent" % _name39)
+    for _decl39 in ("box-shadow: 0 0 14px -2px rgba(0,0,0,.85)", "border-radius: 10px",
+                    "margin-top: 4px", "width: max-content"):
+        check(_decl39 in _p39 and _decl39 in _adj39,
+              "%s: %s, the same as Adjust" % (_name39, _decl39))
+    # the fill and blur are the panel's own and must survive the border change
+    check(_p39.count("backdrop-filter: blur(2px)") == 2,
+          "%s still blurs the log behind it, prefixed and not" % _name39)
+
+# BUILD.md described a command that does not produce the artefact that ships.
+_bld39 = rd("BUILD.md").decode("utf-8", "replace") if os.path.isfile(
+    os.path.join(ROOT, "BUILD.md")) else ""
+if _bld39:
+    check("-std=c++17 -O2 -municode -mwindows -static -s" in _bld39,
+          "the documented build is the one that was executed, strip included")
+    check("-lshell32" in _bld39 and "-lole32" in _bld39 and "-lws2_32" not in _bld39,
+          "against the libraries the launcher actually calls")
+    check("bare filename" in _bld39,
+          "and says why all four inputs must share one working directory")
+    check("665 KB instead of 216 KB" in _bld39,
+          "with what following it unstripped would have cost")
+if os.path.isfile(os.path.join(ROOT, "PandorumLLM.exe")):
+    check(os.path.getsize(os.path.join(ROOT, "PandorumLLM.exe")) < 400 * 1024,
+          "the exe in this tree is the stripped build",
+          "%d bytes" % os.path.getsize(os.path.join(ROOT, "PandorumLLM.exe")))
+
+check(".provall { grid-column: 1 / -1;" in _css
+      and "justify-self: center;" in seg(_css, ".provall {", ".provpick {"),
+      "and All on/off sits in the middle of the grid it spans")
+nin(seg(_css, ".provall {", ".provpick {"), "justify-self: start;",
+    "not pinned to the left edge")
+
+
+# ----------------------------------------------------------------- v3.75 patch40
+# The queue rule already refused a name owned by another voicetype - `taken` inverts
+# _spk_voices. But the PLAYER never enters _spk_voices: their branch returns before
+# that dict is touched. So the guard was blind to exactly one name, and it is the one
+# SkyrimNet queues most often, because it writes the player's dialogue too. Colette's
+# chunk arrived while a Maxxor request waited, nothing owned "Maxxor", and her line
+# was named for the player.
+section("v3.75 patch40: an NPC sample never takes the player's name")
+
+_svx = seg(py, "def speaker_for_voice_ex(voicetype):", "def player_name_unread(")
+check("for _pn in (player_name_setting(), _spk_player[0]):" in _svx,
+      "the player's names are read before the lock, which neither call takes")
+check('taken.setdefault(_pn, "player")' in _svx,
+      "and the guard that inverts _spk_voices is told about them")
+check("_elig = [nm for _w, nm in _spk_recent" in _svx
+      and "taken.get(nm, key) == key]" in _svx,
+      "a waiting request counts only if its character could speak through THIS sample")
+check("if run and run[2] and now - run[1] <= RUN_GAP_S and not _elig:" in _svx,
+      "so a request that was already ruled out no longer stands the run down")
+nin(_svx, "and not any(now - _w <= SPEAKER_PAIR_S for _w, _n in _spk_recent)):",
+    "the raw queue-is-empty test is gone")
+check(_svx.count("taken = {v: k for k, v in _spk_voices.items()}") == 1,
+      "and the ownership table is built once, so its two readers cannot disagree")
+check("refused to name %s after the player" in py,
+      "a refusal is said out loud, where the wrong name used to appear")
+
+try:
+    import time as _t40
+    _sv40 = (dict(fp._spk_voices), list(fp._spk_recent), dict(fp._spk_run),
+             fp._spk_typed[0], fp._spk_player[0], set(fp._spk_known),
+             dict(fp._spk_pin), dict(fp._spk_unique_pos))
+    _pl40, _al40 = fp.panel_log, fp.tts_identity_alarm
+    fp.panel_log = lambda *a, **k: None
+    fp.tts_identity_alarm = lambda *a, **k: None
+
+    def _reset40():
+        fp._spk_voices.clear(); fp._spk_run.clear(); fp._spk_pin.clear()
+        fp._spk_recent[:] = []; fp._spk_known.clear(); fp._spk_unique_pos.clear()
+        fp._spk_typed[0] = ""; fp._spk_player[0] = ""; fp._spk_player_src[0] = ""
+        fp.META_LAST[0], fp.META_LAST[1] = "", 0.0
+
+    _now40 = _t40.time()
+
+    # the owner's 11:29:13 record, replayed from the ledger it wrote
+    _reset40()
+    fp._spk_voices["femaleshrill"] = "Colette Marence"
+    fp._spk_voices["femaleuniquemirabelleervine"] = "Ertzebet the Librarian\'s Assistant"
+    fp._spk_run["femaleshrill"] = ["Colette Marence", _now40 - 1.0, True]
+    fp._spk_pin["femaleshrill"] = ("Colette Marence", _now40 - 12.0)   # aged out
+    fp._spk_player[0] = "Maxxor"
+    fp._spk_known.update(["Colette Marence", "Maxxor",
+                          "Ertzebet the Librarian\'s Assistant"])
+    fp._spk_recent[:] = [(_now40 - 2.0, "Maxxor"),
+                         (_now40 - 1.0, "Ertzebet the Librarian\'s Assistant")]
+    _w1 = fp.speaker_for_voice_ex("femaleshrill")[0] == "Colette Marence"
+
+    # patch116 must survive: a SHARED voicetype still hands over to who just spoke
+    _reset40()
+    fp._spk_voices["femaledarkelf"] = "Nelysa"
+    fp._spk_run["femaledarkelf"] = ["Nelysa", _now40 - 1.0, True]
+    fp._spk_known.update(["Nelysa", "Brelyna Maryon"])
+    fp._spk_recent[:] = [(_now40 - 1.0, "Brelyna Maryon")]
+    _w2 = fp.speaker_for_voice_ex("femaledarkelf")[0] == "Brelyna Maryon"
+
+    # the player's name is refused on an NPC sample even with nothing else waiting
+    _reset40()
+    fp._spk_player[0] = "Maxxor"
+    fp._spk_known.update(["Maxxor"])
+    fp._spk_recent[:] = [(_now40 - 1.0, "Maxxor")]
+    _w3 = fp.speaker_for_voice_ex("malenord")[0] != "Maxxor"
+
+    # and a free voicetype is still paired with the request that named it
+    _reset40()
+    fp._spk_known.update(["Urag gro-Shub"])
+    fp._spk_recent[:] = [(_now40 - 1.0, "Urag gro-Shub")]
+    _w4 = fp.speaker_for_voice_ex("maleorc")[0] == "Urag gro-Shub"
+
+    # the typed name counts as the player\'s too, not only the one read from a prompt
+    _reset40()
+    fp._spk_typed[0] = "Dovah"
+    fp._spk_known.update(["Dovah"])
+    fp._spk_recent[:] = [(_now40 - 1.0, "Dovah")]
+    _w5 = fp.speaker_for_voice_ex("malenord")[0] != "Dovah"
+
+    _reset40()
+    (fp._spk_voices.update(_sv40[0]), fp._spk_recent.extend(_sv40[1]),
+     fp._spk_run.update(_sv40[2]))
+    fp._spk_typed[0], fp._spk_player[0] = _sv40[3], _sv40[4]
+    fp._spk_known.update(_sv40[5]); fp._spk_pin.update(_sv40[6])
+    fp._spk_unique_pos.update(_sv40[7])
+    fp.panel_log, fp.tts_identity_alarm = _pl40, _al40
+
+    check(_w1 and _w2 and _w3 and _w4 and _w5,
+          "run: the owner\'s line is Colette again, a shared voicetype still hands "
+          "over, the player\'s name is refused on an NPC sample typed or read, and a "
+          "free voicetype is still paired",
+          str([_w1, _w2, _w3, _w4, _w5]))
+except Exception as _e40x:
+    check(False, "the patch40 runs did not RUN", str(_e40x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch41
+# Five emotion tokens, measured by ear on the owner's rig, one short line each, the
+# engine re-conditioned on another speaker before every take so the carryover pressure
+# was identical. disgust, longing, sadness and shame came back as a DIFFERENT SPEAKER;
+# elation came back as the right speaker but unrecognizable, at 4x the RMS of every
+# other take. The other sixteen were correct, with amusement and pride as controls.
+# The block set already existed and had been empty since it was written.
+section("v3.75 patch41: the tokens that break the voice are refused")
+
+check(sorted(fp.TTS_EMOTION_OFF)
+      == ["determination", "disgust", "elation", "longing", "sadness", "shame"],
+      "the five measured emotions and the one asked for are named",
+      str(sorted(fp.TTS_EMOTION_OFF)))
+check(py.index("TTS_EMOTION_OFF = (") < py.index("DEF_SETTINGS = {"),
+      "the list is defined above the defaults it seeds")
+check(py.count("TTS_EMOTION_OFF = (") == 1,
+      "and defined once, so the two boards cannot drift from each other")
+check("ELATION HAS BEEN HERE BEFORE" in py,
+      "elation records that it has been blocked and unblocked before")
+nin(py, "over-reference x%.2f",
+    "the patch40 length diagnostic is gone - the A/B disproved its hypothesis")
+
+# The unique-voicetype bind is a fact about the SAMPLE, not about who speaks through
+# it now. SkyrimNet lends a unique sample to other characters.
+_ubx = seg(py, "def speaker_for_voice_ex(voicetype):", "def player_name_unread(")
+check(_ubx.index('return pin[0], "the words of the line itself"')
+      < _ubx.index('return ub, "bound to this unique voicetype"'),
+      "a unique voicetype yields to the words of the line itself")
+check(_ubx.index('return ub, "bound to this unique voicetype"')
+      < _ubx.index('"paired with a waiting dialogue request"'),
+      "but still outranks the queue, the cache and the run")
+
+try:
+    import time as _t41
+    _pl41 = fp.panel_log
+    fp.panel_log = lambda *a, **k: None
+    # With NO board applied, nothing is refused - the six are a default now, and the
+    # patch42 section runs all three routes with the default board, which is the real
+    # question. Here: an allowed emotion must still travel every route untouched.
+    _leak41, _drop41 = [], []
+    for _e41 in ("amusement", "pride", "anger", "fear"):
+        _tok = "<|emotion:%s|>" % _e41
+        if not any(w.split("-")[-1].lower() == _e41
+                   for w in dict(fp.TAG_OFFER).get("Emotion", ())):
+            _drop41.append("%s via offer" % _e41)
+        if _tok not in fp.tts_apply_tags("[EMOTION-%s] A line." % _e41.upper(),
+                                         keep=True, engine="audiocpp"):
+            _drop41.append("%s via wire" % _e41)
+        fp.MOOD_QUEUE["GateEmo"] = ([("emotion", _e41)], _t41.time())
+        if _tok not in fp.tts_npc_mood_arm("GateEmo", "A line."):
+            _drop41.append("%s via mood arm" % _e41)
+        fp.MOOD_QUEUE.pop("GateEmo", None)
+
+    # the unique bind yields to the line's own words, and answers without one
+    _k41 = "femaleuniquemirabelleervine"
+    _sv41 = (dict(fp._spk_unique_pos), dict(fp._spk_pin), dict(fp._spk_run),
+             set(fp._spk_known))
+    fp._spk_unique_pos.clear(); fp._spk_pin.clear(); fp._spk_run.clear()
+    fp._spk_known.update(["Mirabelle Ervine", "Ertzebet the Librarian\'s Assistant"])
+    _u1 = fp.speaker_for_voice_ex(_k41)[0] == "Mirabelle Ervine"
+    fp._spk_pin[_k41] = ("Ertzebet the Librarian\'s Assistant", _t41.time())
+    _u2 = fp.speaker_for_voice_ex(_k41)[0] == "Ertzebet the Librarian\'s Assistant"
+    fp._spk_pin.clear()
+    _u3 = fp.speaker_for_voice_ex(_k41)[0] == "Mirabelle Ervine"
+    fp._spk_unique_pos.clear(); fp._spk_pin.clear(); fp._spk_run.clear()
+    fp._spk_known.clear()
+    fp._spk_unique_pos.update(_sv41[0]); fp._spk_pin.update(_sv41[1])
+    fp._spk_run.update(_sv41[2]); fp._spk_known.update(_sv41[3])
+    fp.panel_log = _pl41
+
+    check(not _leak41 and not _drop41 and _u1 and _u2 and _u3,
+          "run: an allowed emotion still travels the offer, the wire and the mood "
+          "arm, and a borrowed unique sample takes the name its own words give "
+          "while the filename still answers without one",
+          str([_leak41, _drop41, _u1, _u2, _u3]))
+except Exception as _e41x:
+    check(False, "the patch41 runs did not RUN", str(_e41x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch42
+# patch41 subtracted the measured emotions from the offer, so they left the board
+# entirely and could not be put back - the trap in section 5: never let an
+# explanation disable an input. Elation especially, which has been blocked,
+# unblocked and blocked again across this project's life, had lost its switch.
+# They are a DEFAULT now: on the board, ticked off, one click from returning.
+section("v3.75 patch42: the six are a default, not a refusal")
+
+check(fp.TTS_EMOTION_OFF == ("disgust", "elation", "longing", "sadness", "shame",
+                             "determination"),
+      "five measured and one asked for, named in one place",
+      str(fp.TTS_EMOTION_OFF))
+check(len(dict(fp.TAG_OFFER)["Emotion"]) == len(fp.TTS_TAGS["emotion"]),
+      "every emotion the engine has is on the board again",
+      "%d of %d" % (len(dict(fp.TAG_OFFER)["Emotion"]), len(fp.TTS_TAGS["emotion"])))
+check(fp.DEF_SETTINGS["ttsTagsOff"] == fp.TTS_EMOTION_OFF_WORDS
+      and fp.DEF_SETTINGS["ttsTagsFinalOff"] == fp.TTS_EMOTION_OFF_WORDS,
+      "and a fresh install ships them off on BOTH boards - the prompt and the wire")
+nin(py, "TTS_EMOTION_BLOCK = frozenset",
+    "the hard refusal is gone, switch and all")
+check("cool = frozenset(tag_pair(_w) for _w in (cool or ()))" in py,
+      "the NPC mood arm reads the board in whichever notation it arrives")
+check('cool=tags_off(st, "ttsTagsFinalOff") | _cool' in py,
+      "and is given it - the arm forms its own token, so the wire gate cannot catch it")
+
+try:
+    import time as _t42
+    _st42 = dict(fp.DEF_SETTINGS)                     # exactly a fresh install
+    _ban42 = fp.tags_off(_st42, "ttsTagsFinalOff")
+    _off42 = fp.tags_off(_st42, "ttsTagsOff")
+    _pl42 = fp.panel_log
+    fp.panel_log = lambda *a, **k: None
+
+    _prompt42 = fp.tts_tag_prompt(off=frozenset(w.upper() for w in _off42))
+    _inp42 = [e for e in fp.TTS_EMOTION_OFF
+              if ("EMOTION-%s" % e.upper()) in _prompt42]
+
+    _leak42 = []
+    for _e42 in fp.TTS_EMOTION_OFF:
+        _tok42 = "<|emotion:%s|>" % _e42
+        if _tok42 in fp.tts_apply_tags("[EMOTION-%s] A line." % _e42.upper(),
+                                       True, "audiocpp", _ban42):
+            _leak42.append("%s wire" % _e42)
+        fp.MOOD_QUEUE["GateP42"] = ([("emotion", _e42)], _t42.time())
+        _arm42 = fp.tts_npc_mood_arm("GateP42", "A line.", cool=_ban42)
+        fp.MOOD_QUEUE.pop("GateP42", None)
+        if _tok42 in _arm42:
+            _leak42.append("%s mood arm" % _e42)
+
+    # one still allowed must still get through, both ways
+    _keep42 = "<|emotion:amusement|>" in fp.tts_apply_tags(
+        "[EMOTION-AMUSEMENT] A line.", True, "audiocpp", _ban42)
+    fp.MOOD_QUEUE["GateP42"] = ([("emotion", "amusement")], _t42.time())
+    _keep42b = "<|emotion:amusement|>" in fp.tts_npc_mood_arm(
+        "GateP42", "A line.", cool=_ban42)
+    fp.MOOD_QUEUE.pop("GateP42", None)
+
+    # and one switched back ON returns - the agency patch41 removed
+    _st42b = dict(fp.DEF_SETTINGS)
+    for _k42 in ("ttsTagsOff", "ttsTagsFinalOff"):
+        _st42b[_k42] = " ".join(w for w in str(_st42b[_k42]).split()
+                                if w != "EMOTION-SADNESS")
+    _back42 = "<|emotion:sadness|>" in fp.tts_apply_tags(
+        "[EMOTION-SADNESS] A line.", True, "audiocpp",
+        fp.tags_off(_st42b, "ttsTagsFinalOff"))
+    fp.panel_log = _pl42
+
+    check(not _inp42 and not _leak42 and _keep42 and _keep42b and _back42,
+          "run: on a fresh install none of the six is named in the prompts or reaches "
+          "the engine by either route, an allowed emotion still does, and one switched "
+          "back on returns",
+          str([_inp42, _leak42, _keep42, _keep42b, _back42]))
+except Exception as _e42x:
+    check(False, "the patch42 runs did not RUN", str(_e42x)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch43
+# The default merge replaces a setting only when it is EMPTY - right for a preference,
+# wrong for a measurement. A tag board the user had ever touched kept its value and
+# kept the six broken emotions enabled, so the people most likely to be using tags
+# were the only ones the fix did not reach.
+section("v3.75 patch43: a measurement reaches a config the user had customised")
+
+check('if not st.get("emoOffV43"):' in py and '_have + _add' in py,
+      "the six are ADDED to an existing board, never replacing what is there")
+check('st["emoOffV43"] = True' in py,
+      "and only once, so switching one back on afterwards sticks")
+nin(py, "TTS_EMOTION_BLOCK",
+    "no comment still names the constant that was removed in patch42")
+
+try:
+    def _mig43(existing):
+        _st = dict(existing)
+        for _k, _v in fp.DEF_SETTINGS.items():
+            if _k not in _st or (_st[_k] == "" and _v != "" and _k != "llamacppPath"):
+                _st[_k] = _v
+        if not _st.get("emoOffV43"):
+            for _ek in ("ttsTagsOff", "ttsTagsFinalOff"):
+                _hv = str(_st.get(_ek) or "").replace(",", " ").split()
+                _ad = [w for w in fp.TTS_EMOTION_OFF_WORDS.split() if w not in _hv]
+                if _ad:
+                    _st[_ek] = " ".join(_hv + _ad)
+            _st["emoOffV43"] = True
+        return _st
+
+    def _n43(st):
+        return len([w for w in str(st["ttsTagsFinalOff"]).split()
+                    if w.startswith("EMOTION-")])
+
+    _m1 = _n43(_mig43({})) == 6                                   # fresh
+    _m2 = _n43(_mig43({"ttsTagsOff": "", "ttsTagsFinalOff": ""})) == 6
+    _cust = _mig43({"ttsTagsOff": "SFX-BURPING", "ttsTagsFinalOff": "SFX-BURPING"})
+    _m3 = _n43(_cust) == 6 and "SFX-BURPING" in _cust["ttsTagsFinalOff"]
+    # already migrated and the user switched five back on - it must STAY switched on
+    _m4 = _n43(_mig43({"ttsTagsOff": "EMOTION-DISGUST",
+                       "ttsTagsFinalOff": "EMOTION-DISGUST",
+                       "emoOffV43": True})) == 1
+    check(_m1 and _m2 and _m3 and _m4,
+          "run: absent, empty and customised boards all end with the six off, what "
+          "the user had put there survives, and a board migrated once is not "
+          "migrated again over their choice",
+          str([_m1, _m2, _m3, _m4]))
+except Exception as _e43x:
+    check(False, "the patch43 runs did not RUN", str(_e43x)[:140])
+
+# One paragraph per release in README.txt - patch39 shipped with two, and a reader
+# scanning for a version has no way to know a second one exists further down.
+try:
+    import re as _re43
+    _rd43 = rd("README.txt").decode("utf-8", "replace").replace("\r\n", "\n")
+    _hd43 = _re43.findall(r"^(v3\.\d+ (?:patch|hotfix)\d+):", _rd43, _re43.M)
+    _dup43 = sorted({h for h in _hd43 if _hd43.count(h) > 1})
+    check(not _dup43, "each release is described once in README.txt", str(_dup43))
+except Exception as _e43y:
+    check(False, "the README heading scan did not RUN", str(_e43y)[:140])
+
+
+# ----------------------------------------------------------------- v3.75 patch44
+# The tree had no .gitattributes at all, so git decided line endings from whatever
+# core.autocrlf was set to on the machine doing the checkout - and the owner's global
+# setting is `true`. A fresh clone would therefore hand back CRLF for the .md files
+# and for launch-llm-fleet.ps1, both of which this gate requires to be LF: the
+# encoding section would fail on files nobody had touched. The bytes are the contract,
+# so they are declared rather than inferred.
+section("v3.75 patch44: git is told the line endings, not left to guess")
+
+if not os.path.isfile(os.path.join(ROOT, ".gitattributes")):
+    # the release tree is not a git checkout; there is nothing here to declare
+    check(None, "line endings declared to git", "repo tree only")
+    _ga = ""
+else:
+    _ga = rd(".gitattributes").decode("utf-8", "replace")
+# Nothing below runs on the release tree, which is not a checkout. (patch44)
+if _ga:
+    check("* " in _ga and "-text" in _ga,
+          "nothing is converted unless this file says so")
+    check("launch-llm-fleet.ps1" in _ga
+          and "eol=lf" in _ga.split("launch-llm-fleet.ps1")[1][:20],
+          "the one LF+BOM exception is named, exactly as LF_PS1 names it")
+
+    # The whole point is that this file and RULES cannot drift. Every extension the gate
+    # enforces must appear here saying the same thing.
+    try:
+        import re as _re44
+        _rules44 = {}
+        for _ln in _ga.split("\n"):
+          _ln = _ln.split("#")[0].strip()
+          if not _ln or _ln.startswith("*  ") or _ln.split()[0] == "*":
+              continue
+          _pat = _ln.split()[0]
+          _m = _re44.search(r"eol=(crlf|lf)", _ln)
+          if _m:
+              _rules44[_pat] = _m.group(1)
+        _miss44, _wrong44 = [], []
+        for _ext, (_bom, _eol) in RULES.items():
+          _key = "*" + _ext
+          if _key not in _rules44:
+              _miss44.append(_ext)
+          elif _rules44[_key] != _eol:
+              _wrong44.append("%s: gate says %s, gitattributes says %s"
+                              % (_ext, _eol, _rules44[_key]))
+        for _lf in LF_PS1:
+          if _rules44.get(_lf) != "lf":
+              _wrong44.append("%s is not pinned to lf" % _lf)
+        check(not _miss44 and not _wrong44,
+            "every extension the gate enforces is pinned here, saying the same thing",
+            str(_miss44 + _wrong44))
+
+        # A rule matching nothing means the file has drifted from the tree. Only the eol
+        # rules are contracts; the `binary` lines are guards for types not here yet.
+        _all44 = []
+        for _dp, _dn, _fn in os.walk(ROOT):
+          _dn[:] = [d for d in _dn if d not in (".git", "__pycache__")]
+          _all44 += [f for f in _fn]
+        _unused44 = []
+        for _pat, _eol in _rules44.items():
+          if not any(_f == _pat or (_pat.startswith("*.")
+                                    and _f.lower().endswith(_pat[1:].lower()))
+                     for _f in _all44):
+              _unused44.append(_pat)
+        check(not _unused44,
+            "and no rule names a file type this tree does not have",
+            str(_unused44))
+    except Exception as _e44x:
+        check(False, "the gitattributes cross-check did not RUN", str(_e44x)[:140])
+
+    # and it must agree with the bytes actually in the tree, or the first clone breaks
+    try:
+        def _want44(rel):
+          _base = rel.split("/")[-1]
+          _hit = None
+          for _ln in _ga.split("\n"):
+              _ln = _ln.split("#")[0].strip()
+              if not _ln:
+                  continue
+              _p = _ln.split()[0]
+              if _p == "*":
+                  continue
+              if _p == _base or (_p.startswith("*.")
+                                 and _base.lower().endswith(_p[1:].lower())):
+                  _hit = _ln
+          if not _hit:
+              return None
+          if "binary" in _hit:
+              return "binary"
+          _m = _re44.search(r"eol=(crlf|lf)", _hit)
+          return _m.group(1).upper() if _m else None
+
+        _bad44 = []
+        for _dp, _dn, _fn in os.walk(ROOT):
+          _dn[:] = [d for d in _dn if d not in (".git", "__pycache__")]
+          for _f in sorted(_fn):
+              _rel = os.path.relpath(os.path.join(_dp, _f), ROOT).replace("\\", "/")
+              _raw = rd(_rel)
+              if _rel.lower().endswith((".ico", ".exe")):
+                  _act = "binary"
+              else:
+                  _c = _raw.count(b"\r\n")
+                  _l = _raw.count(b"\n") - _c
+                  _act = "CRLF" if _l == 0 and _c else ("LF" if _c == 0 else "MIXED")
+              _w = _want44(_rel)
+              if _w != _act:
+                  _bad44.append("%s: declared %s, on disk %s" % (_rel, _w, _act))
+        check(not _bad44,
+            "and every file in the tree already has the endings it declares",
+            str(_bad44[:3]))
+    except Exception as _e44y:
+        check(False, "the gitattributes tree scan did not RUN", str(_e44y)[:140])
+
+
+# ------------------------------------------------------------------- v3.76 Beta
+# A server card renders every setting the same way: label, the llama.cpp flag in
+# blue, control - and the blue flag opens that setting in the Sampler Guide. The
+# seven Speculative Decoding cells were drawn identically and opened nothing, on the
+# grounds that these flags had no page. Four had gained one since and three never
+# had. A control that LOOKS like a link and is not is worse than one that does not.
+section("v3.76: every speculative flag opens its own guide page")
+
+_sg = seg(JS, "const SPEC_GUIDE = {", "};")
+nin(seg(JS, "const ref9 = function(flag) {", "const cell9 = function("),
+    'style="cursor:default" title="the llama.cpp flag \'\n        + \'this control writes">[\' + esc(flag) + \']</span>\';\n    };',
+    "the reference is no longer dead for every flag")
+check('data-act="paramGuide" data-t="\' + pgSlug(g)' in JS,
+      "a speculative flag opens the guide, like every other flag on the card")
+check("if (!g) {" in seg(JS, "const ref9 = function(flag) {", "const cell9 = function("),
+      "and a flag with no page still renders plainly rather than lying about it")
+
+try:
+    import re as _re76
+
+    def _slug76(n):
+        _o = ""
+        for _c in n.lower():
+            if _c.isalnum() and _c.isascii():
+                _o += _c
+            elif _o and _o[-1] != "-":
+                _o += "-"
+        return "pg-" + _o.rstrip("-")
+
+    _i76 = JS.index("function renderParams()")
+    _pages76 = set(_re76.findall(r'\{ ?name:"([^"]+)"', JS[_i76:_i76 + 200000]))
+    _slugs76 = {_slug76(_n) for _n in _pages76}
+
+    # every flag the card can hand ref9 must resolve to a page that exists
+    _map76 = dict(_re76.findall(r'"(--[a-z-]+)":\s*"([^"]+)"', _sg))
+    _bad76 = [f for f, p in _map76.items() if _slug76(p) not in _slugs76]
+
+    # and every flag the speculative segment actually writes must be IN that map
+    _spec76 = seg(JS, "h += '<div class=\"pgrp\">Speculative Decoding'", "h += '</div>';")
+    _used76 = set(_re76.findall(r'"(--spec-draft-[a-z-]+)"', _spec76))
+    _unmapped76 = sorted(_used76 - set(_map76))
+
+    # the four pages this release adds
+    _new76 = [p for p in ("Draft n-min", "Draft split probability",
+                          "Draft backend sampling", "Draft KV cache type")
+              if p not in _pages76]
+
+    check(not _bad76 and not _unmapped76 and not _new76,
+          "run: every speculative control the card writes maps to a guide page that "
+          "exists, and none is left pointing at nothing",
+          str([_bad76, _unmapped76, _new76]))
+except Exception as _e76x:
+    check(False, "the v3.76 speculative runs did not RUN", str(_e76x)[:140])
+
+
+# The guide explained DRY and XTC and none of llama.cpp's four classic penalties, so
+# a reader reaching for a repetition control had nothing to choose between.
+section("v3.76: every repetition penalty llama.cpp has is explained")
+
+try:
+    _want76 = {"Repeat penalty": "--repeat-penalty N",
+               "Repeat last-n": "--repeat-last-n N",
+               "Presence penalty": "--presence-penalty N",
+               "Frequency penalty": "--frequency-penalty N",
+               "DRY penalty": "--dry-multiplier N",
+               "XTC (Exclude Top Choices)": None}
+    _miss76, _flag76 = [], []
+    for _nm76, _fl76 in _want76.items():
+        _m76 = _re76.search(r'\{ ?name:"%s"(.{0,140})' % _re76.escape(_nm76),
+                            JS[_i76:_i76 + 200000], _re76.S)
+        if not _m76:
+            _miss76.append(_nm76)
+        elif _fl76 and ('flag:"%s"' % _fl76) not in _m76.group(1):
+            _flag76.append("%s: %s" % (_nm76, _fl76))
+    check(not _miss76 and not _flag76,
+          "run: repeat, repeat-last-n, presence, frequency, DRY and XTC each have a "
+          "page, and each names the flag llama.cpp actually takes",
+          str([_miss76, _flag76]))
+except Exception as _e76y:
+    check(False, "the v3.76 penalty runs did not RUN", str(_e76y)[:140])
+
+# --penalize-nl was removed from llama.cpp master; a guide that offered it would be
+# teaching a flag the server rejects.
+nin(JS, "--penalize-nl", "and no page teaches a flag master has removed")
 
 
 # --------------------------------------------------- the gate leaves no trace

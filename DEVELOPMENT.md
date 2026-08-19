@@ -5,7 +5,7 @@ zip) and work can continue with no ramp-up. It says what the project is, how it 
 how a release is cut, and — most importantly — the traps that have already cost real
 debugging time. **Read §5 before editing anything.**
 
-**Current version:** v3.75 Beta (`v3.75 Beta` in the header).
+**Current version:** v3.76 Beta (`v3.76 Beta` in the header).
 
 ---
 
@@ -24,7 +24,7 @@ on Windows and drives a local **llama.cpp inference fleet**, plus an embedded
 
 Distributed **source-visible** with a **SHA-256 per release**. No code signing.
 
-**Version string.** `APP_VERSION` ("v3.75 Beta") + `APP_PATCH` (an int, 0 = none) are
+**Version string.** `APP_VERSION` ("v3.76 Beta") + `APP_PATCH` (an int, 0 = none) are
 combined into `APP_VER_UI` — the single source feeding the header, console banner, error
 log, launch log, debug report, `X-App` and the page-cache check. `APP_RELEASE_TAG` holds the
 GitHub tag this build ships under and **must match the tag actually published**, because the
@@ -538,6 +538,14 @@ both, which read as success; removing the clip resurfaced the survivor. When a
 fix is verified at the mechanism level yet the symptom persists, do not retract
 the fix - go hunting for the second cause, and poison the test with both
 (patch143).
+
+**134. A dependency's DEFAULT can change under you, and silence is the
+symptom.** llama.cpp stopped inferring a speculative type from a local draft
+file; `--model-draft` kept being accepted, the drafter kept loading, and it
+drafted nothing - the only evidence was decode speed and one trace line. When a
+tool takes a thing and does not complain, that is not proof it uses it. Check
+the flags a new build actually acts on, not the ones it still parses (v3.75
+hotfix1).
 
 **133. A control that cannot do anything must say so, not sit there.** Muse
 Glimmer ignores --reasoning entirely; leaving the switch live would have let
@@ -1215,7 +1223,153 @@ slots are pinned per provider by number; assigning them by position in `slot["pr
 would have moved every number the first time a provider was added or dragged, and each
 moved number sends a request to a cache belonging to someone else. Sort by id.
 
+**136. A record written on COMPLETION cannot answer "is this still coming?"**
+`CHUNK_TRACE` gets its entry when a chunk's synthesis returns, so "the reply is still
+arriving" was decided from returned chunks alone - and a request the panel was still
+holding open left no mark anywhere in the process. A slow chunk was therefore
+indistinguishable from no chunk: one field line spent 12.7 s inside a single request,
+the 3.5 s quiet window shut while it was in flight, and the thought spoke 3.0 s before
+that chunk was delivered. Ask what the evidence is ABSENT from, not only what it is
+present in. Corollary: a bounded retry ladder is right for a guess and wrong for a
+fact - three defers bounded a chunk that might never come, but a request known to be
+open should wait on the clock instead, and the old bound fired into the reply.
+
+**137. A cache keyed on a file that exists cannot see a file being written.**
+`tts_thought_make` was "cached by content" via `os.path.isfile`, which is true only
+AFTER the wav lands. The warm-up thread and the fire that followed it asked for the
+same id a few seconds apart, both saw no file, and both synthesised - on a single-slot
+speech engine, so the duplicate take held the slot while the reply's own next chunk
+queued behind it. That queue is what lengthened the request that closed the window in
+gotcha 136: the amplifier and the fault were the same bug seen twice. A cache whose
+key is an artefact needs a lock over the PRODUCTION of that artefact, not only over
+reading it.
+
+**138. Two subsystems that make sound must know about each other.** Thoughts play in
+the panel, dialogue plays in the game, and neither had any idea the other was
+speaking - so the next character's first line started on top of the thought before it.
+There was already a mechanism for exactly this (the BEFORE rule holds the HTTP response
+until the thought's playtime has passed); it simply had never been pointed at the turn
+boundary. Look for the lever that already exists before inventing one.
+
+**150. A checked-in contract that only one tool knows is half a contract.** The
+gate has enforced exact line endings per file type since section 6 was written, and
+the repository had no `.gitattributes` at all - so git formatted every checkout from
+whatever `core.autocrlf` was set to locally. With the common Windows default of
+`true`, a fresh clone gets CRLF for the `.md` files and for `launch-llm-fleet.ps1`,
+both of which the gate requires to be LF: the encoding section fails on files nobody
+touched. It stayed invisible because the owner works from the release zip, not a
+checkout, so the one path that breaks was the one path never taken. When a rule is
+enforced by your own tooling, ask which OTHER tool also gets a vote - and make the
+two cross-check each other rather than merely agreeing today.
+
+**149. "Only fill it if it is empty" is right for a preference and wrong for a
+measurement.** The config merge replaces a setting on upgrade only when the stored
+value is `""`. That protects a user's choices, which is what it is for - but six
+emotions had been measured to break the cloned voice, and a board with any value at
+all kept them enabled. The people it failed were precisely the ones who had used the
+feature enough to customise it. Facts and preferences upgrade differently: a fact is
+ADDED to what is there, behind a one-time flag, so nothing chosen is lost and the
+user can still overrule it afterwards.
+
+**147. Shipping something off is not the same as taking it away, and the
+difference is the switch.** patch41 subtracted six emotions from the offer, which
+removed them from the board along with the tag - no way to see them, no way to put
+one back. DEVELOPMENT.md already had the law (never let an explanation disable an
+input) and it still happened, because "block it" and "default it off" sound like the
+same instruction. They are not: one is a decision the user can revisit, the other is
+a decision made for them. Elation is the proof - blocked, unblocked, blocked, and now
+off-by-default across four reversals. The entry most likely to be wrong is the one
+that most needs its switch.
+
+**148. A stage that writes the FINISHED form bypasses every gate downstream of it.**
+The NPC mood pass emits a complete `<|emotion:x|>` token, and `tts_apply_tags` returns
+a line that already carries one untouched - deliberately, so a line's own tags are not
+double-processed. The consequence was invisible for a long time: the Allowed Tags
+board was honoured for the player, whose tags arrive as `[EMOTION-X]` brackets and go
+through the gate, and silently ignored for every NPC. When two producers feed one
+consumer, check that both are actually passing through it, not just the one you were
+looking at.
+
+**144. A knob that exists and is empty is not a safeguard, it is a note to
+self.** `TTS_EMOTION_BLOCK` was wired into three code paths and held `frozenset()`
+for its whole life, with a comment explaining that the mechanism stays "if a tag is
+ever found to be reliably destructive". A tag had been - the owner reported wrong
+voices for months - and nobody ran the fifteen-second test that would have named it.
+Twelve untested tokens, one short line each, thirteen minutes: four produce a
+different speaker and a fifth destroys the level. The cost of not measuring was
+paid one bad line at a time for far longer than the measurement took.
+
+**145. Block the input, never try to hear the output.** The same sweep put through
+zero-crossing rate and RMS puts the four wrong-speaker takes squarely inside the
+spread of the correct ones - nothing separates them acoustically. That is the THIRD
+time this project has confirmed it: the Pitch Guard (patch33) and the pitch-based
+detector before it both measured feeling rather than identity. A wrong voice is not
+detectable from the wave; it is preventable from the token.
+
+**146. Rank hypotheses by what discriminates, not by what you can measure.** The
+wrong-voiced line was the highest audio-to-reference ratio of forty-five takes -
+a real, striking, quantifiable outlier, and completely irrelevant. The A/B killed
+it in one run: the LONGEST take came back correct and a short one came back wrong.
+The measurable correlate was a coincidence riding along with the actual cause, and
+a diagnostic had already been shipped to collect more of it. Design the experiment
+that separates the candidates before building anything that assumes one of them.
+
+**141. A guard built from one table is blind to whatever that table excludes.**
+The queue rule refused a name already bound to another voicetype by inverting
+`_spk_voices` - sound, except the player branch of `speaker_for_voice_ex` returns
+before `_spk_voices` is ever written. The player was therefore the single name the
+guard could not see, and it is the name queued most often, because SkyrimNet writes
+the player's dialogue too. Ask what a lookup table cannot contain, not only what it
+does.
+
+**142. A rule that stands down for "any" competitor stands down for competitors that
+cannot compete.** The utterance run yields while a dialogue request is waiting,
+because a shared sample belongs to whoever spoke most recently. But "waiting" counted
+every queued name, including ones that demonstrably speak through a different sample
+and so could never claim this one. Refusing them one at a time was not enough: the
+run had already been silenced by their mere presence, and the line fell through to
+printing its raw voicetype. Eligibility, not existence.
+
+**143. A check can pass because a rule is unreachable rather than because it is
+right.** Two speaker sections cleared `_spk_recent` and `_spk_voices` and left
+`_spk_run` set, so the second ran inside the first's utterance run. Invisible for as
+long as the run rule could not fire there - and the moment patch40 let it, the check
+failed and looked like a regression in the panel. Reset every store a section
+touches, or the gate is testing the leftovers.
+
+**140. A pattern that caps a name is a silent data loss, not a validation.**
+`SPEAKER_RX` bounded a character's name at 29 characters. A longer one did not
+truncate and did not warn - it failed to match, `note_speaker` returned `""`, and four
+stores guarded by `if who:` were skipped: the mood queue, `REPLY_FULL`, `REPLY_RING`
+and `THOUGHT_FRESH`. One character lost her emotion tags, her thought audio, her
+last-chunk matching and her name in the ledger, and the only visible trace was a
+dashboard row reading `thought:` with no name in front of it. Bound a capture by what
+it must not cross - here a comma, a full stop or a newline, which the character class
+already did - not by a length guessed from the names that happened to be in front of
+you. Corollary: when several regexes share a magic number, they share the bug; there
+were five.
+
+**139. A build that behaves is not the same as a build that is correct.** patch11 was
+reported good and patch38 bad, with byte-identical thought code - `tts_thought_fire`,
+`tts_thought_after_chunk` and `tts_chunk_trace` all diffed clean. The difference was
+the TTS calibration store: warm (lead 1.02 s, headroom 1.46, 86 scored lines) meant no
+chunk ever took 3.5 s and the latent fault never fired; near-cold (lead 0.32 s,
+headroom 1.28, 17 scored lines) produced 6 runaway retries in 16 chunks and it fired
+twice in one minute. Diff the code before believing a regression, and check the STATE
+the two runs started from.
 ---
+
+**135. An architecture string says what family a file belongs to - the tensors say
+what it can DO.** llama.cpp types an MTP drafter by one tensor,
+`blk.{block_count-1}.nextn.eh_proj.weight` (`common_speculative_types_from_gguf`),
+because qwen35-generation heads declare the family architecture, not a drafter one.
+The architecture-only rule sent `--spec-type draft-simple` beside a one-layer head
+file and llama-server tried to load it as a 65-layer model, dying between `local
+path` and the fit step with nothing in the console. Corollary: a tensor scan capped
+at the first N names walks straight past the tensor that matters - it sits at the
+END of the list. The same tensor inside a full model means the model drafts for
+ITSELF (`--spec-type draft-mtp`, no draft file), which the card now states.
+
 
 ## 6. Encoding (enforced by the gate)
 
@@ -1362,7 +1516,7 @@ present rather than that it worked.
 ## 12. Starting the next chat
 
 > This is **PandorumLLM** — a single-file stdlib-Python browser control panel + embedded
-> thinking-proxy for my SkyrimNet local llama.cpp fleet. Current version is **v3.75 Beta**.
+> thinking-proxy for my SkyrimNet local llama.cpp fleet. Current version is **v3.76 Beta**.
 > I'm attaching `DEVELOPMENT.md` and the current `fleet-panel.py`. Read the Gotchas section
 > first. I want to: **<your change>**.
 
@@ -2019,8 +2173,704 @@ safetensors *and* a q8 gguf reports `weights=1` pointing at the gguf, with no wa
 folders are marked `shadowed`, disabled in the dropdown, and refused at start. `--weight` is
 a disambiguator *within* one resolved model, not a way to choose between models.
 
+**A display cap must never feed the data path.** The thought row was trimmed to 400
+characters for the terminal, and the same trimmed string went on to the thought-audio
+pass - so the voice read "...the heat buil" and stopped mid-word. The trim looked like
+formatting; it was data loss. Anything cut for display is cut at the last moment, on a
+copy, and never stored back.
+
+**An edit script is source code and earns the same escape-depth respect as the page.**
+Two new flavors in one patch. A backslash at the end of a line *inside a triple-quoted
+edit literal* is a line continuation inside the string: the two source lines splice into
+one, the panel still parses, and every later anchor quoting them as two lines counts
+zero. And a repair that replaced "from this rep to the print" swallowed the write-back
+sitting between them - the reps ran in memory, the script printed success, the file
+never changed. Anchors bound exactly what they mean to replace, and a repaired script
+is re-read before it is re-run.
+
+**A heuristic is only as safe as its test's ability to FAIL.** patch123 named the
+player from a standalone think request, guarded by an agreement test: the speaker and
+the think-as name must match. The test passed for the player - and when SkyrimNet began
+sending NPC think tasks in the identical shape, it passed for those too, because it was
+never able to fail for them. A safety test that cannot fail for the counterexample
+class is a tautology. When upstream owns the input shape, prefer refusals over
+inference: "a name already bound to a voicetype is never the player" cannot be walked
+into by a prompt change (patch4).
+
+**No config I/O on a per-line path - and the gate's no-trace check is the tripwire.**
+The typed player name was first read with `load_config_cached()` inside the naming
+lookup: one parse per spoken line, and on a tree with no config it CREATED one, which
+the "gate leaves the tree as it found it" sweep caught. Same family as gotcha 37. A
+per-line lookup reads a slot; the slot is refreshed where a cfg is already in hand -
+the speak path and the settings save.
+
+**An anomaly detector must know the system's designed motions.** A first cut alarmed
+"voice X was A and is now B" - but a shared voicetype changing hands is patch116's
+design working, and that alarm would have cried wolf on every commoner in the game. It
+also wrote through TTSW.log from inside the naming lock's caller, which is how the gate
+found it: the alarm path loaded a config the run never granted. The contradiction worth
+shouting about is one NAME on two samples, and only that one ships.
+
+**Timing is a guess; content is a fact.** Every naming failure in the field came from a
+timing rule - a pairing window, a pin lifetime, a sticky cache - because timing encodes
+"probably" and the queue does not care. The reply's own words are per-turn unique above
+a couple of dozen characters, the proxy served them itself, and a chunk that arrives
+ninety seconds late still matches the right reply. When a correlation can be made by
+content, every timing rule behind it is demoted to tie-breaking.
+
+**A fixture must be shaped like the field.** Two patch5 gate runs failed on their first
+pass because the invented names - "GateYsolda5", a speaker called "A" - never matched
+SPEAKER_RX, so the machinery under test was never reached and the run measured the
+fixture, not the panel. A replay's inputs go through the same parsers the field's do;
+if the parser would refuse them in production, the fixture is wrong, not the parser.
+
+**Enforcement fails closed; detection only watches.** patch4 built the instrument - the
+missing-sample alarm - and the line still went out on a dead path, leaving the engine
+to improvise in whoever it conditioned on last, behind a perfect-looking log. An alarm
+beside a fault that proceeds anyway documents the damage; the gate that refuses or
+recovers PREVENTS it. Detection first is right for an unproven fault; once the fault
+class is real, the alarm graduates to a gate.
+
+**A corroborator is judged by its own ledger before it is trusted more.** The Meta
+selector's pick was wired as a tie-breaker only, and one session's ledger showed it
+lagging a full turn on every populated line - Mirabelle when Tolfdir spoke, Tolfdir
+when Onmund spoke. It never fired, because ties never happened; had it been made
+authoritative, that session carries three wrong names. The rank a signal deserves is
+read off its recorded disagreements, not its description.
+
+**Instruments exist to be surprised by.** The leading theory for the wrong-voice fault
+was session carryover, and the whole detection stack was built around proving it. The
+first field capture then showed a FIRST-of-session take - correct bytes on record, no
+previous request in existence - coming back in the wrong voice: carryover cannot
+explain a cold start, so the theory fell to its own instrument. The evidence was only
+decisive because the input side was already hash-proven; had the reference not been
+fingerprinted, "SkyrimNet sent the wrong sample" would have been unfalsifiable.
+
+**Mirrored state is maintained where the state changes, not where it is convenient.**
+The engine-conditioning record was first written only by the dialogue path, because
+that is where the warm-up lived - but a voiced thought conditions the engine's one
+session exactly the same way, so the record went stale on every thought and the change
+detector missed real changes. State that mirrors another process is updated at every
+site that changes the real thing, through one function, or it is fiction with a delay.
+
+**A comment describing a fix is worse than no fix.** The TTS start's exit-detection
+carried a comment saying a refused session option "is read back, remembered and the
+start retried without it - once" - and the code below it returned an error. The retry
+had never existed. Nobody rechecks a mechanism the source says is already there, so
+the gap survived until 0.6 made it load-bearing; patch8 wrote the retry the comment
+had been describing, and the gate now pins the CALL, not the prose.
+
+**Anchors match file bytes, not source bytes.** A JS string inside the panel's Python
+carries \\u2026 on disk - two backslashes - because the Python layer eats one. An edit
+anchored on the SOURCE spelling (one backslash) counts zero and aborts. Same law as
+gotcha 137, recurring: before anchoring into embedded-language regions, print the
+line's repr and copy THAT. The count-assert turned the mistake into a no-op instead
+of a corruption, which is the pattern working as designed.
+
+**A new parameter named like an existing local is silently the wrong thing.** The
+drafter-params argument was added as `p` to a function whose body already used `p` for
+the path; the assignment shadowed the argument on line one and every read below it saw
+a string where a dict was meant. The syntax was valid, the parse clean - only running
+the flow showed it. Smoke-test the flow, not just the parse, and name new arguments
+past the function's own vocabulary.
+
+**When escaping depth compounds, stop escaping and compose.** Repairing a gate section
+whose pins quote code that itself quotes JSON put four quoting layers in one string;
+two surgery attempts miscounted backslashes, and the second corrupted the working gate.
+The recovery that held: rebuild from the pristine tree and write the section wholesale
+with the hard literals composed from chr() - a file that never contains the ambiguity
+cannot miscount it. Same family as gotcha 137, one turn deeper.
+
+**A segment rendered after a loop cannot use the loop's locals.** The card's new
+section referenced `tight`, a per-iteration const of the parameter loop above it;
+outside the loop it is a ReferenceError and the whole card stops rendering. What a
+block can see is decided by where it RUNS, not by what it sits near in the file.
+
+**A second model's inference does not belong in front of a line.** The transcript
+fetch was written straight onto the speak path, one line below the timer opening -
+so a first line for a new voice both waited on an ASR round trip and reported that
+wait as synthesis. It was the timing-wall gotcha again, in a feature added long after
+the rule was written. The fix was not only moving the call above the wall: work that
+has to happen once per voice belongs BEHIND the line, in a background worker, with
+the live path reading only what is already known.
+
+**A shape that a person is expected to edit must say what its rows are.** The
+transcript store was keyed by content hash with a bare string beside it - unreadable,
+so unfixable, so in practice write-only. Writing the voicetype beside the text costs
+nothing and turns the file into the thing that actually solves the hard case: proper
+nouns no recogniser will ever get right. Any store meant to be corrected needs a
+human-legible key beside its machine one.
+
+**Strip what the tool adds, whatever the tool was told.** SenseVoice reports language,
+emotion and events as inline markers, and the option that suppresses them is a
+request field the panel might not always control. Since a marker inside a reference
+transcript asserts the sample SAYS it, the strip is unconditional in the panel - the
+setting only decides whether the engine bothers emitting them.
+
+**Repair the input once, or handle the fault forever.** The broken voice clips were
+worked around at every point that touched them - a runtime repair here, a refusal
+there, a note in the log somewhere else - because each site only saw its own symptom.
+Reading them once into a corrected copy and using that copy retires the whole class:
+the engine reads it, a recogniser could read it, the hash is stable across sessions,
+and no downstream code needs to know the fault ever existed. A fault that survives in
+the data will be met again by every consumer of that data.
+
+**Text and its own halo in one colour is a blur, not a glow.** The provider title set
+color and text-shadow to the same variable, so the glyph had no edge against its own
+light and the enclosed shapes filled in. Every glow on the page that reads correctly
+keeps a light glyph against a coloured halo. A glow needs two values, and the one that
+carries the identity belongs to the halo.
+
+**A flag whose expression cannot be false is not a flag.** The adoption verdict was
+first written as an or-chain ending in `or True` - always set, so every line for an
+adopted voice would have reported news. Whether something is NEW is a question about
+the state before the call, and it has to be asked before the call, not reconstructed
+from its return value afterwards.
+
+**A section that imitates a component drifts from it; a section that IS the component
+cannot.** The Speculative Decoding block was first built as a bold full-width row with
+hand-set spacing - close enough to pass a glance, and different in weight, case,
+margins and divider from every real group heading two patches later. Rebuilding it ON
+the .pgrp component made every future heading change apply to it for free. If a thing
+should look like the others, make it out of the others.
+
+**A variable margin cannot be centred against.** The divider sat off-centre because
+the gap above it was whichever bottom margin the previous row happened to carry -
+tight rows 4px, plain 15, stacked 30 - while the gap below was a constant. No single
+margin on the heading fixes that; the cell BEFORE a heading has to surrender its
+margin (`:has(+ .pgrp)`) so the heading owns the entire gap and can split it evenly.
+
+**A dead control dressed as a live one is a small lie.** The new flag references reuse
+the blue .pref style whose cursor promises a click that opens the Sampler Guide - but
+these flags have no guide page. Keeping the look and the pointer cursor would have
+taught the eye a click that does nothing; cursor:default keeps the vocabulary and
+drops the false promise.
+
+**An expectation that collapses with a setting condemns everything it measures.** The
+first runaway detector based its expected duration on the auto-cal estimator, whose
+estimate is 0.0 with calibration off - so the expectation fell to its floor and every
+long take became a runaway, a retry storm shipped as a safety feature. The unit run
+printed the symptom (`exp 0.8s` for a 65-character line) and passing tests hid it,
+because no test asked the one question that mattered: is a LEGITIMATE long take left
+alone? Derive an expectation from the artifact itself - here, the text - never from a
+knob that can be off.
+
+**Validate a detector by replaying every real take you have.** The threshold and the
+short-side ratio were not argued into place: all 78 takes from the tag sweep were
+replayed through the final detector, plus the field cases - the true runaway flagged,
+the sigh-with-words-dropped flagged, one borderline short logged, zero false runaways.
+A detector tuned on fixtures alone is an opinion; one replayed over the corpus is a
+measurement.
+
+**Escape depth compounds in every carrier, heredocs included.** A quoted heredoc
+passes backslashes through literally, so the gate's WAV fixture wrote the TEXT
+backslash-x-zero-zero instead of two zero bytes - four times the frames, every
+duration wrong, every verdict inverted. Same law as gotchas 137 and the patch9
+composition rule, third venue: when bytes matter, compose them (`bytes(2)`), never
+spell them through a quoting layer.
+
+**A default is every place that falls back, not just the settings table.** Turning
+the transcript mode On required three `or "off"` fallbacks to become `or "on"` as
+well as the DEF entry - a config object that never mentions the key reaches the
+function fallbacks, and one left behind would have made "default on" true in the
+table and false in behaviour. The gate now counts the fallbacks.
+
+**The only file in the folder will be picked.** The recogniser field lists every
+gguf in the models folder, and on a fresh install that list is exactly one entry:
+the 4B TTS model - which the user duly picked, co-hosting it as an ASR family the
+server must refuse. A picker whose wrong choice is the LIKELIEST choice needs the
+mistake named inline, in red, at the moment it is made.
+
+**Do not perform surgery on the surgeon.** A quote-collision broke the edit script,
+and patching the edit script with a second script compounded the ambiguity until
+the fix was less legible than the fault. The recovery that held, again: throw the
+patcher away and rewrite it clean, with line-splices where giant string anchors
+would carry quoting risk. Editing tools are cattle, not pets.
+
+**Train and predict must share one function, or they will drift.** The first fit
+trained on raw character counts while predicting from spoken ones, so nineteen
+characters of `<|emotion:sadness|>` were priced as if the speaker read them aloud.
+The second fit fixed that and still failed, because the predictor added an allowance
+for a performed sigh that the residual never subtracted. Both were invisible in the
+code and obvious the moment real takes were fed in - the spread refused to shrink.
+The fix was structural rather than careful: one `tts_voice_extra()` used by the
+predictor AND written into the record, so the two arithmetics are the same arithmetic.
+
+**A learned model must be told what not to learn from.** One 27.5-second runaway in a
+78-take corpus is enough to lift a fitted intercept until every later cap is inflated -
+the failure teaching the system to expect failure. Rows whose residual is far past what
+the fit already expects are dropped before fitting, and the exclusion is a gate check,
+because it is the kind of thing that would silently stop working.
+
+**Guessed constants are wrong in BOTH directions at once.** A flat floor plus a fixed
+per-character rate was 17% over the observed maximum on a 13-character line and 88%
+over on a 43-character one. It read as "conservative", and it was - conservatively
+losing short lines to cap-hits while conservatively letting runaways burn twice as
+long as needed. An average is not a safety margin; the spread has to be measured.
+
+**A charset cannot tell an order from a moan.** The first non-lexical rule was a
+set of breathy letters, and "Run. Now." is spelled entirely inside it - a two-word
+command classified as a vocalisation. Shape had to join the letters: a performance
+word is breathy letters WITH a stretch (a doubled letter), which keeps "Ahh" and
+"Mmm" out of judgement and keeps orders in. The unit fixture that caught it stays.
+
+**At exactly half, the majority test acquits the guilty.** `hit >= len/2` let a
+two-word line whose transcript held only the sigh pass as spoken - one word of two
+is half, and half was enough. The conviction this feature exists for was the case
+the threshold could not reach. Strict majority (`hit*2 > len`) convicts it, and the
+one-word guard still refuses to convict on a single word.
+
+**An ellipsis was priced twice.** The dots stayed in the character count AND earned
+a pause allowance, so every trailing "..." was quietly double-charged. One
+decomposition function - spoken characters with dot-runs removed, counts for what
+is performed - now feeds pricing, fitting, recording and exemption alike; the
+previous two fixes of this family (raw-vs-spoken length, unsubtracted allowances)
+were the same disease in different organs.
+
+**Co-occurrence is not causation, and a device line settles it.** Two TTS failures sat
+within twenty seconds of two LLM OOMs, so they were reported as VRAM contention between
+the fleet and the speech server. The first line of the TTS server log says
+`found 1 CUDA devices` - the pinning was working and the two workloads could not see
+each other. The same session then produced a second wrong cause (a duplicated model in
+the ASR slot) that a single screenshot disproved. Both guesses were reachable only
+because the logs could not answer the question directly. The lesson is not "guess
+better", it is that a diagnosis attempted on absent evidence should be a request for
+evidence instead.
+
+**A residual bucket will fill up with the thing you most needed to see.** "panel" was
+everything in prep that was not the tag injector or the mood pass, and it quietly
+contained inline thought synthesis - 2.6 seconds on one line, 10 milliseconds on the
+next, reported identically. Any timing report with an unlabelled remainder is a report
+that will eventually mislead. Name the steps; let the remainder be the small one.
+
+**We were not filtering the server's output - it simply had nothing to say.** The
+instinct on finding an uninformative log is to look for what is discarding lines. Here
+stdout and stderr went straight to the file and audio.cpp is just quiet by default,
+with `--log` documented one line deep in the README. Check what the tool CAN say before
+auditing your own handling of what it did say.
+
+**Fix the ruler before you change what it measures.** Six patches of TTS work were
+judged against a `server:` figure that summed every failed attempt into one synthesis.
+On the session that prompted the complaint, 38% of all reported server time was takes
+that were thrown away, and the line that read 43 tps had actually run at 75. Every
+conclusion drawn from that number - including "TTS got slower" - was drawn from a
+measurement of the ladder rather than of the engine. When a metric and a memory
+disagree by 2-3x, suspect the metric first.
+
+**An intercept extrapolated from a narrow window is not a measurement.** A fixed
+per-request cost of 499ms was derived by fitting six points spanning 77-99 tokens and
+extending the line back to zero. The slope was reasonably constrained; the intercept was
+barely constrained at all, and it was then attributed to reference encoding on no
+evidence beyond plausibility. Reported as a fact, it nearly cost a voice-quality setting
+change. State the window a fit came from, and do not extrapolate a per-unit model past
+the range that produced it.
+
+**Do not perform surgery on the surgeon - the gate is no exception.** An interrupted
+build left three copies of the same new gate section in the working file. Unpicking them
+by hand would have meant editing a file whose state was already unknown; recopying the
+gate from the clean staged tree and inserting once took one command and left nothing to
+verify. The same rule that applies to a broken edit script applies to a broken edit.
+
+**A stateful engine needs a lock, and this one advertised its state in its own docs.**
+audio.cpp says the Higgs integration "keeps the reference prompt state in the model
+session". The panel sent concurrent requests to it for months. The wrong-voice reports
+chased pitch, emotion tags, sample cross-wiring and identity resolution for two days
+across several patches - and the identity ledger was right every time, because the panel
+always sent the correct file. Nobody asked whether two correct files could be in the
+engine at once. When a component documents that it holds state, serialise it before
+investigating anything downstream of it.
+
+**A retry that escalates must know what it is escalating.** The cap ladder was written
+for a model that failed to stop, where a bigger budget genuinely helps. Applied to an
+allocation refusal it asked the card for a larger buffer than the one just declined,
+three times, each worse than the last. A retry policy belongs to a failure MODE, not to
+the act of failing.
+
+**An error message that names a cause is a claim, and it can be wrong for years.**
+"not enough VRAM - try a shorter reference voice, a smaller model, or another card"
+fired on a card with 19 GB free. It sent the owner hunting for memory that was already
+there, and it sent this session's diagnosis down two dead ends before the probe added in
+patch17 printed the actual figures beside it. Prefer messages that report what was
+measured over messages that explain what it means.
+
+**A clamp that always binds is not a clamp, it is the value.** `AUTOCAL_HEAD_MAX = 1.60`
+read as a safety rail; in practice the fit asked for more than 1.60 in every session on
+record, so the learned margin was decorative. The tell was in the log the whole time -
+the same "headroom 1.60" line beside a p95 that kept moving. A learned parameter that
+never changes is not converged, it is pinned, and a bound that is never slack should be
+audited as a hard-coded value.
+
+**A censored observation entered at the current headroom closes the loop on itself.**
+A line hitting an estimate-decided cap enters the fit at cap/est, which by construction
+IS the headroom in force. Under a binding clamp that means every failure votes for
+exactly the value that caused it - 452 of 1124 scored lines at precisely 1.60 - and the
+statistic that would justify raising the margin is computed from data the margin
+truncated. Feedback that manufactures its own evidence cannot be diagnosed from inside
+the loop; it needs the bound removed and the record cleared.
+
+**Escape depth, fourth venue: JS inside a Python string.** A dialogue body written with
+backslash-n produced real newlines and an unterminated JS literal, because the page
+script is a Python string literal and the escape is consumed one layer down. The gate's
+node --check caught it. Same law as the heredoc and the chr() composition rules:
+compose the character (`String.fromCharCode(10)`), never spell it through a quoting
+layer.
+
+**The mitigation was the cause.** Every countermeasure built for the repeated-token
+failure - runaway detection, the token model, take verification, the cap ladder - treated
+it as something the engine did TO us. It was something the panel asked for: the retry
+stepped the samplers colder on each attempt, and the third attempt at temperature 0.32
+with min_p 0.08 is near-greedy decoding, which is the textbook way to make an
+autoregressive model repeat itself forever. The measurement that should have ended this
+days earlier was already in hand: a bit-identical 40 ms loop means the distribution has
+collapsed to one token, and a collapsed distribution has a cause. Reading "the sampler
+did this" off that observation needed no new instrumentation, only the question "what
+narrows a distribution?" - which points straight at the code that narrows it on purpose.
+
+**Check the reference implementation's defaults before tuning around them.** Boson's own
+example is temperature 0.8, top_k 50, nothing else. The panel was sending top_p, min_p
+and repetition_penalty - none of which appear in the reference setup, one of which
+(repetition_penalty) audio.cpp documents as accepted-but-unconsumed for this family. Four
+of the five sampler controls existed to solve a problem the fifth was creating.
+
+**A default that only applies to fresh installs is not a default.** The reference
+samplers are written by the installer over whatever the fields already hold, because the
+users who most need them are the ones who have been tuning to escape the fault. A
+reinstall exists to undo a tuning session, so it has to overwrite.
+
+**A prompt that presupposes output gets output.** "Return it word for word with tags
+added" reads as an instruction to add tags, whatever an "optional" clause says two lines
+later - and a model given a flat sentence invented a singing style to satisfy it. The
+family of this gotcha is already on record ("fewer is better" gets fewer); its general
+form is that the FRAME outweighs the qualifier. State the null action as the default,
+and let the examples show it by majority.
+
+**Fail-open still costs the timeout.** The tagger failed open correctly when its server
+was down - and paid two seconds per player line to do it, attributed to nothing. A
+fallback that is reached by timing out is a stall wearing a safety label. Check
+liveness with the probe that already exists before paying for the call, and say once
+what is being skipped, or the feature silently becomes the cost.
+
+**Three hard-coded copies of one key set, and the newest member reached only two of
+them.** top_k was added to TTS_SAMP_KEYS in patch21 and did not appear on the page,
+because the chip renderer carried its own ["temp","top_p","min_p","rep"] and the sampler
+board carried a third copy in _samp_key. The gate check pinned the map, which passed. A
+constant that enumerates a set must be the ONLY enumeration of it: the page is now handed
+the keys (sampKeys) and the board iterates TTS_SAMP_KEYS. When adding to a set, grep for
+its members as literals, not for the constant's name.
+
+**Removing a feature means removing what asserted it.** Deleting autocal_sampler_arith
+broke eight gate sites, two of them seg() boundaries that merely NAMED the function.
+Boundaries chosen as "the next def" silently couple unrelated checks to a function's
+existence; the retells that followed were mechanical, but they were only findable because
+the gate crashed loudly rather than skipping.
+
+**A hover effect should light text, not soften it.** .plpay:hover stacked a 7px
+text-shadow, a 16px text-shadow and a drop-shadow FILTER. The filter operates on the
+already-composited glyphs, so it blurs pixels the shadows blurred - the result reads as
+out of focus rather than lit. One shadow, tight radius. Filters and text-shadows do not
+add, they compound.
+
+**A display that enumerates its own categories cannot show a new one.** The meter bar
+listed seven band names in meterSegs. The spend ledger had been measuring five more since
+patch17, and every one of them was drawn as nothing - not wrong, not zero, simply absent,
+with `panel` silently absorbing the time. This is the third instance this week of the
+same shape (the sampler chips, the sampler board, this bar): a set enumerated in two
+places diverges the moment one grows. The rule that came out of it: a view renders the
+KEYS OF THE DATA, and only the ordering is written by hand.
+
+**Instrumentation has to be attached where the work happens, not where it is convenient.**
+SenseVoice was wrapped in a `transcript` step that also covered a dictionary read, and
+its learner path ran on a background thread that no per-line ledger watched. Timing the
+one function every caller goes through - and doing it in a `finally` - put it on the
+board from all three call sites at once.
+
+**A clamp in someone else's log is a bug in our output.** llama.cpp printed
+"requested draft size exceeds the trained block size 16 -- clamping to 15" on every
+launch, and it was read for a year as an engine quirk. It was the panel sending
+block_size as the depth. The rule is in llama.cpp's source in one line - a DFlash block
+is [id_last, mask x (block_size-1)], so slot zero is not draftable - and reading it took
+minutes. When a tool corrects our input every single time, the tool is not being
+awkward; the input is wrong.
+
+**The same limit has two answers, so a constant would have been wrong.** DSpark drafters
+sampling from an anchor fill the whole block; plain DFlash cannot. Hard-coding
+block_size-1 would have quietly under-drafted every DSpark model. The ceiling had to be
+derived from the drafter's own metadata and its tensor scan, which is also why it is
+computed and not typed in.
+
+**An abort leaves the file untouched, which is the point - and the trap.** The first p25
+edit aborted on a bad anchor, taking a metadata-key addition with it. The ceiling
+function was re-added under a working anchor; the key was not, so the function read a
+key that gguf_meta never captured. Nothing failed - the default simply always applied.
+After an aborted multi-edit, re-verify EVERY change it carried, not the one being
+retried.
+
+**A parser that expects a sentence nobody writes is a contract with one signatory.**
+slot_vram_report has always keyed "exited" off the exact string "Server process exited
+before it became ready". llama.cpp never emits it; the shipped launcher template never
+emitted it either. The flag could therefore only ever be false for generated launchers,
+and no test noticed because the check merely read a dict key that was correctly present
+and correctly False. When a reader depends on a producer, gate BOTH ends together - the
+producing template and the consuming parser - or the pair drifts silently.
+
+**A retry loop with no exit check destroys its own evidence.** The template ended with
+`& "<SELF_PATH>"`, an unconditional self-invocation. A server failing at load restarted
+forever, and every restart replaced the console holding the error. The symptom reported
+downstream was "sometimes it does not launch" - which is what an unreadable, repeating
+failure looks like from outside. A supervisor that cannot tell success from failure is
+not a supervisor.
+
+**Untestable code earns extra scepticism, not extra confidence.** There is no PowerShell
+in this build environment, so the launcher body cannot be executed here. That is a reason
+to keep the file MINIMAL and to push logic into the panel where it can be run - not a
+reason to port hundreds of lines of someone else's parser into it on faith.
+
+**Read the upstream option table before writing an option set.** The first draft of the
+Load mode values was guessed - mmap/read/mlock/dio - and llama.cpp actually accepts
+auto/none/mmap/mlock/mmap+mlock/dio. A select offering a value the parser rejects is a
+setting that fails only on the user's machine, at launch, with a message they did not
+ask for. The values, their order and the default all came out of arg.cpp in the end, and
+took one fetch.
+
+**Renaming a reference target silently orphans everything pointing at it.** The guide
+page "Threads / mmap / fit" was renamed once mmap moved out of it, and two card settings
+still named the old title - their [--flag] chips would have opened nothing, with no
+error anywhere. The gate now walks every card setting's guide reference and fails if the
+page does not exist, which is a check that should have existed from the day the
+cross-reference feature shipped.
+
+**Deprecated upstream is not automatically wrong here.** --chat-template-kwargs is
+deprecated in llama.cpp and is deliberately still written, because some models honour
+only the template kwarg; the panel writes it AND --reasoning for that reason, and the
+code says so at the constant. An audit that removes every deprecated flag on sight would
+have broken those models. Check why a thing is there before removing it for being old.
+
+**A guard that skips work must leave a debt, not a hole.** stateRepull declined to
+repaint while focus sat inside the TTS pane - reasonable, typing must not be clobbered -
+but the decline was FINAL: the fresh state was fetched and then never shown, because the
+drawn-signature matched itself forever after. Focus sits on the Install button the user
+just pressed, so the one moment the page most needed to repaint was the one moment the
+guard always fired. The fix is one line: a deferred repaint clears the drawn signature,
+so whoever renders next renders fresh. (gotcha: defer means OWED.)
+
+**One confirm gate for two verbs, and the harmless verb paid for the harmful one.** The
+install endpoint required confirm for everything, then branched on action. Dismiss - hide
+a banner - bounced with "not confirmed" on every click, and the client, which never read
+the reply, repainted the same banner. Check destructive-ness per action, and answer the
+harmless ones first.
+
+**"Default" also means what an install writes.** DEF_SETTINGS said 10 seconds; the
+installer wrote 4 over it (patch18); the owner read the page and saw 4 and called it the
+default, correctly. Every writer of a value is part of its default, and they must agree
+- the gate now pins both writers to 10.
+
+**A remainder band hides whatever is not measured, and the owner will find it before
+the bar does.** "panel" is defined as prep minus everything ledgered, so the warm-up -
+which wrapped only its HTTP call in a spend_step while the surrounding work fell through
+- showed up as several hundred unexplained milliseconds. The answer came from the timing
+CSV in three lines of arithmetic: split every line by whether the speaker changed, and
+the medians were 33 ms against 749 ms. Group the measurement by the thing you suspect;
+do not stare at totals.
+
+**A fix outlives the fault it was built for.** The warm-up existed to absorb session
+carryover between voices. The sampler root cause removed the carryover, and the warm-up
+kept charging for it - a fix nobody re-examined because it was off by default in the
+shipped config and quietly on in the owner's.
+
+**Slicing to "the next def" is the rule I already had, and I broke it.** Deleting
+tts_warmup_needed by cutting from its header to the following def swallowed _WIRE_SEEN,
+a module constant that happened to sit between them. Nothing failed at import; the gate's
+orphan scan caught it. Delete a function by its own span, then diff the symbol list.
+
+**Fix the class the element actually uses.** patch28 cleared filter:blur from .uuid; the
+address inputs are .hb. The change passed its gate because the gate pinned the rule I
+edited, not the rendered field. When a fix is about something VISIBLE, pin the element
+that renders, not the stylesheet line.
+
+**"Bare switch" is only safe when the engine-side default is off.** --fit was grouped
+with --no-cont-batching as a flag that is present or absent. --no-cont-batching defaults
+off upstream, so absent means off and the shorthand holds; --fit defaults ON, so absent
+means ON and the card lied. This is the third instance of the same law in this project
+(enable_thinking, cfg-or-load_config, now --fit): ABSENT IS NOT OFF. Before treating a
+dial as present-or-absent, read the upstream default.
+
+**One folder for two audiences is a bug waiting for a fleet.** Server cards and the
+Launcher Creator shared templates\, so a file whose first line reads "TEMPLATE_NAME:
+Single GPU (no GPU pinning) - for 1 PC / 1 GPU" was listed for a three-card server. It
+even documented its own unsuitability, in the dropdown, and was still selectable. The
+folder is the contract: server-templates\ files pin a card, templates\ files may do
+anything. Separate the folders, not the naming.
+
+**Two independent faults produced one symptom, and either alone would have been
+survivable.** No pin meant every GPU was visible; fit-on meant llama.cpp used them all.
+With the pin but no fit fix, one card would have been used and over-committed; with the
+fit fix but no pin, layers would have stayed put on whichever card llama.cpp chose
+first. The owner reported one behaviour, and it took both fixes. When a symptom has a
+clean single-cause story, check whether it needs two.
+
+**A placeholder is a contract with a specific substituting function - check its list.**
+patch30 shipped a template pinning with <GPU_UUID>. render_launcher_lines implements
+<GPU_ID>, <MODEL_PATH>, <MMPROJ_PATH>, <DRAFT_PATH>, <TITLE>, <SELF_PATH>, <SELF_NAME>,
+<PORT> and <LLAMA_EXE> - and nothing else. An unknown placeholder does not error; it
+survives into the output as literal text, which CUDA then ignores, which looks exactly
+like no pin at all. The gate had checked that the TEMPLATE contained a pin line, which
+it did. Pin the RENDERED result, not the source.
+
+**And the template was never rendered anyway.** Server cards do not call
+render_launcher_lines - that is the Launcher Creator's path. A card stores template text
+as `custom` and write_slot_launcher writes it verbatim, with ps1_set_flag editing only
+entries inside $llamaArgs. Anything outside the array - an env line, a Write-Host - is
+untouchable by that mechanism. A value that MUST be right cannot live where only an
+optional editor can reach it: ps1_force_gpu_pin now rewrites the bytes on the way to
+disk.
+
+**Two fixes for one symptom, and the first one worked.** patch30's --fit fix did land -
+"fitting params to device memory" is absent from all three of the owner's new logs - but
+the models still spread, because the pin fix did not. A partially-fixed symptom looks
+identical to an unfixed one from outside, so say which half is proven: the fit half was
+provable from the log the owner already had.
+
+**A warning nobody reads is not a fix, and the log proved the code right and the ship
+wrong.** patch31's enforcement worked exactly as written: ten lines of "server N has no
+GPU chosen - its launcher pins nothing". Every one was correct, none helped. When the
+correct behaviour on missing input is known and safe - assign the least-loaded card -
+DO it and log the decision; reserve warnings for cases with no safe default. The fleet
+still spread for one more patch because the code chose to be right instead of useful.
+
+**Store the value in the shape its consumer matches.** The model dropdown compares
+option.path === settings value, full path against full path. The installer began storing
+basename - correct-looking, wrong shape - and the symptom was "(none selected)" beside a
+successfully installed model. The adopt route stored the full path all along, which is
+why only fresh installs showed it.
+
+**A button holds focus until something takes it away.** The patch28 fix deferred a
+focus-blocked repaint until "the next render" - which never came, because clicking
+Install focuses a button and buttons do not blur themselves. Deferral needs a due date;
+the due date yields to INPUT/TEXTAREA/SELECT so typing is never clobbered.
+
+**The owner's conjecture was right and was dismissed twice. Investigate it instead.**
+He said --load-mode was causing models to spread; the reply was that load-mode cannot
+change which devices are VISIBLE. True, and irrelevant - he was describing ALLOCATION,
+not visibility, and mmap governs allocation. He then ran the experiment: auto spreads,
+--no-mmap fixes it, dio fixes it. Three data points beat a mechanism argument. When
+someone who is watching the machine says "it is X", the cost of testing X is minutes and
+the cost of dismissing it was three patches.
+
+**A wrong comment became a disabled control.** The OFF map in the card renderer both
+explains why a setting is irrelevant AND sets `disabled` on it. A patch27 comment claimed
+load mode "only affects load time, not generation", so every fully-offloaded card greyed
+out the one control that fixed the fleet. Anything that disables input on the strength of
+an assumption needs that assumption to be measured, not reasoned.
+
+**Focus deferral must not cover events the user just triggered.** Two patches tried to
+make a focus-deferred repaint eventually fire (clear the signature, then a timer). Both
+missed that ADOPTION never runs the install poller, so the SSE repaint was the only route
+and it was the deferred one. An install completing is not "someone might be typing" - it
+gets its own event and repaints unconditionally.
+
+**When the documentation and the default disagree, the default is the bug.** The Sampler
+Guide has said for many patches that --cache-ram and --ctx-checkpoints must both be set
+to zero for a GPU-only cache, "and the zeros must be explicit". The panel shipped
+--cache-ram 0 and --ctx-checkpoints 8. Nobody compared the guide against the table. A
+guide that states a correct value is a test waiting to be written; the gate now pins the
+default it prescribes.
+
+**Diff against the known-good artifact, flag by flag, before theorising.** The owner had
+a launcher that behaved correctly and one that did not. Four host-memory routes existed -
+fitting, mmap, KV spill, checkpoints - and they were closed one per patch across p30,
+p33 and p34 because each round asked "what could cause this" instead of "what differs".
+The full diff was available from the first message that contained both files.
+
+**A symptom with several independent causes reappears identically after each partial
+fix.** Three times the report was "no change", and three times something HAD changed -
+just not enough to alter the observable. Where multiple causes are plausible, enumerate
+and close them together, or state explicitly which half is proven and which remains.
+
+**Never let an explanation disable an input.** The OFF map served two purposes - saying
+why a setting is being overruled, and setting `disabled` on it. The first is helpful and
+can be wrong harmlessly; the second is destructive when wrong. A claim in a comment
+became a locked control, and the owner had to hand-edit launchers to apply the fix that
+control existed to apply. UI that removes agency needs a much higher standard of evidence
+than UI that offers advice.
+
+**Repainting cannot fix what is read once at load.** Three patches tried to make a
+focus-deferred repaint eventually fire, each correct about the previous failure and each
+still ending in CTRL+F5. The honest read is that the repaint path was never the whole
+story, and an install is rare, deliberate and already disruptive - a page reload is
+allowed. Prefer the certain, blunt mechanism for rare events; save the careful one for
+the hot path.
+
+**A summary is not the conversation.** This session lost an exchange to compaction, and
+the reply to it - patch34 - existed in the tree while the request that produced it did
+not. Before assuming an unfamiliar tree state is corruption, check whether it is simply
+work whose provenance was dropped: the version line, the CHANGELOG entry and the shipped
+zips all agreed, and they were the record.
+
+**A readiness check must ask about the thing that can be down.** PTI and PME are
+panel-called: they have a server but no listener, and provider_route says so - "Proxy",
+no port. The gate probed rt["port"], which is empty for exactly those two, so
+slot_status("") answered "unknown" forever and the tagger failed open on every player
+line. The failure was silent BECAUSE it was designed to fail open. When a guard exists to
+skip work safely, its inputs need a test of their own; a guard that always fires is
+indistinguishable from a feature that is off.
+
+**A switch that needs a restart is not a switch.** Remote Access bound the socket at
+startup, so flipping it changed nothing while the page printed the LAN address to visit.
+The bind was defence-in-depth over client_scope, which is consulted PER REQUEST and
+already denies external addresses outright and LAN addresses while the switch is off.
+Keeping the weaker, static lock cost the stronger, dynamic one its effect. If a control
+implies immediacy, the enforcement point has to be one that is consulted at use time.
+
+**Reverting is allowed to be the answer.** patch35 reloaded the page after an install
+because four repaint attempts had failed. It worked, and it threw away the terminal, the
+scroll position and any half-typed field to deliver four strings. The owner rejected it
+and was right: the fix was to write those four fields directly after the repaint. When a
+solution is disproportionate to the problem, that is evidence the problem was framed
+wrongly.
+
+**An off-by-default display switch is a bug report waiting to happen.** ttsThoughtOut
+shipped off, and a session went into "NPC thoughts are broken" before the owner found the
+button. This is the second time in one session that a display default produced a fault
+report - PTI Output and PME Output are the same shape. If a feature exists because it is
+useful, its display default should be the useful one; save "off by default" for things
+that cost something to show.
+
+**Read the identifiers out of the source before writing a list of them.** The stamps
+default was first written as "dashboard,thinking,tts,ptipme,split" - and the real kinds
+are splitd and splitt, with ttscal besides. A name nothing matches fails silently: that
+terminal simply keeps its timestamps and nobody knows why. The gate now compares the
+default against the set of tail ids scraped from the page, both directions, so an
+invented name and a missed terminal each fail.
+
+**Thought timing has not been touched this session.** The owner reported thoughts landing
+after the first chunk again and asked for a revert; the newest patch marker anywhere in
+the arming block is patch182, well before patch26. The cause is therefore adjacent -
+chunking, or last-chunk detection - and reverting something that was never changed would
+have been a wasted patch. Check provenance before reverting.
+
+**When a function is right and the symptom persists, instrument its INPUTS.** Fed the
+owner's own logged strings, tts_chunk_is_last returns True on the real final chunk - so
+the suffix rule is sound and something about REPLY_FULL is not. Three candidates share
+one symptom: no kept reply, a stale one, or one whose text does not match. Guessing
+between them is what the last two rounds did; the verdict now names itself, and the next
+log answers it. Prefer a patch that ENDS the guessing over a patch that guesses better.
+
+**A diagnostic must not have side effects a predicate did not have.** _th_why called
+calterm_log, which creates the log directory and reads the config - so a pure test of the
+predicate began writing files into the tree, and the gate's own "leaves no trace" check
+caught it. The explanation is now written only when a thought is actually waiting on this
+speaker, which is both the only time it is useful and side-effect-free everywhere else.
+
+**Display switches, again.** ttsActionOut shipped off for the same reason ttsThoughtOut
+did, and would have produced the same bug report eventually. Both are now on. The rule
+worth keeping: a switch that only decides whether to SHOW something already computed
+should default to showing it.
+
 ### Still open
 
+- **The launcher template's VRAM REPORT prints "STATUS: loaded" over a dead launch.**
+  The panel's card report reads llama.cpp's own lines instead and says "exited during
+  load"; the template's line itself still lies and stays unfixed.
 - **`ttsWrapperPort` is not honoured.** The reference wrapper hardcodes `WRAP_PORT = 7860`.
   The launcher exports `WRAP_PORT`; making the field real needs one line in the wrapper:
   `WRAP_PORT = int(os.environ.get("WRAP_PORT", 7860))`.

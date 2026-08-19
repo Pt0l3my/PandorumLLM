@@ -28,7 +28,27 @@ $args_ = @(
 )
 
 Write-Host ("Launching: {0}" -f (Split-Path "<MODEL_PATH>" -Leaf))
-& $exe @args_
 
-# Crash-restart supervisor line (PandorumLLM/stack convention):
-& "<SELF_PATH>"
+# llama-server's own output goes straight to this console and this log, unfiltered.
+# The panel reads THESE lines to report what the server allocated - weights, KV,
+# compute buffers, the draft split - so nothing here may reformat or swallow them.
+& $exe @args_
+$code = $LASTEXITCODE
+
+# The panel watches for this exact sentence to tell a server that died from one
+# still loading. llama-server never prints it, so the launcher must.
+if ($code -ne 0) {
+    Write-Host ""
+    Write-Host ("Server process exited before it became ready (exit {0})" -f $code) -ForegroundColor Red
+} else {
+    Write-Host ""
+    Write-Host ("Server process exited before it became ready (exit 0 - stopped or never bound)") -ForegroundColor Yellow
+}
+
+# No automatic relaunch. This file used to re-invoke itself here, so a server that
+# could not start looped instead of stopping - and the console that held the reason
+# was replaced by the next attempt before anyone could read it. Restart from the
+# panel, which now says why the last one ended.
+Write-Host "This window stays open so the lines above can be read. Close it when done." -ForegroundColor DarkGray
+if ($Host.Name -eq "ConsoleHost") { [void][System.Console]::ReadKey($true) }
+exit $code
