@@ -1,0 +1,33 @@
+PandorumLLM License (Source-Visible, Personal Use)
+Copyright (c) 2026 Pt0l3my
+
+Permission is granted, free of charge, to any person obtaining a copy of this
+software and its source code (the "Software"), to use, run, study and modify
+the Software for PERSONAL, NON-COMMERCIAL purposes only, subject to the
+following conditions:
+
+1. NO REDISTRIBUTION. You may not distribute, publish, sublicense, sell, rent,
+   lease or otherwise make the Software or any modified version of it available
+   to any third party, in source or binary form, in whole or in part. Linking
+   to the official repository or release page is permitted and encouraged.
+
+2. PERSONAL MODIFICATION. You may modify the Software for your own use.
+   Modified copies remain subject to this license in full and must keep this
+   license text and the copyright notice above.
+
+3. NO TRADEMARK OR NAME USE. The names "PandorumLLM" and "Pt0l3my" may not be
+   used to endorse or promote derived works without prior written permission.
+
+4. THIRD-PARTY COMPONENTS. The Software drives, but does not include,
+   third-party programs (for example llama.cpp, audio.cpp and SkyrimNet).
+   Those remain under their own licenses.
+
+5. NO WARRANTY. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+   KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+   MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN
+   NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
+   USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+For any permission beyond this license, contact the author via
+https://github.com/Pt0l3my/PandorumLLM
