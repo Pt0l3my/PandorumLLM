@@ -1,0 +1,32 @@
+# Line endings are part of this project's contract: the gate checks the exact bytes
+# of every shipped file (DEVELOPMENT.md section 6), so git must not decide them from
+# whatever core.autocrlf happens to be set to on the machine doing the checkout.
+#
+# Each rule below mirrors one entry in gate.py's RULES table. Change one and the gate
+# fails on the other - which is the point.
+
+# never guess: text is declared per type, and nothing else is converted
+*                       -text
+
+*.py                    text eol=crlf
+*.bat                   text eol=crlf
+*.ps1                   text eol=crlf
+*.txt                   text eol=crlf
+LICENSE                 text eol=crlf
+
+*.js                    text eol=crlf
+*.md                    text eol=lf
+*.rc                    text eol=lf
+*.manifest              text eol=lf
+*.cpp                   text eol=lf
+*.json                  text eol=lf
+.gitignore              text eol=lf
+.gitattributes          text eol=lf
+
+# the one documented exception: BOM + LF, and the gate knows it by name
+launch-llm-fleet.ps1    text eol=lf
+
+*.ico                   binary
+*.exe                   binary
+*.wav                   binary
+*.zip                   binary
