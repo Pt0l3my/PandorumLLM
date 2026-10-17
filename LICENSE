@@ -1,0 +1,95 @@
+PandorumLLM License, version 2.0
+Source-Visible - Personal Use - No Redistribution - No Derivative or Competing Works
+Copyright (c) 2026 Pt0l3my. All rights reserved, except as expressly granted below.
+
+0. DEFINITIONS
+
+   "The Software" means PandorumLLM in every form its author publishes it:
+   source code, binaries, launchers, templates and configuration defaults; its
+   documentation (README, CHANGELOG, DEVELOPMENT, BUILD and AUTHORSHIP files,
+   and the in-app User Guide and Sampler Guide); and its interface text, screen
+   layouts, visual designs, icons, names, screenshots and release notes.
+
+1. WHAT YOU MAY DO
+
+   Free of charge, for personal and non-commercial purposes only, you may
+   download, install and run the Software to operate your own local model
+   servers, and modify your own copy for your own use. The source is published
+   so that you can read it before you run it.
+
+2. NO REDISTRIBUTION
+
+   You may not distribute, publish, sublicense, sell, rent, lease or otherwise
+   make the Software or any modified version of it available to anyone else,
+   in source or binary form, in whole or in part. Modified copies remain under
+   this license in full and must keep this license text and the copyright
+   notice above. Linking to the official repository or release page is
+   permitted.
+
+3. NO DERIVATIVE OR COMPETING WORKS
+
+   You may not use the Software, in whole or in part, as the basis, model,
+   reference or specification for any other software, product, service, mod,
+   plugin or tool. This includes:
+
+   (a) copying, adapting, translating or porting any of its source code, into
+       any programming language;
+   (b) copying or closely imitating its documentation, interface text, screen
+       layouts, visual designs, icons or screenshots;
+   (c) re-creating its features, workflows or designs in another application
+       by working from the Software, its documentation, its changelogs or its
+       screenshots;
+   (d) integrating the Software, or anything made from it, into another
+       application.
+
+   This applies whether or not any code is copied, and whether or not credit is
+   given. Credit is not permission.
+
+4. NAMES AND IDENTITY
+
+   Without prior written permission, the names "PandorumLLM" and "Pt0l3my" and
+   the PandorumLLM logo may not be used:
+   (a) to name, endorse or promote any other software;
+   (b) to claim that other software has the same or equivalent features,
+       functionality or compatibility as the Software; or
+   (c) in any way that suggests an affiliation with, or approval by, the author.
+   Referring people to the Software itself, by name or by link, is permitted.
+
+5. THE AUTHOR'S POSITION
+
+   The author does not consent to the ideas, features and designs first
+   published in the Software being copied into, re-implemented in or integrated
+   into other applications. AUTHORSHIP.md records what was first published
+   here, and the public repository's history records when.
+
+6. YOUR RIGHTS UNDER LAW
+
+   Nothing in this license takes away a right that applicable law gives you
+   and does not allow a contract to remove - for example, a lawful user's right
+   to observe, study and test how a program works. Each term applies to the
+   fullest extent the law allows; where a term cannot be enforced, it is
+   limited to what can be, and the rest of this license still applies.
+
+7. TERMINATION
+
+   Any breach of this license ends your permission under it automatically. You
+   must then stop using the Software and delete your copies, including
+   modified ones. Permission may be restored only by the author, in writing.
+
+8. THIRD-PARTY COMPONENTS
+
+   The Software drives, but does not include, third-party programs (for
+   example llama.cpp, audio.cpp and SkyrimNet), and may download models that
+   carry their own licenses. Those remain under their own licenses.
+
+9. NO WARRANTY
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHOR BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM, OUT
+   OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+For any permission beyond this license, contact the author via
+https://github.com/Pt0l3my/PandorumLLM
